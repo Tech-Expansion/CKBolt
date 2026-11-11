@@ -1,0 +1,4 @@
+# Operator files of the testnet deployment: settings with secrets, wallet passwords, certificates and macaroons.
+.env
+hub.env
+secrets/

@@ -1,0 +1,15 @@
+
+node_modules
+.next
+.git
+.github
+.env
+.env.*
+!.env.example
+npm-debug.log*
+Dockerfile*
+compose.y*ml
+README.md
+*.zip
+test-results
+playwright-report

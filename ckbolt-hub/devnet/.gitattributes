@@ -1,0 +1,8 @@
+# Files used inside Linux containers keep LF endings on Windows checkouts (core.autocrlf=true would break them).
+*.sh       text eol=lf
+*.toml     text eol=lf
+*.yml      text eol=lf
+Dockerfile text eol=lf
+# Contract binaries baked into the devnet genesis must stay byte-identical.
+ckb/contracts/*     binary
+ckb/contracts/*.md  text

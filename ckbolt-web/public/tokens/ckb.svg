@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <circle cx="50" cy="50" r="50" fill="#ffffff"/>
+  <!-- Nervos CKB logomark, from CKB Explorer (public/images/tokens/ckb_token.svg) -->
+  <g transform="translate(24 24.2) scale(0.2504)" fill="#000000">
+    <polygon points="0,0 0,206.3 53.2,206.3 53.2,93.9 93.9,93.9"/>
+    <polygon points="154.5,0 154.5,112.4 113.8,112.4 207.7,206.3 207.7,0"/>
+  </g>
+</svg>

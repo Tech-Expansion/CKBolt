@@ -1,0 +1,12 @@
+{
+  "moduleFileExtensions": ["js", "json", "ts"],
+  "rootDir": "..",
+  "roots": ["<rootDir>/test/e2e"],
+  "testRegex": ".*\\.e2e-spec\\.ts$",
+  "globalSetup": "<rootDir>/test/e2e/support/global-setup.ts",
+  "transform": {
+    "^.+\\.ts$": ["ts-jest", { "tsconfig": "tsconfig.json", "diagnostics": { "ignoreCodes": [151002] } }]
+  },
+  "testEnvironment": "node",
+  "testTimeout": 300000
+}

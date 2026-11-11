@@ -1,0 +1,9 @@
+# Build context of deploy/testnet/hub/Dockerfile (BuildKit reads <Dockerfile>.dockerignore). Allow-list: only what
+# `npm ci` and `nest build` need, so no .env, secrets, data, devnet state or local node_modules reach the image.
+*
+!package.json
+!package-lock.json
+!tsconfig.json
+!tsconfig.build.json
+!nest-cli.json
+!src

@@ -1,0 +1,267 @@
+# CKBolt on test networks: Mutinynet (a custom signet with 30 s blocks) for Bitcoin and Lightning, CKB testnet for
+# Fiber. Runbook: deploy/README.md (the kit runs on the VPS under /opt/ckbolt/testnet, driven from Windows by
+# `npm --prefix deploy run testnet -- <command>`).
+#
+#   bitcoind (Mutinynet fork) ── lnd-hub [⇄ lnd-demo]        LND v0.21.4-beta on signet
+#   CKB testnet (public RPC)  ── fnn-hub [⇄ fnn-demo]        fnn v0.9.1 release, CKB and RUSD channels
+#   hub (CKBolt) ── lnd-hub, fnn-hub; demo wallet (optional) ── lnd-demo, fnn-demo
+#
+# This base file is safe on any machine: it needs no public address and publishes only the hub, on 127.0.0.1. A server
+# with a public IP adds docker-compose.public.yml (COMPOSE_FILE in .env): lnd-hub and fnn-hub then publish and announce
+# their P2P ports (fnn's port also serves WebSocket for browser Fiber nodes) and the hub tells browsers where to dial.
+# The demo wallet's nodes run only with the `demo` profile (COMPOSE_PROFILES=demo in .env); the hub uses them only with
+# DEMO_ENABLED=true. cloudflared, the Cloudflare Tunnel that makes the hub's API and fnn-hub's WebSocket public over
+# HTTPS and WSS, runs only with the `tunnel` profile, with fiber-ws, its way to fnn-hub's P2P port. cloudflared sits
+# on its own network, `edge`, with only the hub and fiber-ws: it cannot reach fnn's or LND's RPC or bitcoind.
+# Settings: .env (from .env.example; Compose reads it) and hub.env (from hub.env.example). Secrets live in secrets/
+# (never in git): secrets/wallet/ holds the LND wallet passwords and seeds, secrets/hub/ only what the hub may read.
+name: ckbolt-testnet
+
+x-lnd: &lnd
+  image: lightninglabs/lnd:${LND_VERSION:-v0.21.4-beta}
+  restart: unless-stopped
+  stop_grace_period: 2m
+  depends_on:
+    bitcoind: { condition: service_healthy }
+  configs:
+    - source: lnd-conf
+      target: /etc/lnd/lnd.conf
+  healthcheck:
+    test: ["CMD-SHELL", "lncli --network=signet state | grep -q SERVER_ACTIVE"]
+    interval: 15s
+    timeout: 10s
+    retries: 20
+    start_period: 2m
+
+# fnn-hub builds the image from the devnet's release-binary Dockerfile and fnn-demo runs the same tag. Only one service
+# builds it: two builds of one tag in parallel fail with "image ... already exists".
+x-fnn: &fnn
+  image: ckbolt/fnn:v0.9.1
+  restart: unless-stopped
+  init: true
+  healthcheck:
+    test: ["CMD", "fnn-healthcheck"]
+    interval: 15s
+    timeout: 6s
+    retries: 20
+    start_period: 1m
+
+services:
+  # Takes over the bitcoind that has been syncing on the VPS (same project, service and volume: no resync).
+  bitcoind:
+    build: ./bitcoind
+    image: ckbolt/bitcoind-mutinynet:2fda7bfc027e
+    restart: unless-stopped
+    # A clean stop writes the block index and chainstate; a large dbcache can take tens of seconds to flush.
+    stop_grace_period: 2m
+    configs:
+      - source: bitcoin-conf
+        target: /etc/bitcoin/bitcoin.conf
+    volumes: ["bitcoind:/data"]
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-conf=/etc/bitcoin/bitcoin.conf", "-datadir=/data", "getblockchaininfo"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 5m
+
+  lnd-hub:
+    <<: *lnd
+    hostname: lnd-hub
+    command:
+      - --configfile=/etc/lnd/lnd.conf
+      - --alias=${LND_HUB_ALIAS:-ckbolt-hub}
+      - --tlsextradomain=lnd-hub
+    secrets:
+      - source: lnd_hub_wallet_password
+        target: lnd-wallet-password
+    volumes: ["lnd-hub:/root/.lnd"]
+
+  lnd-demo:
+    <<: *lnd
+    profiles: [demo]
+    hostname: lnd-demo
+    command:
+      - --configfile=/etc/lnd/lnd.conf
+      - --alias=${LND_DEMO_ALIAS:-ckbolt-demo-wallet}
+      - --tlsextradomain=lnd-demo
+    secrets:
+      - source: lnd_demo_wallet_password
+        target: lnd-wallet-password
+    volumes: ["lnd-demo:/root/.lnd"]
+
+  fnn-hub:
+    <<: *fnn
+    build: ${FNN_BUILD_CONTEXT:-../../devnet/fnn}
+    hostname: fnn-hub
+    environment:
+      FIBER_SECRET_KEY_PASSWORD: ${FNN_HUB_KEY_PASSWORD:?set FNN_HUB_KEY_PASSWORD in deploy/testnet/.env}
+      # A hostname resolves to the container's private address, which fnn accepts without a Biscuit key.
+      RPC_LISTENING_ADDR: fnn-hub:8227
+      FIBER_ANNOUNCED_NODE_NAME: ${FNN_HUB_NODE_NAME:-ckbolt-hub}
+      # Dialable on the Docker network only (fnn-demo dials it). docker-compose.public.yml announces the public address.
+      FIBER_ANNOUNCED_ADDRS: /dns4/fnn-hub/tcp/8228
+      # No auto-accepted CKB channels (fnn auto-accepts CKB only with a funding amount above 0). UDT channels a node
+      # opens are auto-accepted only where fnn/hub.yml has an auto_accept_amount, generated from FIBER_ASSETS
+      # peerChannels (docs/add-token.md): the hub then counts the longest commitment delay (84 epochs) for them and sizes
+      # its hold invoices in that UDT for it. The hub opens its own channels (`testnet channels`, POST /v1/fiber/inbound-channels).
+      FIBER_AUTO_ACCEPT_CHANNEL_CKB_FUNDING_AMOUNT: "0"
+      CKB_NODE_RPC_URL: ${CKB_RPC_URL:-https://testnet.ckbapp.dev/}
+      RUST_LOG: ${FNN_LOG:-info}
+    volumes: ["fnn-hub:/fiber", "./fnn/hub.yml:/etc/fnn/config.yml:ro"]
+
+  fnn-demo:
+    <<: *fnn
+    profiles: [demo]
+    # Built by fnn-hub (above); never looked up on a registry.
+    pull_policy: never
+    hostname: fnn-demo
+    environment:
+      FIBER_SECRET_KEY_PASSWORD: ${FNN_DEMO_KEY_PASSWORD:?set FNN_DEMO_KEY_PASSWORD in deploy/testnet/.env}
+      RPC_LISTENING_ADDR: fnn-demo:8227
+      FIBER_ANNOUNCED_NODE_NAME: ${FNN_DEMO_NODE_NAME:-ckbolt-demo-wallet}
+      CKB_NODE_RPC_URL: ${CKB_RPC_URL:-https://testnet.ckbapp.dev/}
+      RUST_LOG: ${FNN_LOG:-info}
+    # fnn/demo.yml auto-accepts each UDT from its autoAcceptAmount: fnn-demo accepts the channels fnn-hub opens to it.
+    volumes: ["fnn-demo:/fiber", "./fnn/demo.yml:/etc/fnn/config.yml:ro"]
+
+  hub:
+    build:
+      context: ${HUB_BUILD_CONTEXT:-../..}
+      dockerfile: deploy/testnet/hub/Dockerfile
+    image: ckbolt/hub:${HUB_IMAGE_TAG:-local}
+    restart: unless-stopped
+    # Lets the swap scheduler finish the step it is on and close the database cleanly.
+    stop_grace_period: 1m
+    env_file: [hub.env]
+    environment:
+      # Mandatory: quotes keep verifying across restarts and the web app shows one stable hub key.
+      QUOTE_SIGNING_KEY: ${QUOTE_SIGNING_KEY:?set QUOTE_SIGNING_KEY (64 hex characters) in deploy/testnet/.env}
+      # One switch for the demo wallet: its nodes run with COMPOSE_PROFILES=demo, the hub uses them with this.
+      DEMO_ENABLED: ${DEMO_ENABLED:-false}
+      # The same value as invoices.holdexpirydelta in lnd-conf below (one variable feeds both).
+      LND_HOLD_EXPIRY_DELTA_BLOCKS: ${LND_HOLD_EXPIRY_DELTA_BLOCKS:-18}
+      # Plain log lines (no ANSI colours) for `docker compose logs`, grep and log shippers.
+      NO_COLOR: "1"
+    volumes:
+      - hub-data:/data
+      # TLS certificates and least-privilege macaroons only (`testnet macaroons`); never the LND wallet passwords.
+      - ./secrets/hub:/secrets:ro
+    # Only the CKBolt web server (its /api/hub proxy, or the operator's SSH tunnel) calls the hub: never a public interface.
+    ports: ["127.0.0.1:${HUB_HOST_PORT:-18787}:8787"]
+    # default: its nodes; edge: cloudflared reaches its API there (ckbolt-hub-api.<domain>).
+    networks: [default, edge]
+    depends_on:
+      lnd-hub: { condition: service_healthy }
+      fnn-hub: { condition: service_healthy }
+      # Waited for only when the demo profile runs them.
+      lnd-demo: { condition: service_healthy, required: false }
+      fnn-demo: { condition: service_healthy, required: false }
+
+  # fnn-hub's P2P port (8228, where fnn also serves the WebSocket of browser Fiber nodes) for cloudflared, on the edge
+  # network. A plain TCP relay to that one port: fnn-hub stays off the edge network, so its unauthenticated JSON-RPC
+  # (8227, open to private addresses) is out of the tunnel's reach. Runs with the tunnel (profile `tunnel`) and
+  # publishes no port.
+  fiber-ws:
+    image: alpine/socat:${SOCAT_VERSION:-1.8.0.3}
+    profiles: [tunnel]
+    restart: unless-stopped
+    # The image's entrypoint is socat: listen on 8228 (a process per connection) and relay to fnn-hub's P2P port.
+    command: ["TCP-LISTEN:8228,fork,reuseaddr", "TCP:fnn-hub:8228"]
+    networks: [default, edge]
+    depends_on:
+      fnn-hub: { condition: service_healthy }
+
+  # Cloudflare Tunnel (profile `tunnel`: add it to COMPOSE_PROFILES in .env). It only makes outbound connections and
+  # publishes no port, so the server's ports 80 and 443 and its nginx stay untouched. Only on the edge network: it
+  # reaches the hub's API and fiber-ws, nothing else. The tunnel's public hostnames are set in Cloudflare (Zero Trust,
+  # Networks, Tunnels, Public hostnames), not here, in this order:
+  #   ckbolt-hub-api.<domain>   -> http://hub:8787        the web app's proxy only (the hub wants HUB_PROXY_SECRET, hub.env)
+  #   ckbolt-hub-fiber.<domain> -> http://fiber-ws:8228   browser Fiber nodes' WebSocket, dialled as wss on port 443
+  #   anything else             -> http_status:404        the catch-all rule
+  # deploy/README.md section 10 has the steps, and the FIBER_PUBLIC_WS_ADDRS that goes with them.
+  cloudflared:
+    image: cloudflare/cloudflared:${CLOUDFLARED_VERSION:-2026.8.2}
+    profiles: [tunnel]
+    restart: unless-stopped
+    # The image's entrypoint is `cloudflared --no-autoupdate`; `tunnel run` takes the tunnel from TUNNEL_TOKEN.
+    command: ["tunnel", "run"]
+    environment:
+      # The tunnel's token from Cloudflare, set by hand in .env; `testnet env` refuses the profile without it. Empty here
+      # (not `:?`) so that Compose still resolves the file for every other service while the profile is off.
+      TUNNEL_TOKEN: ${CLOUDFLARED_TUNNEL_TOKEN:-}
+    networks: [edge]
+    depends_on:
+      hub: { condition: service_started }
+      fiber-ws: { condition: service_started }
+
+configs:
+  bitcoin-conf:
+    content: |
+      signet=1
+      server=1
+      dnsseed=0
+      rpcuser=${BITCOIND_RPC_USER:-ckbolt}
+      rpcpassword=${BITCOIND_RPC_PASSWORD:?set BITCOIND_RPC_PASSWORD in deploy/testnet/.env}
+      # Cache for the chainstate, MB: more speeds up the first sync; the default suits a synced node.
+      dbcache=${BITCOIND_DBCACHE_MB:-450}
+      [signet]
+      # Mutinynet: its signet challenge, 30 s blocks and the operators' seed node.
+      signetchallenge=512102f7561d208dd9ae99bf497273e16f389bdbd6c4742ddb8e6b216e64fa2928ad8f51ae
+      signetblocktime=30
+      addnode=45.79.52.207:38333
+      # RPC and ZMQ for LND on the Docker network only (no host port is published).
+      rpcbind=0.0.0.0
+      rpcallowip=10.0.0.0/8
+      rpcallowip=172.16.0.0/12
+      rpcallowip=192.168.0.0/16
+      zmqpubrawblock=tcp://0.0.0.0:28332
+      zmqpubrawtx=tcp://0.0.0.0:28333
+      fallbackfee=0.0002
+  lnd-conf:
+    content: |
+      [Application Options]
+      listen=0.0.0.0:9735
+      rpclisten=0.0.0.0:10009
+      ; REST on the container's own loopback only: `testnet wallet` creates the wallet through it (InitWallet) from
+      ; inside the container. Nothing outside the container can reach it.
+      restlisten=127.0.0.1:8080
+      maxpendingchannels=5
+      debuglevel=info
+      ; Unlocks the wallet on every start; lets LND wait for the first wallet creation (`testnet wallet`).
+      wallet-unlock-password-file=/run/secrets/lnd-wallet-password
+      wallet-unlock-allow-create=true
+      ; max-cltv-expiry keeps LND's 2016: the hub's timing relies on it.
+      [Bitcoin]
+      bitcoin.signet=true
+      bitcoin.node=bitcoind
+      [Bitcoind]
+      bitcoind.rpchost=bitcoind:38332
+      bitcoind.rpcuser=${BITCOIND_RPC_USER:-ckbolt}
+      bitcoind.rpcpass=${BITCOIND_RPC_PASSWORD:?set BITCOIND_RPC_PASSWORD in deploy/testnet/.env}
+      bitcoind.zmqpubrawblock=tcp://bitcoind:28332
+      bitcoind.zmqpubrawtx=tcp://bitcoind:28333
+      [invoices]
+      ; LND cancels an accepted hold invoice this many blocks before its earliest HTLC expires. The hub sizes every
+      ; ln_to_fiber payout to end before that point and gets the same variable (LND_HOLD_EXPIRY_DELTA_BLOCKS, 18 or more).
+      invoices.holdexpirydelta=${LND_HOLD_EXPIRY_DELTA_BLOCKS:-18}
+
+networks:
+  # Every service but cloudflared: the nodes' RPCs (fnn-hub's JSON-RPC, LND's gRPC, bitcoind's) answer here.
+  default:
+  # cloudflared, the hub and fiber-ws only: what the tunnel may reach.
+  edge:
+
+secrets:
+  lnd_hub_wallet_password:
+    file: ./secrets/wallet/lnd-hub.password
+  lnd_demo_wallet_password:
+    file: ./secrets/wallet/lnd-demo.password
+
+volumes:
+  bitcoind:
+  lnd-hub:
+  lnd-demo:
+  fnn-hub:
+  fnn-demo:
+  hub-data:

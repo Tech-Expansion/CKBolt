@@ -1,0 +1,181 @@
+# CKBolt hub devnet: bitcoind regtest with two LND nodes, a CKB devnet built from Fiber v0.9.1's dev chain spec (the
+# Fiber contracts are in genesis) with a block producer, and two release fnn v0.9.1 nodes.
+#
+# *-hub nodes are the hub's own; *-user nodes play the user and back the hub's demo wallet (DEMO_* in hub.env).
+# Host ports, versions and dev credentials can be overridden from the environment or an untracked devnet/.env
+# (see README.md, "Ports and secrets"). Every port binds to 127.0.0.1 only.
+name: ckbolt-devnet
+
+x-lnd: &lnd
+  image: lightninglabs/lnd:${LND_VERSION:-v0.21.4-beta}
+  restart: unless-stopped
+  depends_on:
+    bitcoind: { condition: service_healthy }
+  configs:
+    - source: lnd-conf
+      target: /etc/lnd/lnd.conf
+  healthcheck:
+    test: ["CMD", "lncli", "--network=regtest", "getinfo"]
+    interval: 5s
+    timeout: 5s
+    retries: 30
+
+x-ckb: &ckb
+  image: nervos/ckb:${CKB_VERSION:-v0.202.0}
+  restart: unless-stopped
+  # ckb and the block producer stop cleanly on Ctrl-C; tini forwards it, so docker compose stop does not wait for the
+  # kill timeout.
+  init: true
+  stop_signal: SIGINT
+  entrypoint: ["bash", "/devnet/ckb/docker-entrypoint.sh"]
+
+# fnn-hub builds the fnn image and fnn-user runs the same tag. Only one service may build it: two builds of one tag run
+# in parallel on a first `up` and the second fails with "image ... already exists".
+x-fnn: &fnn
+  image: ckbolt-devnet/fnn:v0.9.1
+  restart: unless-stopped
+  init: true
+  depends_on:
+    ckb: { condition: service_healthy }
+  # Written by the bootstrap once the RUSD stand-in exists: CKB_UDT_WHITELIST for both nodes.
+  env_file:
+    - path: ./state/fnn-udt.env
+      required: false
+  healthcheck:
+    test: ["CMD", "fnn-healthcheck"]
+    interval: 5s
+    timeout: 6s
+    retries: 30
+
+services:
+  bitcoind:
+    image: lightninglabs/bitcoin-core:${BITCOIN_CORE_VERSION:-29.4}
+    restart: unless-stopped
+    command: ["-conf=/etc/bitcoin/bitcoin.conf"]
+    configs:
+      - source: bitcoin-conf
+        target: /etc/bitcoin/bitcoin.conf
+    volumes: ["bitcoind:/home/bitcoin/.bitcoin"]
+    ports: ["127.0.0.1:${BITCOIND_RPC_HOST_PORT:-18443}:18443"]
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-conf=/etc/bitcoin/bitcoin.conf", "getblockchaininfo"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  lnd-hub:
+    <<: *lnd
+    hostname: lnd-hub
+    command: ["--configfile=/etc/lnd/lnd.conf", "--alias=ckbolt-hub", "--tlsextradomain=lnd-hub"]
+    volumes: ["lnd-hub:/root/.lnd"]
+    ports:
+      - "127.0.0.1:${LND_HUB_GRPC_HOST_PORT:-10009}:10009"
+      - "127.0.0.1:${LND_HUB_REST_HOST_PORT:-8180}:8080"
+
+  lnd-user:
+    <<: *lnd
+    hostname: lnd-user
+    command: ["--configfile=/etc/lnd/lnd.conf", "--alias=ckbolt-user", "--tlsextradomain=lnd-user"]
+    volumes: ["lnd-user:/root/.lnd"]
+    ports:
+      - "127.0.0.1:${LND_USER_GRPC_HOST_PORT:-10010}:10009"
+      - "127.0.0.1:${LND_USER_REST_HOST_PORT:-8181}:8080"
+
+  ckb:
+    <<: *ckb
+    command: ["node"]
+    environment:
+      CKB_SPEC_FILE: /devnet/ckb/dev.toml
+      # Block rewards go to the genesis issuer's lock (secp256k1 args of the key in dev.toml) by default.
+      CKB_MINER_LOCK_ARG: ${CKB_MINER_LOCK_ARG:-0xc8328aabcd9b9e8e64fbc566c4385c3bdeb219d7}
+    volumes: ["ckb:/var/lib/ckb", "./ckb:/devnet/ckb:ro"]
+    ports: ["127.0.0.1:${CKB_RPC_HOST_PORT:-8114}:8114"]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8114"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # The block producer: generate_block on the node every CKB_BLOCK_INTERVAL_MS (see ckb/docker-entrypoint.sh).
+  ckb-miner:
+    <<: *ckb
+    command: ["miner"]
+    environment:
+      CKB_NODE_RPC_URL: http://ckb:8114/
+      CKB_BLOCK_INTERVAL_MS: ${CKB_BLOCK_INTERVAL_MS:-1000}
+    volumes: ["./ckb:/devnet/ckb:ro"]
+    depends_on:
+      ckb: { condition: service_healthy }
+
+  fnn-hub:
+    <<: *fnn
+    build: ./fnn
+    hostname: fnn-hub
+    environment:
+      FIBER_SECRET_KEY_PASSWORD: ${FNN_HUB_KEY_PASSWORD:-ckbolt-devnet-hub}
+      # A hostname resolves to the container's private IP, which fnn accepts without a Biscuit key (unlike 0.0.0.0).
+      RPC_LISTENING_ADDR: fnn-hub:8227
+      FIBER_ANNOUNCED_NODE_NAME: ckbolt-hub
+      FIBER_ANNOUNCED_ADDRS: /dns4/fnn-hub/tcp/8228
+      CKB_NODE_RPC_URL: http://ckb:8114
+      RUST_LOG: ${FNN_LOG:-info}
+    volumes: ["fnn-hub:/fiber", "./fnn/config.yml:/etc/fnn/config.yml:ro", "./ckb:/devnet/ckb:ro"]
+    ports: ["127.0.0.1:${FNN_HUB_RPC_HOST_PORT:-8227}:8227"]
+
+  fnn-user:
+    <<: *fnn
+    # Built locally by fnn-hub (above); never looked up on a registry.
+    pull_policy: never
+    hostname: fnn-user
+    environment:
+      FIBER_SECRET_KEY_PASSWORD: ${FNN_USER_KEY_PASSWORD:-ckbolt-devnet-user}
+      RPC_LISTENING_ADDR: fnn-user:8227
+      FIBER_ANNOUNCED_NODE_NAME: ckbolt-user
+      FIBER_ANNOUNCED_ADDRS: /dns4/fnn-user/tcp/8228
+      CKB_NODE_RPC_URL: http://ckb:8114
+      RUST_LOG: ${FNN_LOG:-info}
+    volumes: ["fnn-user:/fiber", "./fnn/config.yml:/etc/fnn/config.yml:ro", "./ckb:/devnet/ckb:ro"]
+    ports: ["127.0.0.1:${FNN_USER_RPC_HOST_PORT:-8237}:8227"]
+
+configs:
+  bitcoin-conf:
+    content: |
+      regtest=1
+      server=1
+      txindex=1
+      fallbackfee=0.0002
+      rpcuser=${BITCOIND_RPC_USER:-ckbolt}
+      rpcpassword=${BITCOIND_RPC_PASSWORD:-ckbolt}
+      [regtest]
+      rpcbind=0.0.0.0
+      rpcallowip=0.0.0.0/0
+      zmqpubrawblock=tcp://0.0.0.0:28332
+      zmqpubrawtx=tcp://0.0.0.0:28333
+  lnd-conf:
+    content: |
+      [Application Options]
+      listen=0.0.0.0:9735
+      rpclisten=0.0.0.0:10009
+      restlisten=0.0.0.0:8080
+      ; Dev only: creates and unlocks the wallet without a seed backup.
+      noseedbackup=true
+      maxpendingchannels=5
+      trickledelay=50
+      debuglevel=info
+      [Bitcoin]
+      bitcoin.regtest=true
+      bitcoin.node=bitcoind
+      [Bitcoind]
+      bitcoind.rpchost=bitcoind:18443
+      bitcoind.rpcuser=${BITCOIND_RPC_USER:-ckbolt}
+      bitcoind.rpcpass=${BITCOIND_RPC_PASSWORD:-ckbolt}
+      bitcoind.zmqpubrawblock=tcp://bitcoind:28332
+      bitcoind.zmqpubrawtx=tcp://bitcoind:28333
+
+volumes:
+  bitcoind:
+  lnd-hub:
+  lnd-user:
+  ckb:
+  fnn-hub:
+  fnn-user:

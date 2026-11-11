@@ -1,0 +1,32 @@
+# Shared fnn v0.9.1 config for the devnet nodes (fnn-hub, fnn-user). Settings that differ per node come from the
+# environment in docker-compose.yml (RPC_LISTENING_ADDR, FIBER_ANNOUNCED_*, CKB_NODE_RPC_URL) and the UDT whitelist
+# from devnet/state/fnn-udt.env (CKB_UDT_WHITELIST), which the bootstrap writes once the RUSD stand-in exists.
+# Environment values override this file.
+
+fiber:
+  listening_addr: "/ip4/0.0.0.0/tcp/8228"
+  # The chain spec with the Fiber contracts in genesis; fnn derives the FundingLock, CommitmentLock and auth cell deps
+  # from it, so no `scripts` section is needed on devnet.
+  chain: /devnet/ckb/dev.toml
+  announce_listening_addr: true
+  announce_private_addr: true
+  auto_announce_node: true
+
+rpc:
+  # pubsub enables the subscribe_store_changes WebSocket (FIBER_PUBSUB in the hub).
+  enabled_modules:
+    - channel
+    - graph
+    - info
+    - invoice
+    - payment
+    - peer
+    - pubsub
+
+ckb:
+  tx_tracing_polling_interval_ms: 1000
+
+services:
+  - fiber
+  - rpc
+  - ckb

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <circle cx="50" cy="50" r="50" fill="#ffffff"/>
+  <!-- cWBTC (CCH Wrapped BTC, a CKB testnet token): a plain B with two strokes, wrapped in a ring. Drawn for CKBolt. -->
+  <circle cx="50" cy="50" r="39" fill="none" stroke="#000000" stroke-width="5"/>
+  <g fill="none" stroke="#000000" stroke-linejoin="round">
+    <path d="M38 33 V67 M38 33 H53 A8.5 8.5 0 0 1 53 50 H38 M38 50 H55 A8.5 8.5 0 0 1 55 67 H38" stroke-width="6"/>
+    <path d="M44 26 V33 M52 26 V33 M44 67 V74 M52 67 V74" stroke-width="4"/>
+  </g>
+</svg>

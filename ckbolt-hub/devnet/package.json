@@ -1,0 +1,28 @@
+{
+  "name": "ckbolt-devnet",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local devnet for the CKBolt hub: bitcoind regtest, two LND, a CKB devnet with the Fiber contracts, two fnn.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "up": "tsx scripts/up.ts",
+    "bootstrap": "tsx scripts/bootstrap.ts",
+    "smoke": "tsx scripts/smoke.ts",
+    "mine": "tsx scripts/mine.ts",
+    "secrets": "tsx scripts/secrets.ts",
+    "logs": "docker compose logs --follow --tail=100",
+    "stop": "docker compose stop",
+    "reset": "tsx scripts/reset.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@ckb-ccc/core": "1.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.7.5",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  }
+}

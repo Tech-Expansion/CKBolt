@@ -1,0 +1,26 @@
+# Overlay for a server with a public IPv4 address (the VPS): add it after docker-compose.yml, which COMPOSE_FILE in
+# .env does (docker-compose.yml:docker-compose.public.yml). Only the P2P ports become public: LND 9735 for Lightning
+# peers such as Megalith, fnn 8228 for Fiber peers and, on the same port, the WebSocket that browser Fiber nodes
+# (fiber-js) dial. Every RPC and the hub stay on the Docker network or 127.0.0.1.
+services:
+  lnd-hub:
+    # Replaces the base command (Compose does not merge command lists): the same flags plus the announced address.
+    command:
+      - --configfile=/etc/lnd/lnd.conf
+      - --alias=${LND_HUB_ALIAS:-ckbolt-hub}
+      - --tlsextradomain=lnd-hub
+      - --externalip=${PUBLIC_IP:?set PUBLIC_IP in deploy/testnet/.env (testnet env fills it)}:${LND_HUB_P2P_PORT:-9735}
+    ports: ["${LND_HUB_P2P_PORT:-9735}:9735"]
+
+  fnn-hub:
+    environment:
+      # TCP for Fiber peers; /ws on the same port (fnn's reuse_port_for_websocket) for browser nodes. fnn has no TLS:
+      # pages served over https need a wss address behind a TLS proxy (deploy/README.md, "Browser Fiber nodes").
+      FIBER_ANNOUNCED_ADDRS: /ip4/${PUBLIC_IP:?set PUBLIC_IP in deploy/testnet/.env}/tcp/${FNN_HUB_P2P_PORT:-8228},/ip4/${PUBLIC_IP:?set PUBLIC_IP in deploy/testnet/.env}/tcp/${FNN_HUB_P2P_PORT:-8228}/ws
+    ports: ["${FNN_HUB_P2P_PORT:-8228}:8228"]
+
+  hub:
+    environment:
+      # What GET /v1/fiber/node tells browser Fiber nodes to dial. Set either in .env to override (e.g. a wss address).
+      FIBER_PUBLIC_P2P_ADDRS: ${FIBER_PUBLIC_P2P_ADDRS:-/ip4/${PUBLIC_IP:?set PUBLIC_IP in deploy/testnet/.env}/tcp/${FNN_HUB_P2P_PORT:-8228}}
+      FIBER_PUBLIC_WS_ADDRS: ${FIBER_PUBLIC_WS_ADDRS:-/ip4/${PUBLIC_IP:?set PUBLIC_IP in deploy/testnet/.env}/tcp/${FNN_HUB_P2P_PORT:-8228}/ws}
