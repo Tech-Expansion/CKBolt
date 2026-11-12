@@ -19,13 +19,16 @@ import {
 /**
  * The ln_to_fiber payout guard (FIBER_PAYOUT_GUARD, SwapFlow.guardPayout): fnn lets a payee claim the hub's TLC on chain
  * with the preimage even after it expires, and on-chain settlement opens only a commitment delay after a force close.
- * While the payout is in flight, the hub force-closes a private channel whose payee still holds the TLC at
- * fiberPayoutForceCloseAt, so settlement opens before the TLC expires, while the Lightning hold still stands. It never
- * touches the incoming leg, never closes a public channel, and a failure to look is retried on the next pass.
+ * While the payout is in flight, the hub force-closes a channel whose peer still holds the TLC at
+ * fiberPayoutForceCloseAt, so settlement opens before the TLC expires, while the Lightning hold still stands. Only a
+ * public channel the hub opened to a router that is not the payee stays open. It never touches the incoming leg, and a
+ * failure to look is retried on the next pass.
  */
 
 const PRIVATE_CHANNEL = `0x${"a1".repeat(32)}`;
 const PUBLIC_CHANNEL = `0x${"b2".repeat(32)}`;
+const PAYEE_PUBLIC_CHANNEL = `0x${"c3".repeat(32)}`;
+/** The peer of the default private channel. On a public channel it stands for a router: the payout invoice's payee is h.userFiber. */
 const PAYEE = `03${"cd".repeat(32)}`;
 /** fnn's default commitment delay (1 epoch of 4 h), counted 25 % longer, plus the 30-minute margin. */
 const DEFAULT_LEAD_MS = hours(5) + minutes(30);
@@ -114,13 +117,83 @@ describe("swap engine: the ln_to_fiber payout guard", () => {
     expect(await holdState(hash)).toBe("SETTLED");
   });
 
-  it("never closes a public channel: its peer is a router, answerable to its own payee first", async () => {
+  it("leaves open a public channel the hub opened to a router that is not the payee: the router answers to its payee first", async () => {
     const { swap, hash, sentAt } = await holdingPayee();
     h.hubFiber.setOfferedTlcs(hash, [offered({ channelId: PUBLIC_CHANNEL, channelPublic: true, expiresAt: sentAt + hours(7) })]);
     h.clock.set(sentAt + hours(6));
     await processPasses(h, swap.id, 3);
     expect(h.hubFiber.forceClosedChannels).toEqual([]);
     expect(callCount(h.hubFiber, "forceCloseChannel")).toBe(0);
+  });
+
+  it("closes a public channel whose peer is the payee itself, at the same point as a private one", async () => {
+    const { swap, hash, sentAt } = await holdingPayee();
+    const expiresAt = sentAt + hours(7);
+    h.hubFiber.setOfferedTlcs(hash, [offered({ channelId: PUBLIC_CHANNEL, channelPublic: true, peer: h.userFiber.nodeId, expiresAt })]);
+
+    h.clock.set(expiresAt - DEFAULT_LEAD_MS - minutes(1));
+    await processPasses(h, swap.id, 2);
+    expect(h.hubFiber.forceClosedChannels).toEqual([]);
+
+    h.clock.set(expiresAt - DEFAULT_LEAD_MS);
+    const after = await processPasses(h, swap.id, 2);
+    expect(h.hubFiber.forceClosedChannels).toEqual([PUBLIC_CHANNEL]);
+    expect(after).toMatchObject({ state: "outgoing_in_flight", refunded: false });
+    expect(await holdState(hash)).toBe("ACCEPTED");
+  });
+
+  it("closes a public channel a peer opened, whoever the payee: anyone can open one to the hub and route through it", async () => {
+    const { swap, hash, sentAt } = await holdingPayee();
+    h.hubFiber.setOfferedTlcs(hash, [offered({ channelId: PUBLIC_CHANNEL, channelPublic: true, channelOpenedByPeer: true, expiresAt: sentAt + hours(7) })]);
+
+    h.clock.set(sentAt + FIBER_PAYOUT_GUARD.settleGraceMs - minutes(1));
+    await processPasses(h, swap.id, 1);
+    expect(h.hubFiber.forceClosedChannels).toEqual([]);
+
+    h.clock.set(sentAt + FIBER_PAYOUT_GUARD.settleGraceMs);
+    await processPasses(h, swap.id, 1);
+    expect(h.hubFiber.forceClosedChannels).toEqual([PUBLIC_CHANNEL]);
+  });
+
+  it("reads the payout invoice's payee only when a due TLC is on a routing channel the hub opened", async () => {
+    const { swap, hash, sentAt } = await holdingPayee();
+    h.hubFiber.setOfferedTlcs(hash, [offered({ expiresAt: sentAt + hours(7) })]);
+    const parsedBefore = callCount(h.hubFiber, "parseInvoice");
+    h.clock.set(sentAt + hours(2));
+    await processPasses(h, swap.id, 2);
+    expect(h.hubFiber.forceClosedChannels).toEqual([PRIVATE_CHANNEL]);
+    expect(callCount(h.hubFiber, "parseInvoice")).toBe(parsedBefore);
+
+    h.hubFiber.setOfferedTlcs(hash, [offered({ channelId: PUBLIC_CHANNEL, channelPublic: true, expiresAt: sentAt + hours(7) })]);
+    await processPasses(h, swap.id, 1);
+    expect(callCount(h.hubFiber, "parseInvoice")).toBeGreaterThan(parsedBefore);
+  });
+
+  it("closes the payee's channel and leaves the router's open when one pass sees both", async () => {
+    const { swap, hash, sentAt } = await holdingPayee();
+    const expiresAt = sentAt + hours(7);
+    h.hubFiber.setOfferedTlcs(hash, [
+      offered({ channelId: PUBLIC_CHANNEL, channelPublic: true, expiresAt }),
+      offered({ channelId: PAYEE_PUBLIC_CHANNEL, channelPublic: true, peer: h.userFiber.nodeId, expiresAt }),
+    ]);
+    h.clock.set(expiresAt - DEFAULT_LEAD_MS);
+    await processPasses(h, swap.id, 2);
+    expect(h.hubFiber.forceClosedChannels).toEqual([PAYEE_PUBLIC_CHANNEL]);
+  });
+
+  it("a failure to read the payout invoice is logged and retried; the swap stays as it is", async () => {
+    const { swap, hash, sentAt } = await holdingPayee();
+    h.hubFiber.setOfferedTlcs(hash, [offered({ channelId: PUBLIC_CHANNEL, channelPublic: true, peer: h.userFiber.nodeId, expiresAt: sentAt + hours(7) })]);
+    h.clock.set(sentAt + hours(2));
+    h.hubFiber.failNext = "parseInvoice";
+
+    const after = await processPasses(h, swap.id, 1);
+    expect(after.state).toBe("outgoing_in_flight");
+    expect(h.hubFiber.forceClosedChannels).toEqual([]);
+    expect(logs.warn).toHaveBeenCalledWith(expect.stringContaining("could not check the payout's channels"));
+
+    await processPasses(h, swap.id, 1);
+    expect(h.hubFiber.forceClosedChannels).toEqual([PUBLIC_CHANNEL]);
   });
 
   it("counts a channel the peer opened with the delay assumed for peer channels: closes after the grace", async () => {

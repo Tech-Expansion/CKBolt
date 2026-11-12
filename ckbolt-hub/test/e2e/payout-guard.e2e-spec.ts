@@ -13,17 +13,17 @@ import type { FnnChannel } from "../../devnet/scripts/lib/fiber";
 /**
  * The ln_to_fiber payout guard (FIBER_PAYOUT_GUARD, docs/phase-3-plan.md section 3) on the devnet's real nodes. The
  * payee (fnn-user) holds the hub's TLC with a hold invoice instead of settling it, as a payee that withholds the
- * preimage would. Once the hub's clock passes fiberPayoutForceCloseAt, the hub force-closes the private channel the TLC
- * is on; the payee then claims the TLC on chain with the preimage, fnn-hub reports it as the payout's preimage, and the
- * hub collects the Lightning hold invoice it still holds.
+ * preimage would. Once the hub's clock passes fiberPayoutForceCloseAt, the hub force-closes the channel the TLC is on,
+ * whether private or public (a public node can be the payee); the payee then claims the TLC on chain with the preimage,
+ * fnn-hub reports it as the payout's preimage, and the hub collects the Lightning hold invoice it still holds.
  *
- * The hub runs with a clock a test can move forward, so it acts as if 1.5 hours had passed without waiting for them;
+ * The hub runs with a clock a test can move forward, so it acts as if 2 hours had passed without waiting for them;
  * the CKB devnet's epochs last about ten blocks, so the channel's commitment delay passes in seconds of real time.
  */
 
 const SATS = BigInt(3_101);
-/** Funding of the private channel the hub opens to fnn-user for this test: enough for the payout and its reserve. */
-const PRIVATE_CHANNEL_CKB = BigInt(5_000) * BigInt(100_000_000);
+/** Funding of the channel the hub opens to fnn-user for each case: enough for the payout and its reserve. */
+const PAYOUT_CHANNEL_CKB = BigInt(5_000) * BigInt(100_000_000);
 /** How long the hub's clock jumps: past the force-close point of a payout (expiry less 5.5 h, about 1.2 h after sending). */
 const CLOCK_JUMP_MS = 2 * MS_PER_HOUR;
 /** On-chain steps (open, force close, the delay, the claim) on a devnet mining a block a second. */
@@ -51,30 +51,38 @@ async function until<T>(read: () => Promise<T>, done: (value: T) => boolean, wha
 const sameId = (a: string, b: string): boolean => canonicalHex(a) === canonicalHex(b);
 const holdsTlcFor = (channel: FnnChannel, hash: string): boolean => channel.pending_tlcs.some((tlc) => sameId(tlc.payment_hash, hash));
 
-describe("payout guard on the devnet: a payee that holds the payout over a private channel", () => {
+const CASES = [
+  { channel: "a private channel", isPublic: false },
+  { channel: "a public channel whose peer is the payee", isPublic: true },
+] as const;
+
+describe.each(CASES)("payout guard on the devnet: a payee that holds the payout over $channel", ({ isPublic }) => {
   const e2e = useE2eContext();
-  let disabledPublic: string[] = [];
+  let disabled: string[] = [];
 
   afterAll(async () => {
-    // Give the devnet back as it was: the public CKB channels on again (the private one is closed by the test).
-    for (const id of disabledPublic) await e2e.nodes.fiber.hub.setChannelEnabled(id, true).catch(() => undefined);
+    // Give the devnet back as it was: the other CKB channels on again (the test's own channel is closed by the test).
+    for (const id of disabled) await e2e.nodes.fiber.hub.setChannelEnabled(id, true).catch(() => undefined);
   });
 
   it(
-    "force-closes the private channel; the payee claims on chain with the preimage; the hub collects the Lightning hold",
+    "force-closes the channel; the payee claims on chain with the preimage; the hub collects the Lightning hold",
     async () => {
       const { fiber, lnd, pubkeys } = e2e.nodes;
 
-      // A private CKB channel fnn-hub -> fnn-user; the public CKB ones off for now, so the payout takes the private one.
-      await fiber.hub.openChannel(pubkeys.fnnUser, PRIVATE_CHANNEL_CKB, null, false);
-      const privateChannel = await until(
-        async () => (await fiber.hub.channelsWith(pubkeys.fnnUser)).find((c) => c.is_public === false && c.funding_udt_type_script === null),
+      // A fresh CKB channel fnn-hub -> fnn-user; every other CKB channel with fnn-user off for now, so the payout takes it.
+      const ckbChannels = async () => (await fiber.hub.channelsWith(pubkeys.fnnUser)).filter((c) => c.funding_udt_type_script === null);
+      const before = new Set((await ckbChannels()).map((c) => c.channel_id));
+      await fiber.hub.openChannel(pubkeys.fnnUser, PAYOUT_CHANNEL_CKB, null, isPublic);
+      const payoutChannel = await until(
+        async () => (await ckbChannels()).find((c) => !before.has(c.channel_id)),
         (c) => c?.state.state_name === FIBER_CHANNEL_READY_STATE,
-        "the private channel to be ready",
+        "the payout channel to be ready",
       );
-      const publicCkb = (await fiber.hub.channelsWith(pubkeys.fnnUser)).filter((c) => c.is_public !== false && c.funding_udt_type_script === null);
-      for (const channel of publicCkb) await fiber.hub.setChannelEnabled(channel.channel_id, false);
-      disabledPublic = publicCkb.map((c) => c.channel_id);
+      expect(payoutChannel?.is_public === true).toBe(isPublic);
+      const others = (await ckbChannels()).filter((c) => !sameId(c.channel_id, payoutChannel!.channel_id));
+      for (const channel of others) await fiber.hub.setChannelEnabled(channel.channel_id, false);
+      disabled = others.map((c) => c.channel_id);
 
       const clock = new MovableClock();
       const hub = await e2e.startHub({ providers: [[CLOCK, clock]] });
@@ -97,19 +105,23 @@ describe("payout guard on the devnet: a payee that holds the payout over a priva
       await waitForSwap(hub, swap.id, (s) => s.state === SWAP_STATE.OUTGOING_IN_FLIGHT, ON_CHAIN_TIMEOUT_MS, POLL_MS);
       await until(() => fiber.user.getInvoice(paymentHash), (i) => i.status === "Received", "the payee to hold the payout");
       const carrying = (await fiber.hub.channelsWith(pubkeys.fnnUser)).find((c) => holdsTlcFor(c, paymentHash));
-      expect(carrying?.channel_id).toBe(privateChannel?.channel_id);
+      expect(carrying?.channel_id).toBe(payoutChannel?.channel_id);
 
       // Before the force-close point nothing happens; past it the hub closes that channel and only that one.
       await new Promise((resolve) => setTimeout(resolve, 5_000));
-      expect((await fiber.hub.channelsWith(pubkeys.fnnUser)).find((c) => sameId(c.channel_id, privateChannel!.channel_id))?.state.state_name).toBe(
+      expect((await fiber.hub.channelsWith(pubkeys.fnnUser)).find((c) => sameId(c.channel_id, payoutChannel!.channel_id))?.state.state_name).toBe(
         FIBER_CHANNEL_READY_STATE,
       );
       clock.offsetMs = CLOCK_JUMP_MS;
       await until(
-        async () => (await fiber.hub.channelsWith(pubkeys.fnnUser, true)).find((c) => sameId(c.channel_id, privateChannel!.channel_id)),
+        async () => (await fiber.hub.channelsWith(pubkeys.fnnUser, true)).find((c) => sameId(c.channel_id, payoutChannel!.channel_id)),
         (c) => c !== undefined && c.state.state_name !== FIBER_CHANNEL_READY_STATE,
-        "the hub to force-close the private channel",
+        "the hub to force-close the payout channel",
       );
+      for (const id of disabled) {
+        const other = (await fiber.hub.channelsWith(pubkeys.fnnUser)).find((c) => sameId(c.channel_id, id));
+        expect(other?.state.state_name).toBe(FIBER_CHANNEL_READY_STATE);
+      }
       expect((await getSwap(hub, swap.id)).state).toBe(SWAP_STATE.OUTGOING_IN_FLIGHT);
       expect(await swapSides(e2e.nodes, SWAP_DIRECTION.LN_TO_FIBER).holdInvoiceStatus(paymentHash)).toBe("ACCEPTED");
 

@@ -74,7 +74,8 @@ Playwright's bundled Chromium lacks; those tests skip themselves there and run i
 - fnn can report a payment `Failed` while a part is still out: payouts go in one part (`max_parts: 1`), a matching
   preimage is success, and a `Failed` payout is final only once no outbound TLC for the hash is still pending.
 - fnn lets a payee claim the hub's TLC on chain with the preimage even after its expiry; the payout guard
-  (`FIBER_PAYOUT_GUARD`) force-closes a private payout channel early so that claim lands in time.
+  (`FIBER_PAYOUT_GUARD`) force-closes the payout channel early so that claim lands in time. Only a public channel the
+  hub opened to a router that is not the payee stays open.
 
 ## Web app rules
 

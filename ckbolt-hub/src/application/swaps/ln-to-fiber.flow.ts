@@ -48,6 +48,14 @@ const FIBER_PAYMENT_LEG_STATE: Readonly<Record<FiberPaymentState, PayoutLegState
 };
 
 /**
+ * A public channel the hub's node opened: a routing channel to a node the operator chose. Its peer is a router whose
+ * own payee answers to it a hop's expiry delta earlier, so the payout guard leaves it open unless that peer is the payee
+ * itself. Any other channel can put the TLC in the hands of whoever claims it late: a private channel pays only its
+ * peer, and anyone can open a channel to the hub and announce it.
+ */
+const isHubRoutingChannel = (tlc: FiberOfferedTlc): boolean => tlc.channelPublic && !tlc.channelOpenedByPeer;
+
+/**
  * ln_to_fiber (docs/phase-3-plan.md section 3, direction A): the user pays a Lightning hold invoice on the hub's LND,
  * the hub pays the user's Fiber invoice, capped by `tlc_expiry_limit` so the Fiber lock ends before LND auto-cancels
  * the held HTLC.
@@ -138,17 +146,19 @@ export class LnToFiberFlow implements SwapFlow {
   }
 
   /**
-   * Force-closes each private channel on which the payee still holds the hub's TLC past fiberPayoutForceCloseAt
-   * (FIBER_PAYOUT_GUARD): the on-chain settlement then opens before the TLC expires, so a payee that claims it with the
-   * preimage on chain does so while the Lightning hold still stands, and fnn reports the preimage as the payment's. A
-   * public channel's peer is a router, whose own payee answers to it first (a hop's expiry delta), so it is left open.
+   * Force-closes each channel on which the peer still holds the hub's TLC past fiberPayoutForceCloseAt
+   * (FIBER_PAYOUT_GUARD), unless that peer is a router the hub chose (isHubRoutingChannel) and not the payee: the
+   * on-chain settlement then opens before the TLC expires, so a peer that claims it with the preimage on chain does so
+   * while the Lightning hold still stands, and fnn reports the preimage as the payment's.
    */
   async guardPayout(swap: Swap, sentAt: number): Promise<string[]> {
     const now = this.deps.clock.now();
     const due = (await this.deps.fiber.offeredTlcs(swap.paymentHash)).filter(
-      (tlc) => !tlc.channelPublic && now >= fiberPayoutForceCloseAt({ ...tlc, commitmentDelayEpochs: this.commitmentDelayOf(tlc), sentAt }),
+      (tlc) => now >= fiberPayoutForceCloseAt({ ...tlc, commitmentDelayEpochs: this.commitmentDelayOf(tlc), sentAt }),
     );
-    const channelIds = [...new Set(due.map((tlc) => tlc.channelId))];
+    const payee = due.some(isHubRoutingChannel) ? await this.payoutPayee(swap) : null;
+    const unsafe = due.filter((tlc) => !isHubRoutingChannel(tlc) || tlc.peer === payee);
+    const channelIds = [...new Set(unsafe.map((tlc) => tlc.channelId))];
     for (const channelId of channelIds) await this.deps.fiber.forceCloseChannel(channelId);
     return channelIds;
   }
@@ -169,6 +179,11 @@ export class LnToFiberFlow implements SwapFlow {
     const payout = { state: FIBER_PAYMENT_LEG_STATE[payment.state], preimage: payment.preimage, failureReason: payment.failedError };
     if (payout.state !== PAYOUT_LEG_STATE.FAILED) return payout;
     return (await this.deps.fiber.hasOfferedTlcs(payment.paymentHash)) ? { ...payout, state: PAYOUT_LEG_STATE.IN_FLIGHT } : payout;
+  }
+
+  /** The node the payout pays: its invoice's payee. fnn sends a payment only to an invoice that names one. */
+  private async payoutPayee(swap: Swap): Promise<string | null> {
+    return (await this.deps.fiber.parseInvoice(swap.payoutInvoice)).payee;
   }
 
   /** The hub opens its channels with fnn's default delay; a channel a peer opened is counted with the delay assumed for it. */

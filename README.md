@@ -80,9 +80,10 @@ On the test networks with real wallets: [ckbolt-hub/docs/testing-testnet.md](ckb
 - One hub, run by one operator. Hold invoices mean it cannot keep a payer's money without paying out, but it sets the
   prices and the liquidity, and it can be down.
 - Lightning to Fiber payouts: an fnn payee can claim a TLC on chain with the preimage even after it expires. The hub
-  force-closes a private payout channel early when the payee still holds its TLC, so that claim lands while the
-  Lightning hold is still open. A payout over a channel the payee's node opened with a short commitment delay, and a
-  public Fiber node that is itself the payee, are not covered yet; node-opened token channels are off on the public hub.
+  force-closes the payout channel early when its peer still holds the TLC, so that claim lands while the Lightning
+  hold is still open; only a public channel the hub opened to a router that is not the payee stays open. A payout over
+  a channel the payee's node opened with a commitment delay of about 1.6 to 2.5 epochs is not covered yet;
+  node-opened token channels are off on the public hub.
 - The browser Fiber node keeps its key in the browser, encrypted with the visitor's password. It is meant for test
   money.
 

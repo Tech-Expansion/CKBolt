@@ -97,12 +97,13 @@ export const TIMING_PROFILES = {
 export type TimingProfileName = keyof typeof TIMING_PROFILES;
 
 /**
- * ln_to_fiber payouts over a private channel, whose peer is the payee: fnn lets the payee claim the hub's TLC on chain
- * with the preimage even after its expiry, and the on-chain settlement opens only once the channel's commitment delay
- * has passed after a force close. fnn closes 2/3 of that delay before expiry, so the claim can come about a third of the
- * delay after it, past the point where LND gives the Lightning hold back. The hub closes such a channel itself, earlier
- * (domain/timing fiberPayoutForceCloseAt), when the payee has not settled: settlement then opens before the TLC
- * expires, while the hold still stands, and a preimage the payee reveals on chain still collects it.
+ * ln_to_fiber payouts: fnn lets the peer holding the hub's TLC claim it on chain with the preimage even after its
+ * expiry, and the on-chain settlement opens only once the channel's commitment delay has passed after a force close.
+ * fnn closes 2/3 of that delay before expiry, so the claim can come about a third of the delay after it, past the point
+ * where LND gives the Lightning hold back. The hub closes the channel itself, earlier (domain/timing
+ * fiberPayoutForceCloseAt), when the peer has not settled: settlement then opens before the TLC expires, while the hold
+ * still stands, and a preimage revealed on chain still collects it. Only a public channel the hub opened to a router
+ * that is not the payee stays open (LnToFiberFlow.guardPayout).
  */
 export const FIBER_PAYOUT_GUARD = {
   /** CKB epochs aim at 4 hours but some run longer: the commitment delay is counted this much longer. */

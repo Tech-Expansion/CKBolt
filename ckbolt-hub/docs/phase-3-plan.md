@@ -123,12 +123,15 @@ CCH, Boltz and Loop:
   channel's commitment delay has passed after a force close. fnn force-closes 2/3 of that delay before expiry, so a payee
   that withholds the preimage could claim about a third of the delay after expiry (about 80 minutes with the default
   1-epoch delay), after LND has given the Lightning hold back. While a payout is in flight, the hub force-closes a
-  *private* payout channel whose payee still holds the TLC at `fiberPayoutForceCloseAt` (expiry minus the channel's delay
-  counted 25 % long, minus 30 minutes; never sooner than 10 minutes after the send): settlement then opens before the
-  expiry, while the hold still stands, and fnn reports a preimage claimed on chain as the payment's, so the hub collects.
-  Public channels are left open: their peer is a router, answerable to its own payee a hop delta earlier. Not covered:
-  a channel a peer opened with a delay between about 1.6 and 2.5 epochs (peer channels stay off until this is solved),
-  and a public node that is itself the payee. Extending the hold instead does not fit LDK's 1,008-block cap on Mutinynet. Checked on the devnet's real nodes
+  payout channel whose peer still holds the TLC at `fiberPayoutForceCloseAt` (expiry minus the channel's delay counted
+  25 % long, minus 30 minutes; never sooner than 10 minutes after the send): settlement then opens before the expiry,
+  while the hold still stands, and fnn reports a preimage claimed on chain as the payment's, so the hub collects. Only a
+  public channel the hub opened itself, to a router that is not the payee, is left open: that router answers to its own
+  payee a hop delta earlier. Every other channel is closed: a private one (its peer is the payee), a public one whose
+  peer is the payee (a public node can be the payee; since 2026-11-12), and any channel a peer opened, public or not
+  (anyone can open one to the hub, announce it and route a payout through it; since 2026-11-12). Not covered: a channel
+  a peer opened with a delay between about 1.6 and 2.5 epochs (peer channels stay off until this is solved). Extending
+  the hold instead does not fit LDK's 1,008-block cap on Mutinynet. Checked on the devnet's real nodes
   (2026-11-10, `test/e2e/payout-guard.e2e-spec.ts`): fnn-hub force-closes the private channel, the payee claims the TLC
   on chain with the preimage, fnn-hub reports that preimage as the payout's, and the hub settles the Lightning hold.
 
