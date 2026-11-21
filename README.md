@@ -9,6 +9,7 @@ or the payer is refunded.
 
 - Live testnet demo: <https://ckbolt.texlabs.org> (Bitcoin Mutinynet and CKB testnet, test money only)
 - Testnet cWBTC faucet: <https://ckbolt-faucet.texlabs.org>
+- News: [@CKBoltNetwork](https://x.com/CKBoltNetwork) on X
 - Built by [TEX Labs](https://texlabs.org)
 
 ## What is in this repository
