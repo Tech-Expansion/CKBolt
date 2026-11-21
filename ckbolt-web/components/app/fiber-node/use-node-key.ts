@@ -7,6 +7,7 @@ import {
   encryptKeys,
   parseKeystore,
   passwordProblem,
+  strengthenKeystore,
   WrongPasswordError,
   type KeystoreRecord,
 } from "@/lib/wallets/fiber-browser/keystore";
@@ -26,11 +27,15 @@ export interface NodeKey {
   error: string | null;
   /** New keys, stored encrypted; the keys to start with, or null on error. */
   create: (password: string, confirmation: string) => Promise<NodeKeys | null>;
+  /** Opens the stored keys; a record with weaker scrypt parameters than today's is stored again with today's. */
   unlock: (password: string) => Promise<NodeKeys | null>;
-  /** Replaces the stored keys with a backup, after checking the password opens it. */
+  /** Replaces the stored keys with a backup, after checking the password opens it (with today's scrypt parameters). */
   restore: (backup: string, password: string) => Promise<NodeKeys | null>;
-  /** Keeps the node id next to the keys, so the page can name the node before it is unlocked. */
-  rememberNodeId: (nodeId: string) => void;
+  /**
+   * Keeps the running node's id and CKB address next to the keys: the page names the node before it is unlocked, and
+   * the funding page checks a link's address against it (security review W7). A null address keeps the stored one.
+   */
+  rememberNode: (nodeId: string, address: string | null) => void;
   forget: () => void;
 }
 
@@ -39,6 +44,19 @@ const UNREADABLE_BACKUP = "This is not a CKBolt Fiber node backup for this netwo
 const UNEXPECTED = "Something went wrong with the node key. Try again.";
 
 const messageOf = (e: unknown): string => (e instanceof WrongPasswordError ? e.message : e instanceof Error ? e.message : UNEXPECTED);
+
+/**
+ * The record to keep once `password` has opened it: encrypted again with today's scrypt parameters when its own are
+ * weaker (security review W6), else as it is. The keys are already open, so a failure here keeps the old record and
+ * still lets the node start.
+ */
+async function strongerRecord(record: KeystoreRecord, keys: NodeKeys, password: string): Promise<KeystoreRecord> {
+  try {
+    return (await strengthenKeystore(record, keys, password, browserKeystoreDeps())) ?? record;
+  } catch {
+    return record;
+  }
+}
 
 /** The node's keys in this browser: create, unlock, restore, forget. Keys only ever leave this hook to start the node. */
 export function useNodeKey(network: string): NodeKey {
@@ -91,9 +109,12 @@ export function useNodeKey(network: string): NodeKey {
     (password: string) =>
       run(async () => {
         if (!record) throw new Error("There is no node key in this browser yet.");
-        return decryptKeys(record, password, browserKeystoreDeps());
+        const keys = await decryptKeys(record, password, browserKeystoreDeps());
+        const kept = await strongerRecord(record, keys, password);
+        if (kept !== record) save(kept);
+        return keys;
       }),
-    [run, record],
+    [run, record, save],
   );
 
   const restore = useCallback(
@@ -103,15 +124,18 @@ export function useNodeKey(network: string): NodeKey {
         const parsed = parseKeystore(backup.trim(), network);
         if (!parsed) throw new Error(UNREADABLE_BACKUP);
         const keys = await decryptKeys(parsed, password, browserKeystoreDeps());
-        save(parsed);
+        // The address comes only from the node that runs here: a backup's own is dropped, and the node writes it once it runs.
+        save(await strongerRecord({ ...parsed, address: null }, keys, password));
         return keys;
       }),
     [run, repository, save, network],
   );
 
-  const rememberNodeId = useCallback(
-    (nodeId: string) => {
-      if (record && record.nodeId !== nodeId) save({ ...record, nodeId });
+  const rememberNode = useCallback(
+    (nodeId: string, address: string | null) => {
+      if (!record) return;
+      const nextAddress = address ?? record.address;
+      if (record.nodeId !== nodeId || record.address !== nextAddress) save({ ...record, nodeId, address: nextAddress });
     },
     [record, save],
   );
@@ -123,5 +147,5 @@ export function useNodeKey(network: string): NodeKey {
     setError(repository ? null : STORAGE_BLOCKED);
   }, [repository]);
 
-  return { record, storageBlocked: !repository, unreadable, busy, error, create, unlock, restore, rememberNodeId, forget };
+  return { record, storageBlocked: !repository, unreadable, busy, error, create, unlock, restore, rememberNode, forget };
 }

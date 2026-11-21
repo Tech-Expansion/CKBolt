@@ -27,6 +27,7 @@ import { TEST_FIBER_NODE_GLOBAL } from "../../lib/wallets/fiber-browser/fiber-te
 import { FakeCkbChain, rpcTransactionHash, sameScript, type JsonRpcRequest } from "./fiber-byo-fakes";
 import { expectNoSeriousAxe } from "./page-checks";
 import { chooseUtxoGlobal, installCkbWallet } from "./support/ckb-wallet";
+import { fakeNodeIdentity, keysFromHex, keystoreWithAddress, KEYSTORE_KEY, makeStoredKey, OLD_KDF, seedKeystore, storedKeystore } from "./support/node-keystore";
 
 /*
  * The visitor's Fiber node in the browser: the isolated page /app/fiber that runs it, and the same-origin
@@ -641,7 +642,7 @@ const hubSummary = (page: Page) => page.getByTestId("fiber-node-hub-summary");
 const hubKnown = (page: Page) => expect(hubPanel(page)).toContainText("Hub node", { timeout: 20_000 });
 
 async function createNode(page: Page, password = PASSWORD) {
-  await page.getByLabel("Password, at least 8 characters").fill(password);
+  await page.getByLabel("Password, at least 12 characters").fill(password);
   await page.getByLabel("Repeat the password").fill(password);
   await page.getByRole("button", { name: "Create node" }).click();
   await expect(page.getByTestId("fiber-node-address")).toBeVisible({ timeout: 30_000 });
@@ -755,7 +756,7 @@ test.describe("browser Fiber node: the isolated page", () => {
     await expect(page.getByRole("heading", { name: "Your Fiber node." })).toBeVisible();
     await expect(page.locator("main")).toContainText("A Fiber node in this tab, for live swaps on testnet.");
     const about = await openTip(page, "About the browser node");
-    await expect(about).toContainText("fiber-js 0.9.1 runs in this tab on CKB testnet.");
+    await expect(about).toContainText("fiber-js 0.10.1 runs in this tab on CKB testnet.");
     await expect(about).toContainText("encrypted with your password");
     await page.keyboard.press("Escape");
     const limits = page.getByTestId("fiber-node-limits");
@@ -790,10 +791,10 @@ test.describe("browser Fiber node: the isolated page", () => {
     await page.goto("/app/fiber");
     await expect(page.getByTestId("fiber-node-create")).toBeVisible({ timeout: 20_000 });
     const before = await page.evaluate(() => performance.getEntriesByType("resource").length);
-    await page.getByLabel("Password, at least 8 characters").fill(PASSWORD);
+    await page.getByLabel("Password, at least 12 characters").fill(PASSWORD);
     await page.getByLabel("Repeat the password").fill(PASSWORD);
     await page.getByRole("button", { name: "Create node" }).click();
-    await expect(page.getByTestId("fiber-node-status")).toContainText(/Starting the node: loading fiber-js 0\.9\.1|Node id|could not start/, { timeout: 30_000 });
+    await expect(page.getByTestId("fiber-node-status")).toContainText(/Starting the node: loading fiber-js 0\.10\.1|Node id|could not start/, { timeout: 30_000 });
     await expect
       .poll(
         () =>
@@ -849,11 +850,11 @@ test.describe("browser Fiber node: key and node", () => {
     await hubKnown(page);
 
     // Password rules first.
-    const password = page.getByLabel("Password, at least 8 characters");
+    const password = page.getByLabel("Password, at least 12 characters");
     await password.fill("short");
     await page.getByLabel("Repeat the password").fill("short");
     await page.getByRole("button", { name: "Create node" }).click();
-    await expect(page.getByTestId("fiber-node-key-error")).toHaveText("Use at least 8 characters.");
+    await expect(page.getByTestId("fiber-node-key-error")).toHaveText("Use at least 12 characters.");
     await expect(password).toHaveAttribute("aria-invalid", "true");
     await password.fill(PASSWORD);
     await page.getByLabel("Repeat the password").fill(`${PASSWORD}!`);
@@ -901,7 +902,9 @@ test.describe("browser Fiber node: key and node", () => {
     expect(await callsOf(page, "connect_peer")).toEqual([{ address: `${HUB_WSS}/p2p/${HUB_PEER_ID}` }]);
     await expect(hubPanel(page)).toContainText(shorten(HUB_NODE_ID, 10));
 
-    // The keystore: scrypt with the named cost and AES-GCM, the public node id, nothing in clear.
+    // The keystore: scrypt with the named cost and AES-GCM, the public node id and address, nothing in clear. The
+    // running node writes its address next to its key, for the funding page (W7).
+    await expect.poll(async () => (await storedKeystore(page))?.address).toBe(address);
     const stored = await page.evaluate(() => ({ ...localStorage }));
     // The keystore, and the hub's public node id, kept so the wallet knows the hub while it is out of reach.
     expect(Object.keys(stored).filter((k) => k.startsWith("ckbolt:fiber-browser")).sort()).toEqual([
@@ -910,7 +913,7 @@ test.describe("browser Fiber node: key and node", () => {
     ]);
     expect(stored["ckbolt:fiber-browser:testnet:hub-node-id"]).toBe(HUB_NODE_ID);
     const record = JSON.parse(stored["ckbolt:fiber-browser:testnet:keystore"]);
-    expect(record).toMatchObject({ version: 1, network: "testnet", kdf: { name: "scrypt", logN: 16, r: 8, p: 1 }, cipher: { name: "AES-GCM" }, nodeId: state.nodeId });
+    expect(record).toMatchObject({ version: 1, network: "testnet", kdf: { name: "scrypt", logN: 16, r: 8, p: 1 }, cipher: { name: "AES-GCM" }, nodeId: state.nodeId, address });
 
     const secrets = [start.fiberKey, start.ckbKey!, PASSWORD];
     await expectNowhere(secrets, [
@@ -1039,7 +1042,7 @@ test.describe("browser Fiber node: key and node", () => {
     await harness(context);
     await openNodePage(page, { failStart: "Failed to load contract cell deps" });
     await hubKnown(page);
-    await page.getByLabel("Password, at least 8 characters").fill(PASSWORD);
+    await page.getByLabel("Password, at least 12 characters").fill(PASSWORD);
     await page.getByLabel("Repeat the password").fill(PASSWORD);
     await page.getByRole("button", { name: "Create node" }).click();
     await expect(tagOf(page, "Node")).toHaveText("Failed", { timeout: 30_000 });
@@ -1052,6 +1055,126 @@ test.describe("browser Fiber node: key and node", () => {
     await unlock(page);
     await expect(page.getByTestId("fiber-node-address")).toBeVisible({ timeout: 30_000 });
     await expect(tagOf(page, "Node")).toHaveText("Running");
+  });
+});
+
+test.describe("browser Fiber node: the key's password and scrypt (security review W6)", () => {
+  /** A password of the old minimum, which a new key may not use any more but a kept one still opens with. */
+  const SHORT = "eight ch";
+  const OLD_CREATED = "2026-09-01T10:00:00.000Z";
+
+  test("a new password needs 12 characters: 11 are refused, exactly 12 create the node and unlock it after a reload", async ({ page, context }) => {
+    test.setTimeout(90_000);
+    await harness(context);
+    await openNodePage(page);
+    await hubKnown(page);
+    const eleven = "elevenchars";
+    const twelve = "twelve chars";
+    expect([eleven.length, twelve.length]).toEqual([11, 12]);
+    const password = page.getByLabel("Password, at least 12 characters");
+    await expect(password).toBeVisible();
+    await password.fill(eleven);
+    await page.getByLabel("Repeat the password").fill(eleven);
+    await page.getByRole("button", { name: "Create node" }).click();
+    await expect(page.getByTestId("fiber-node-key-error")).toHaveText("Use at least 12 characters.");
+    await expect(password).toHaveAttribute("aria-invalid", "true");
+    expect((await fake(page)).starts).toEqual([]);
+    expect(await page.evaluate((key) => localStorage.getItem(key), KEYSTORE_KEY)).toBeNull();
+
+    await createNode(page, twelve);
+    const first = await fake(page);
+    expect(first.starts).toHaveLength(1);
+    expect(await storedKeystore(page)).toMatchObject({ kdf: { name: "scrypt", logN: 16, r: 8, p: 1 }, nodeId: first.nodeId });
+
+    await page.reload();
+    await expect(page.getByTestId("fiber-node-unlock")).toBeVisible({ timeout: 20_000 });
+    await hubKnown(page);
+    await unlock(page, twelve);
+    await expect(page.getByTestId("fiber-node-address")).toBeVisible({ timeout: 30_000 });
+    expect((await fake(page)).starts[0].fiberKey).toBe(first.starts[0].fiberKey);
+  });
+
+  test("a key kept under an 8-character password with an older scrypt cost unlocks, and is stored again with today's cost", async ({ page, context }) => {
+    test.setTimeout(90_000);
+    await harness(context);
+    const made = await makeStoredKey({ password: SHORT, kdf: OLD_KDF, createdAt: OLD_CREATED });
+    const own = fakeNodeIdentity(keysFromHex(made.keys));
+    const old = await makeStoredKey({ password: SHORT, kdf: OLD_KDF, keys: keysFromHex(made.keys), nodeId: own.nodeId, address: own.address, createdAt: OLD_CREATED });
+    await seedKeystore(page, old.text);
+    await openNodePage(page);
+    await expect(page.getByTestId("fiber-node-unlock")).toContainText(`Node ${shorten(own.nodeId, 8)} is stored in this browser.`);
+    await hubKnown(page);
+    // Unlock checks no length: the old password opens it.
+    await unlock(page, SHORT);
+    await expect(page.getByTestId("fiber-node-address")).toBeVisible({ timeout: 30_000 });
+    const started = await fake(page);
+    expect(started.starts[0]).toMatchObject({ fiberKey: old.keys.fiberKey, ckbKey: old.keys.ckbKey });
+    expect(started.nodeId).toBe(own.nodeId);
+    await expect(page.getByTestId("fiber-node-address")).toContainText(own.address);
+
+    // Stored again with today's scrypt parameters, under the same password; the node, its address and its age stay.
+    await expect.poll(async () => (await storedKeystore(page))?.kdf.logN, { timeout: 15_000 }).toBe(16);
+    const stronger = (await storedKeystore(page))!;
+    expect(stronger.kdf).toMatchObject({ name: "scrypt", logN: 16, r: 8, p: 1 });
+    expect(stronger.kdf.salt).not.toBe(old.record.kdf.salt);
+    expect(stronger.ciphertext).not.toBe(old.record.ciphertext);
+    expect(stronger).toMatchObject({ version: 1, network: "testnet", nodeId: own.nodeId, address: own.address, createdAt: OLD_CREATED });
+    await expectNowhere([old.keys.fiberKey, old.keys.ckbKey, SHORT], [{ name: "local storage", text: JSON.stringify(await page.evaluate(() => ({ ...localStorage }))) }]);
+
+    // The same password opens the new record, and nothing is written again.
+    await page.reload();
+    await expect(page.getByTestId("fiber-node-unlock")).toBeVisible({ timeout: 20_000 });
+    await hubKnown(page);
+    await unlock(page, SHORT);
+    await expect(page.getByTestId("fiber-node-address")).toBeVisible({ timeout: 30_000 });
+    expect((await fake(page)).starts[0].fiberKey).toBe(old.keys.fiberKey);
+    expect(await storedKeystore(page)).toEqual(stronger);
+  });
+
+  test("a kept key whose scrypt costs more work than today's (with less memory) is opened and left as it is", async ({ page, context }) => {
+    test.setTimeout(90_000);
+    await harness(context);
+    // N 2^15, r 8, p 4: half today's memory, twice its work. Moving it to today's would make it cheaper to try passwords on.
+    const made = await makeStoredKey({ password: SHORT, kdf: { logN: 15, r: 8, p: 4 }, createdAt: OLD_CREATED });
+    const own = fakeNodeIdentity(keysFromHex(made.keys));
+    const kept = await makeStoredKey({ password: SHORT, kdf: { logN: 15, r: 8, p: 4 }, keys: keysFromHex(made.keys), nodeId: own.nodeId, address: own.address, createdAt: OLD_CREATED });
+    await seedKeystore(page, kept.text);
+    await openNodePage(page);
+    await hubKnown(page);
+    await unlock(page, SHORT);
+    await expect(page.getByTestId("fiber-node-address")).toBeVisible({ timeout: 30_000 });
+    expect((await fake(page)).starts[0].fiberKey).toBe(kept.keys.fiberKey);
+    await expect(hubPanel(page)).toContainText("Connected");
+    expect(await page.evaluate((key) => localStorage.getItem(key), KEYSTORE_KEY)).toBe(kept.text);
+  });
+
+  test("a backup made under an 8-character password with an older scrypt cost restores; the backup's address is dropped and the node writes its own", async ({ page, context }) => {
+    test.setTimeout(90_000);
+    await harness(context);
+    const made = await makeStoredKey({ password: SHORT, kdf: OLD_KDF, createdAt: OLD_CREATED });
+    const own = fakeNodeIdentity(keysFromHex(made.keys));
+    // The file names someone else's address: a backup is not the node, so the page does not take its word for it.
+    const elsewhere = ccc.Address.from({ script: { codeHash: SECP_CODE_HASH, hashType: "type", args: `0x${"ee".repeat(20)}` }, prefix: "ckt" }).toString();
+    const backup = await makeStoredKey({ password: SHORT, kdf: OLD_KDF, keys: keysFromHex(made.keys), nodeId: own.nodeId, address: elsewhere, createdAt: OLD_CREATED });
+    await openNodePage(page);
+    await hubKnown(page);
+    const restore = page.getByTestId("fiber-node-restore");
+    await restore.getByText("Restore from a backup").click();
+    await restore.getByLabel("Backup file contents").fill(backup.text);
+    await restore.getByLabel("The backup's password").fill(SHORT);
+    await restore.getByRole("button", { name: "Restore and start node" }).click();
+    await expect(page.getByTestId("fiber-node-address")).toBeVisible({ timeout: 30_000 });
+    expect((await fake(page)).starts.at(-1)).toMatchObject({ fiberKey: backup.keys.fiberKey, ckbKey: backup.keys.ckbKey });
+
+    // Stored with today's cost, and with the address the running node reported, not the file's.
+    await expect.poll(async () => (await storedKeystore(page))?.address, { timeout: 15_000 }).toBe(own.address);
+    const stored = (await storedKeystore(page))!;
+    expect(stored.kdf).toMatchObject({ name: "scrypt", logN: 16, r: 8, p: 1 });
+    expect(stored).toMatchObject({ nodeId: own.nodeId, address: own.address, createdAt: OLD_CREATED });
+    expect(JSON.stringify(stored)).not.toContain(elsewhere);
+    // The backup to download is the stored record, so it follows.
+    const [download] = await Promise.all([page.waitForEvent("download"), page.getByTestId("fiber-node-backup").getByRole("link", { name: "Download encrypted backup" }).click()]);
+    expect(JSON.parse(readFileSync(await download.path(), "utf8"))).toEqual(stored);
   });
 });
 
@@ -1394,6 +1517,9 @@ test.describe("browser Fiber node: channels with the hub", () => {
     await expect(form).toBeVisible({ timeout: 20_000 });
     await expect(form.getByRole("button", { name: "Connect CKB wallet" })).toBeVisible();
     await expect(fundPage.getByTestId("fund-node-missing")).toHaveCount(0);
+    // The running node confirmed its own address (W7): neither refused nor left unconfirmed.
+    await expect(fundPage.getByTestId("fund-node-mismatch")).toHaveCount(0);
+    await expect(fundPage.getByTestId("fund-node-unconfirmed")).toHaveCount(0);
     // Wallet popups (JoyID) need a page that is not isolated.
     expect(await fundPage.evaluate(() => crossOriginIsolated)).toBe(false);
     // The node tab keeps running: the funding page runs no node and takes no lock.
@@ -1416,6 +1542,8 @@ test.describe("browser Fiber node: channels with the hub", () => {
 
   test("the funding page fits the screen and has no serious accessibility problems", async ({ page }) => {
     const address = ccc.Address.from({ script: { codeHash: SECP_CODE_HASH, hashType: "type", args: `0x${"cd".repeat(20)}` }, prefix: "ckt" }).toString();
+    // The node kept this address with its key (W7: the page offers the form for the node's own address only).
+    await seedKeystore(page, await keystoreWithAddress(address));
     await page.goto(`/app/fiber/fund?address=${address}`);
     await expect(page.getByTestId("fund-fiber-node")).toBeVisible({ timeout: 20_000 });
     await expect(page.getByText("Testnet: fund your browser Fiber node")).toBeVisible();
@@ -1766,7 +1894,7 @@ test.describe("browser Fiber node: the bridge", () => {
         { name: BRIDGE_CHANNEL_NAME, version: BRIDGE_PROTOCOL_VERSION, method, params },
       );
 
-    const paid = await ask("pay-invoice", { swapId, invoice: holdInvoice });
+    const paid = await ask("pay-invoice", { swapId, invoice: holdInvoice, payoutInvoice: h.hub.swap.receive.invoice, asset: "CKB", amount: ckb(8_000).toString() });
     expect.soft(paid, "pay-invoice answer").toMatchObject({ ok: false, error: { code: "wrong_network" } });
     const made = await ask("make-invoice", { asset: "CKB", amount: ckb(100).toString(), quoteExpiresAt: new Date(now + 150_000).toISOString(), network: null });
     expect.soft(made, "make-invoice answer").toMatchObject({ ok: false, error: { code: "wrong_network" } });

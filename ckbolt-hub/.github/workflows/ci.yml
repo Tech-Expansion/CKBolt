@@ -1,0 +1,31 @@
+# Checks every push and pull request: types, unit tests (no network) and the production build. The devnet e2e suite
+# needs Docker and the local devnet (docs/testing.md), so it stays a local step before a deploy.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: Devnet scripts type-check
+        run: npm --prefix devnet ci && npm --prefix devnet run typecheck

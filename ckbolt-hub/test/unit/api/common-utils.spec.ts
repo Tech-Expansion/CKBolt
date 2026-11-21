@@ -122,6 +122,39 @@ describe("describeError", () => {
     const error = new TypeError("fetch failed", { cause: new Error("connect ECONNREFUSED 127.0.0.1:8227") });
     expect(describeError(error)).toBe("fetch failed: connect ECONNREFUSED 127.0.0.1:8227");
   });
+
+  describe("an AggregateError (the payout guard groups the steps of a pass that failed)", () => {
+    it("adds every grouped error's description in parentheses, an inner error's own cause included", () => {
+      const refused = new Error("shutdown_channel: channel is busy");
+      const lost = new TypeError("fetch failed", { cause: new Error("connect ECONNREFUSED 127.0.0.1:8227") });
+      const error = new AggregateError([refused, lost], "payout guard closed [0xa1]; 2 step(s) failed");
+
+      expect(describeError(error)).toBe(
+        "payout guard closed [0xa1]; 2 step(s) failed (shutdown_channel: channel is busy; fetch failed: connect ECONNREFUSED 127.0.0.1:8227)",
+      );
+    });
+
+    it("adds nothing for an empty one: no empty parentheses", () => {
+      expect(describeError(new AggregateError([], "nothing grouped"))).toBe("nothing grouped");
+    });
+
+    it("puts its own cause after the grouped errors", () => {
+      const error = new AggregateError([new Error("inner")], "outer", { cause: new Error("root") });
+      expect(describeError(error)).toBe("outer (inner): root");
+    });
+
+    it("stringifies a grouped value that is not an Error", () => {
+      expect(describeError(new AggregateError(["text", 42, null], "outer"))).toBe("outer (text; 42; null)");
+    });
+
+    it("describes one nested in another, and one held as a cause", () => {
+      const nested = new AggregateError([new AggregateError([new Error("deep")], "middle")], "outer");
+      expect(describeError(nested)).toBe("outer (middle (deep))");
+      expect(describeError(new Error("wrapper", { cause: new AggregateError([new Error("a"), new Error("b")], "group") }))).toBe(
+        "wrapper: group (a; b)",
+      );
+    });
+  });
 });
 
 describe("basisPointsOfCeil", () => {

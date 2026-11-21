@@ -29,7 +29,8 @@ const FIBER_PAGE_COPY = {
  * The visitor's own Fiber node (fiber-js) on an isolated page: next.config.mjs sends Document-Isolation-Policy and
  * COOP/COEP for this route only, so the CCC wallet popups on /app keep working. Links here are plain <a>, never
  * next/link: only a full load gets this page's headers. With ?view=wallet it is the Fiber node popup in a window of its own,
- * for browsers that cannot isolate the header's popover (Firefox, Safari).
+ * for browsers that cannot isolate the header's popover (Firefox, Safari). It renders per request (it reads the query),
+ * which proxy.ts's Content-Security-Policy needs: Next.js puts that response's nonce on the page's scripts.
  */
 export default async function FiberNodeRoute({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
   if (isWalletWindowQuery((await searchParams)[FIBER_WALLET_WINDOW.PARAM])) return <FiberWalletApp view="window" />;

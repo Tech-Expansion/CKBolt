@@ -34,7 +34,7 @@ invoice for the payout (CKB -> BTC, `fiber_to_ln`). Read with [lnd.md](./lnd.md)
 | Bitcoin Connect | v3.12.3 (MIT). Good modal, but about **233 KB gzip** (LNC + lit + sdk), its connector list is mostly mainnet custodial wallets, its Alby Hub button goes to Alby Cloud (mainnet), its LNC connector uses an RPC removed in LND 0.21, and its WebLN provider hides `network`. Its dependency `@getalby/lightning-tools` 8.2.0 does `import('crypto')`, which broke a plain browser build. [V][T] |
 | Faucet | On-chain, "Pay invoice", "Open channel", "Test NWC" and Arkade need **GitHub login or L402** (L402 = pay about 1,000 **mainnet** sats). No login: `POST /api/bolt11` (60/day/IP) and the LNURL-withdraw endpoint. 1,000,000 sats per request and per IP/user/address per rolling 24 h. API is documented (`/llms.txt`, `/auth.md`, `/openapi.json`); scripts use the GitHub **device flow** (JWT valid 31 days). [V][T] |
 | Faucet and hold invoices | It pays with `SendPaymentV2` and waits for a terminal state with no overall timeout, so it **does** pay a hold invoice and keep it in flight. The HTTP call sits behind Cloudflare, so the browser gets an error after about 100 s while the payment continues. [V code][I behaviour] |
-| Hold-invoice payers | Alby Hub (LDK) waits for success or failure with no timeout and caps the route CLTV at **1008**; LND (faucet) at 2016. The hub's Mutinynet hold invoice needs **861 blocks** with fnn's default Fiber invoice, so an LDK payer can use at most one 80-block forwarding hop (the faucet). [V][I] |
+| Hold-invoice payers | Alby Hub (LDK) waits for success or failure with no timeout and caps the route CLTV at **1008**; LND (faucet) at 2016. The hub's Mutinynet hold invoice needs **901 blocks** with fnn's default Fiber invoice (861 before the 30-minute Lightning margin of 2026-11-13). LDK also keeps 80 blocks for a random offset, so an LDK payer needs a channel of its own with the hub's LND (found on 2026-10-25, docs/testing-testnet.md). [V][I] |
 | makeInvoice CLTV | Alby Hub (LDK 0.2.7): `min_final_cltv_expiry_delta` **42**, expiry 86,400 s. LND (faucet, tested live): **80**, 86,400 s. The hub accepts payout invoices up to about **796** blocks on Mutinynet. [V][T][I] |
 | Verify on chain | Lightning payments are off-chain; mutinynet.com (mempool v3.3.2) shows funding/closing txs, nodes and public channels only. Payment proof = hub swap events, wallet history, and `sha256(preimage) == payment_hash`. [V] |
 | **Recommendation** | Build a small **"Connect wallet" panel with NWC first (paste secret, `@getalby/sdk/nwc`) plus WebLN when `window.webln` exists**; skip Bitcoin Connect for the Mutinynet demo. Testers use **Alby Hub on Mutinynet in Docker** with a faucet channel. Details in §6. [I] |
@@ -239,9 +239,9 @@ From the frontend tiles ([FFE/src/routes/index.tsx#L15-L43](https://github.com/M
 
 ### 4.1 The hub's numbers on Mutinynet [V code][I arithmetic]
 
-From `TIMING_PROFILES.mutinynet` (`src/common/constants/timing.constants.ts`): fast block 30 s, slow 45 s, `lndHoldExpiryDeltaBlocks` 18, `lnMarginBlocks` 20, `lnRouteBudgetBlocks` 160 (two LND hops of 80), `payerMaxCltv` 1008 (LDK), `maxFiberHops` 1, `fiberMarginMs` 10 min, `maxPayoutLockMs` 12 h.
+From `TIMING_PROFILES.mutinynet` (`src/common/constants/timing.constants.ts`): fast block 30 s, slow 45 s, `lndHoldExpiryDeltaBlocks` 18, `lnMarginBlocks` 60 (20 before 2026-11-13), `lnRouteBudgetBlocks` 160 (two LND hops of 80), `payerMaxCltv` 1008 (LDK), `maxFiberHops` 1, `fiberMarginMs` 10 min, `maxPayoutLockMs` 12 h.
 
-- **BTC -> CKB hold invoice** (`planLnToFiber`): Fiber payout lock = user's Fiber invoice `final_expiry_delta` + 1 × 4 h + 10 min. With fnn's default and minimum 160 min: 410 min = 820 blocks; `cltv_expiry` = 820 + 18 + 20 + 3 = **861 blocks** (about 7.2 h). A Fiber invoice with a longer final delta makes the CLTV exceed 1008 and the hub refuses the quote.
+- **BTC -> CKB hold invoice** (`planLnToFiber`): Fiber payout lock = user's Fiber invoice `final_expiry_delta` + 1 × 4 h + 10 min. With fnn's default and minimum 160 min: 410 min = 820 blocks; `cltv_expiry` = 820 + 18 + 60 + 3 = **901 blocks** (about 7.5 h; 861 with the 20-block margin used before 2026-11-13). A Fiber invoice with a longer final delta makes the CLTV exceed 1008 and the hub refuses the quote.
 - **CKB -> BTC payout invoice** (`planFiberToLn`): `cltv_limit` cap = floor(12 h / 45 s) = 960; needs invoice CLTV + 3 + 1 + 160 ≤ 960, so the payout invoice's `min_final_cltv_expiry_delta` may be up to about **796 blocks**.
 
 ### 4.2 Wallet behaviour
@@ -256,8 +256,8 @@ From `TIMING_PROFILES.mutinynet` (`src/common/constants/timing.constants.ts`): f
 
 ### 4.3 What this means for LDK payers [I]
 
-- LDK counts the invoice's final CLTV plus every forwarding hop's delta against 1008. With the hub's 861, an Alby Hub payer has **147 blocks** for forwarding hops. The faucet forwards with 80, so **Alby Hub -> faucet -> CKBolt hub (941) fits; any route with a second 80-block hop (1021) fails** with "no route".
-- Operational rule: the CKBolt hub's LND must have a channel with the faucet node (inbound for BTC -> CKB, as [lnd.md §4.4](./lnd.md) already says), and tester wallets should have their channel with the faucet too. A direct tester-to-hub channel also works (861).
+- LDK counts the invoice's final CLTV plus every forwarding hop's delta against 1008, and keeps 80 of them for a random offset (found on 2026-10-25; this note first missed the offset). With the hub's 901, an Alby Hub payer has **27 blocks** for forwarding hops: no forwarding node fits (the faucet forwards with 80, Megalith with 144), so the payer needs a channel with the hub's LND.
+- Operational rule: the CKBolt hub's LND must have a channel with the faucet node (inbound for BTC -> CKB, as [lnd.md §4.4](./lnd.md) already says), and tester wallets should have their channel with the faucet too. A tester's LDK wallet (Alby Hub) needs a direct channel with the hub (901 fits; through the faucet does not).
 - LND payers (faucet) have 2016, so they can use longer routes.
 - Every `makeInvoice` result seen (42, 80) is far below the hub's ~796 limit for payout invoices.
 - After a hub cancel (refund) the payer sees `incorrect_or_unknown_payment_details` ([lnd.md §2.2](./lnd.md)); Alby Hub returns "received payment failed event: …".
@@ -307,7 +307,7 @@ docker run -d --name albyhub-mutinynet --restart unless-stopped \
 ### 6.3 Hub prerequisites [I]
 
 - The hub's Mutinynet LND has a channel **from** the faucet (inbound, so payers can reach it in one 80-block hop) and **to** the faucet (outbound, for payouts).
-- Keep the Mutinynet profile's hold CLTV at or below 1008 (it is 861 with fnn's default Fiber invoice); otherwise only LND payers (faucet) can pay.
+- Keep the Mutinynet profile's hold CLTV at or below 1008 (it is 901 with fnn's default Fiber invoice since 2026-11-13); otherwise only LND payers (faucet) can pay.
 
 ---
 

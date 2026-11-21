@@ -110,6 +110,8 @@ export class FakeLightningNode implements LightningPort {
   readonly pubkey: string;
   /** Every call, in order, for assertions: e.g. expect(node.calls).toContain("settleInvoice"). */
   readonly calls: string[] = [];
+  /** Every createHoldInvoice request this node took, as the hub sent it, in order (e.g. to read its memo). */
+  readonly holdInvoiceRequests: Array<Parameters<LightningPort["createHoldInvoice"]>[0]> = [];
   private readonly payments = new Map<Hex32, LnPaymentStatus>();
   private readonly listeners = new Set<(paymentHash: Hex32) => void>();
   private balances: LnBalances;
@@ -195,6 +197,7 @@ export class FakeLightningNode implements LightningPort {
 
   async createHoldInvoice(args: { paymentHash: Hex32; amountSats: bigint; expirySeconds: number; cltvExpiry: number; memo: string }) {
     this.enter("createHoldInvoice");
+    this.holdInvoiceRequests.push({ ...args });
     return { paymentRequest: this.register(args.paymentHash, args.amountSats, args.expirySeconds, args.cltvExpiry, args.memo, true, null) };
   }
 

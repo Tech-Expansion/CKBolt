@@ -30,8 +30,11 @@ export const E2E_HUB_ENV: Readonly<Record<string, string>> = {
   SWAP_MAX_UNPAID: UNLIMITED,
 };
 
-/** The name the fake price source reports in quotes (prices.source). */
-export const E2E_PRICE_SOURCE_NAME = "e2e-fixed-prices";
+/**
+ * The names the fake price sources report in quotes (prices.source). Two of them, at the same fixed prices, because a
+ * price needs PRICE_MIN_SOURCES (2 by default) agreeing sources: the hub under test keeps the production rule.
+ */
+export const E2E_PRICE_SOURCE_NAMES: readonly string[] = ["e2e-fixed-prices-a", "e2e-fixed-prices-b"];
 
 /** Each test file gets a fresh SQLite database in a new directory with this prefix under the OS temp directory. */
 export const TEMP_DATABASE_DIR_PREFIX = "ckbolt-hub-e2e-";

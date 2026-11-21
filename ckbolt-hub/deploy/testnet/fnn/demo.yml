@@ -1,10 +1,12 @@
-# fnn v0.9.1 config of fnn-demo (the optional demo wallet's Fiber node) on CKB testnet: hub.yml with fnn-demo's own
+# fnn v0.10.1 config of fnn-demo (the optional demo wallet's Fiber node) on CKB testnet: hub.yml with fnn-demo's own
 # generated `ckb.udt_whitelist` (docs/add-token.md), whose `auto_accept_amount` per UDT is the asset's autoAcceptAmount
 # in FIBER_ASSETS (or add_token.py --demo-auto-accept), so fnn-demo accepts the channels fnn-hub opens to it (it accepts
 # CKB channels by fnn's default). Restart fnn-demo after the whitelist changes. Per-node values come from the
 # environment in docker-compose.yml. Do not edit the `scripts` section: it is fixed by the Fiber deployment on testnet.
 fiber:
   listening_addr: "/ip4/0.0.0.0/tcp/8228"
+  # Every store write waits for the disk (fnn 0.10): a power loss cannot lose the last channel updates.
+  store_sync_writes: true
   bootnode_addrs:
     - "/ip4/54.179.226.154/tcp/8228/p2p/Qmes1EBD4yNo9Ywkfe6eRw9tG1nVNGLDmMud1xJMsoYFKy"
     - "/ip4/16.163.7.105/tcp/8228/p2p/QmdyQWjPtbK4NWWsvy8s69NGJaQULwgeQDT5ZpNDrTNaeV"

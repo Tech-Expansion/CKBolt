@@ -40,7 +40,7 @@ import { toNodeId } from "../../common/utils/node-id.util";
 import { sameAssetScript } from "../../common/utils/script.util";
 import { secondsToMs } from "../../common/utils/time.util";
 import type { CkbNetwork, Hex32, Script } from "../../domain/types";
-import { FiberRpcResponseError } from "./fiber-rpc.errors";
+import { FiberInvoiceContentError, FiberRpcResponseError } from "./fiber-rpc.errors";
 import {
   rpcScriptSchema,
   storeChangeNotificationSchema,
@@ -119,7 +119,7 @@ export const fromRpcScript = (script: RpcScript): Script => ({
 export function networkFromCurrency(currency: string): CkbNetwork {
   const networks = Object.keys(FIBER_CURRENCY) as CkbNetwork[];
   const network = networks.find((candidate) => FIBER_CURRENCY[candidate].toLowerCase() === currency.toLowerCase());
-  if (network === undefined) throw new FiberRpcResponseError(`unknown currency "${currency}"`);
+  if (network === undefined) throw new FiberInvoiceContentError(`unknown currency "${currency}"`);
   return network;
 }
 
@@ -127,16 +127,27 @@ export function networkFromCurrency(currency: string): CkbNetwork {
 
 type InvoiceAttributes = ReadonlyMap<string, unknown>;
 
-/** `attrs` is a list of single-key objects; keys are looked up the same way as enum names. */
-const invoiceAttributes = (invoice: RpcCkbInvoice): InvoiceAttributes =>
-  new Map(invoice.data.attrs.flatMap((attr) => Object.entries(attr)).map(([key, value]) => [enumKey(key), value]));
+/**
+ * `attrs` is a list of single-key objects; keys are looked up the same way as enum names. A key may appear only once:
+ * an invoice that repeats one (two hash algorithms, two UDT scripts) is refused, since the hub would check one value
+ * while the paying node could use the other.
+ */
+function invoiceAttributes(invoice: RpcCkbInvoice): InvoiceAttributes {
+  const attrs = new Map<string, unknown>();
+  for (const [name, value] of invoice.data.attrs.flatMap((attr) => Object.entries(attr))) {
+    const key = enumKey(name);
+    if (attrs.has(key)) throw new FiberInvoiceContentError(`invoice attribute ${name} appears more than once`);
+    attrs.set(key, value);
+  }
+  return attrs;
+}
 
 const attribute = (attrs: InvoiceAttributes, key: string): unknown => attrs.get(enumKey(key)) ?? null;
 
 function stringAttribute(attrs: InvoiceAttributes, key: string): string | null {
   const value = attribute(attrs, key);
   if (value === null) return null;
-  if (typeof value !== "string") throw new FiberRpcResponseError(`invoice attribute ${key} is not a string`);
+  if (typeof value !== "string") throw new FiberInvoiceContentError(`invoice attribute ${key} is not a string`);
   return value;
 }
 
@@ -150,7 +161,7 @@ function featureAttribute(attrs: InvoiceAttributes): string[] {
   const value = attribute(attrs, FIBER_INVOICE_ATTR.FEATURE);
   if (value === null) return [];
   if (!Array.isArray(value) || !value.every((name) => typeof name === "string")) {
-    throw new FiberRpcResponseError(`invoice attribute ${FIBER_INVOICE_ATTR.FEATURE} is not a list of names`);
+    throw new FiberInvoiceContentError(`invoice attribute ${FIBER_INVOICE_ATTR.FEATURE} is not a list of names`);
   }
   return value;
 }
@@ -163,7 +174,7 @@ function udtScriptAttribute(attrs: InvoiceAttributes): Script | null {
   if (value === null) return null;
   if (typeof value === "string") return converted(FIBER_INVOICE_ATTR.UDT_SCRIPT, () => decodeMoleculeScript(value));
   const parsed = rpcScriptSchema.safeParse(value);
-  if (!parsed.success) throw new FiberRpcResponseError(`invoice attribute ${FIBER_INVOICE_ATTR.UDT_SCRIPT} is not a script`);
+  if (!parsed.success) throw new FiberInvoiceContentError(`invoice attribute ${FIBER_INVOICE_ATTR.UDT_SCRIPT} is not a script`);
   return fromRpcScript(parsed.data);
 }
 

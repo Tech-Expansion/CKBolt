@@ -133,13 +133,17 @@ describe("clientKeyOf", () => {
     },
   );
 
-  it.each(["192.0.2.1", "8.8.8.8", "::ffff:8.8.8.8", "172.32.0.1", "2001:db8::1"])(
-    "ignores the header from %s, a client on the internet that reached the hub directly, even with trustProxy",
-    (client) => {
-      expect(clientKeyOf(req("203.0.113.5", { remoteAddress: client }), true)).toBe(client);
-      expect(clientKeyOf(req(`${client}, 198.51.100.7`, { remoteAddress: client }), true)).toBe(client);
-    },
-  );
+  // The key is the client's own address, as clientNetworkKey counts it: IPv4-mapped as IPv4, IPv6 per /64.
+  it.each([
+    ["192.0.2.1", "192.0.2.1"],
+    ["8.8.8.8", "8.8.8.8"],
+    ["::ffff:8.8.8.8", "8.8.8.8"],
+    ["172.32.0.1", "172.32.0.1"],
+    ["2001:db8::1", "2001:db8:0:0::/64"],
+  ])("ignores the header from %s, a client on the internet that reached the hub directly, even with trustProxy (key %s)", (client, key) => {
+    expect(clientKeyOf(req("203.0.113.5", { remoteAddress: client }), true)).toBe(key);
+    expect(clientKeyOf(req(`${client}, 198.51.100.7`, { remoteAddress: client }), true)).toBe(key);
+  });
 
   it("trims spaces and ignores empty entries", () => {
     expect(clientKeyOf(req("  203.0.113.5  "), true)).toBe("203.0.113.5");
@@ -160,6 +164,25 @@ describe("clientKeyOf", () => {
     expect(clientKeyOf(req(undefined, {}), false)).toBe(UNKNOWN_CLIENT_KEY);
     expect(clientKeyOf(req("", {}), true)).toBe(UNKNOWN_CLIENT_KEY);
     expect(clientKeyOf(req("203.0.113.5", {}), false)).toBe(UNKNOWN_CLIENT_KEY);
+  });
+
+  describe("counts an address by its network (clientNetworkKey, security review H3)", () => {
+    it("keys an IPv6 socket address by its /64", () => {
+      expect(clientKeyOf(req(undefined, { remoteAddress: "2001:db8:1:2:aaaa::1" }), false)).toBe("2001:db8:1:2::/64");
+    });
+
+    it("keys an IPv6 X-Forwarded-For entry by its /64 behind a trusted proxy", () => {
+      expect(clientKeyOf(req("2001:db8:1:2:aaaa::1"), true)).toBe("2001:db8:1:2::/64");
+      expect(clientKeyOf(req("2001:db8:1:2:bbbb::2"), true)).toBe("2001:db8:1:2::/64");
+    });
+
+    it("keys an IPv4-mapped X-Forwarded-For entry as its IPv4 address", () => {
+      expect(clientKeyOf(req("::ffff:203.0.113.5"), true)).toBe("203.0.113.5");
+    });
+
+    it("keys the socket address the same way when the header is not trusted", () => {
+      expect(clientKeyOf(req("2001:db8:9:9::1", { remoteAddress: "::ffff:192.0.2.1" }), false)).toBe("192.0.2.1");
+    });
   });
 });
 
@@ -218,6 +241,21 @@ describe("RateLimitGuard", () => {
     guard.canActivate(fromAddress("192.0.2.2"));
     guard.canActivate(fromAddress("192.0.2.3"));
     expect(guard.canActivate(fromAddress("192.0.2.1"))).toBe(true);
+  });
+
+  it("counts every address of one IPv6 /64 as one client, and another /64 as another", () => {
+    const clock = new FakeClock(T0);
+    const guard = new RateLimitGuard(testConfig({ server: { rateLimitPerMinute: 1 } }), clock);
+    expect(guard.canActivate(fromAddress("2001:db8:1:2::1"))).toBe(true);
+    expect(() => guard.canActivate(fromAddress("2001:db8:1:2:ffff:ffff:ffff:ffff"))).toThrow(RateLimitedError);
+    expect(guard.canActivate(fromAddress("2001:db8:1:3::1"))).toBe(true);
+  });
+
+  it("counts an IPv4 client once, whether its address comes plain or IPv4-mapped", () => {
+    const clock = new FakeClock(T0);
+    const guard = new RateLimitGuard(testConfig({ server: { rateLimitPerMinute: 1 } }), clock);
+    expect(guard.canActivate(fromAddress("192.0.2.1"))).toBe(true);
+    expect(() => guard.canActivate(fromAddress("::ffff:192.0.2.1"))).toThrow(RateLimitedError);
   });
 
   it("follows server.trustProxy for the client key", () => {

@@ -19,6 +19,7 @@ export const LN_WALLET_MESSAGE = {
 
   /* the hub's hold invoice (ln_to_fiber) */
   HOLD_INVOICE_MISMATCH: "The hub's invoice does not match this swap, so CKBolt does not show it.",
+  HOLD_INVOICE_EXPIRED: "The hub's invoice has expired, so CKBolt does not show it.",
 
   /* a Lightning channel from the hub (./hub-channel.ts), on the guide's hub card */
   CHANNEL_NODE_ID_INVALID: "Paste your node id: 66 hex characters, starting 02 or 03.",

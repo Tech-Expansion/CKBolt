@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { ManualFiberStep, type FiberInvoiceRequest, type FiberWalletState } from "../../components/app/swap/contracts";
+import { ManualFiberStep, type FiberInvoiceRequest, type FiberPayRequest, type FiberWalletState } from "../../components/app/swap/contracts";
 import { fiberChipView } from "../../components/app/swap/wallets/chip-view";
 import { WALLET_TONE_LABEL } from "../../components/app/swap/wallets/copy";
 import { WALLET_TONE_STATUS } from "../../components/app/swap/wallets/status-dot";
@@ -270,6 +270,16 @@ class FakeBridge implements BrowserNodePort {
 
 const refuse = (code: (typeof BRIDGE_ERROR)[keyof typeof BRIDGE_ERROR]) => () => Promise.reject(new BridgeError(code, `node said ${code}`));
 
+/** What the swap card asks the node to pay: the hub's hold invoice and what the visitor accepted. */
+const payRequest = (patch: Partial<FiberPayRequest> = {}): FiberPayRequest => ({
+  swapId: "s1",
+  invoice: "fibt1hold",
+  payoutInvoice: "lntbs1visitor",
+  asset: "CKB",
+  amount: CKB(1_000),
+  ...patch,
+});
+
 test.describe("browser node wallet", () => {
   test("asks the node for the payout invoice and returns it once checked", async () => {
     const bridge = new FakeBridge();
@@ -277,6 +287,27 @@ test.describe("browser node wallet", () => {
     const r = request();
     await expect(wallet.makeInvoice(r)).resolves.toBe(bridge.invoice);
     expect(bridge.invoices).toEqual([{ asset: r.asset, amount: r.amount, quoteExpiresAt: r.quoteExpiresAt, network: r.network }]);
+  });
+
+  test("remembers the payment hash the node reported for each payout invoice it made here, and only for those", async () => {
+    const bridge = new FakeBridge();
+    const wallet = new BrowserNodeWallet(bridge);
+    const made = await wallet.makeInvoice(request());
+    expect(wallet.payoutHashOf(made)).toBe("ab".repeat(32));
+    // A pasted invoice, or any the node did not make here: unknown.
+    expect(wallet.payoutHashOf(demoFiberInvoice("testnet", BigInt(CKB(1_000))))).toBeNull();
+    expect(wallet.payoutHashOf("")).toBeNull();
+    // An invoice the check refused is not kept either.
+    bridge.invoice = demoFiberInvoice("testnet", BigInt(CKB(5)));
+    await expect(wallet.makeInvoice(request())).rejects.toThrow(FIBER_WALLET_MESSAGE.INVOICE_WRONG_AMOUNT);
+    expect(wallet.payoutHashOf(bridge.invoice)).toBeNull();
+  });
+
+  test("sends the node what the visitor accepted with the hold invoice: the payout invoice, the token and the amount", async () => {
+    const bridge = new FakeBridge();
+    const pay = payRequest({ asset: "RUSD", amount: "3960000000", payoutInvoice: "lntbs99u1mine" });
+    await new BrowserNodeWallet(bridge).payInvoice(pay);
+    expect(bridge.payments).toEqual([{ swapId: "s1", invoice: "fibt1hold", payoutInvoice: "lntbs99u1mine", asset: "RUSD", amount: "3960000000" }]);
   });
 
   test("refuses an invoice the node made for another amount", async () => {
@@ -294,7 +325,7 @@ test.describe("browser node wallet", () => {
   test("pays a swap once: a second call while the first runs, or after it, sends nothing", async () => {
     const bridge = new FakeBridge();
     const wallet = new BrowserNodeWallet(bridge);
-    const pay = { swapId: "s1", invoice: "fibt1hold" };
+    const pay = payRequest();
     const first = wallet.payInvoice(pay);
     const second = wallet.payInvoice(pay);
     await expect(first).resolves.toBeUndefined();
@@ -309,7 +340,7 @@ test.describe("browser node wallet", () => {
     const bridge = new FakeBridge();
     bridge.payAnswers.push(refuse(BRIDGE_ERROR.TIMEOUT));
     const wallet = new BrowserNodeWallet(bridge);
-    const pay = { swapId: "s1", invoice: "fibt1hold" };
+    const pay = payRequest();
     await expect(wallet.payInvoice(pay)).resolves.toBeUndefined();
     await expect(wallet.payInvoice(pay)).resolves.toBeUndefined();
     expect(bridge.payments).toHaveLength(1);
@@ -320,7 +351,7 @@ test.describe("browser node wallet", () => {
       const bridge = new FakeBridge();
       bridge.payAnswers.push(refuse(code));
       const wallet = new BrowserNodeWallet(bridge);
-      const pay = { swapId: "s1", invoice: "fibt1hold" };
+      const pay = payRequest();
       await expect(wallet.payInvoice(pay)).rejects.toThrow(`node said ${code}`);
       await expect(wallet.payInvoice(pay)).resolves.toBeUndefined();
       expect(bridge.payments).toHaveLength(2);
@@ -331,7 +362,7 @@ test.describe("browser node wallet", () => {
     const bridge = new FakeBridge();
     bridge.payAnswers.push(() => Promise.reject(new Error("channel closed")));
     const wallet = new BrowserNodeWallet(bridge);
-    const pay = { swapId: "s1", invoice: "fibt1hold" };
+    const pay = payRequest();
     await expect(wallet.payInvoice(pay)).rejects.toThrow("channel closed");
     await expect(wallet.payInvoice(pay)).rejects.toThrow("channel closed");
     expect(bridge.payments).toHaveLength(1);

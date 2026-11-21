@@ -33,7 +33,7 @@ Local testing without real networks is in [`testing.md`](testing.md).
 - BTC to CKB from Alby Hub failed with `RouteNotFound`. LDK pays only routes of at most 1008 CLTV blocks and keeps
   80 of them for a random offset (rust-lightning `router.rs`); the hub's hold invoice needs 861 (fnn locks a payout at
   least 400 minutes, about 800 Mutinynet blocks). That leaves 67 blocks for the nodes in between: not even Megalith
-  (144) fits. So:
+  (144) fits. (Since 2026-11-13 the hold invoice needs 901 blocks, leaving 27.) So:
   - **an Alby Hub wallet needs a channel of its own with the hub's LND** to pay BTC to CKB (section 2, step 5);
   - lnd-hub has a private channel with **Megalith**, the LSP Alby Hub wallets get their channels from: 220,000 sats,
     100,000 pushed to Megalith. Payouts to Alby Hub (CKB to BTC) go through it, and LND payers can pay through it

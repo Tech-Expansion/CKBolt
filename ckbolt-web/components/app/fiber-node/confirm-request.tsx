@@ -1,6 +1,7 @@
 "use client";
 
 import { useId, useState, type FormEvent } from "react";
+import { formatSats } from "@/lib/swap/format";
 import type { ConfirmOutcome, PendingConfirmation } from "@/lib/wallets/fiber-browser/confirmations";
 import { CKB_ASSET } from "@/lib/wallets/fiber-browser/channels";
 import type { StatusTone } from "@/lib/status-tone";
@@ -51,7 +52,7 @@ function PendingRequest({ pending, confirmations, names }: { pending: PendingCon
   const errorId = useId();
   useSecretReset(() => setPassword(""));
 
-  const asset = view.kind === "fiber-payment" ? view.asset : CKB_ASSET;
+  const asset = view.kind === "on-chain" ? CKB_ASSET : view.asset;
   const amount = names.amount(asset, view.amount);
   const canConfirm = !pending.running && (!onChain || password.length > 0);
 
@@ -67,7 +68,7 @@ function PendingRequest({ pending, confirmations, names }: { pending: PendingCon
   return (
     <form onSubmit={submit} className="space-y-4" data-testid="fiber-wallet-confirm-request" data-kind={view.kind} noValidate>
       <p className="flex items-center gap-1 text-sm">
-        {onChain ? CONFIRM_COPY.LEAD_ON_CHAIN : CONFIRM_COPY.LEAD_PAYMENT}
+        {onChain ? CONFIRM_COPY.LEAD_ON_CHAIN : view.kind === "swap-payment" ? CONFIRM_COPY.LEAD_SWAP : CONFIRM_COPY.LEAD_PAYMENT}
         <InfoTip label={CONFIRM_COPY.TIP_LABEL} align="start">
           {CONFIRM_COPY.TIP}
         </InfoTip>
@@ -92,6 +93,13 @@ function PendingRequest({ pending, confirmations, names }: { pending: PendingCon
             </div>
             <Row label={CONFIRM_COPY.MAX_FEE} value={names.amount(view.asset, view.maxFee)} />
             {view.note && <Row label={CONFIRM_COPY.NOTE} value={view.note} />}
+            {view.expiresAt !== null && <Row label={CONFIRM_COPY.EXPIRES} value={when(view.expiresAt)} />}
+          </>
+        ) : view.kind === "swap-payment" ? (
+          <>
+            <Row label={CONFIRM_COPY.YOU_GET} value={CONFIRM_COPY.SATS(formatSats(view.receiveSats))} />
+            <Row label={CONFIRM_COPY.TO} value={CONFIRM_COPY.HUB} />
+            <Row label={CONFIRM_COPY.MAX_FEE} value={names.amount(view.asset, view.maxFee)} />
             {view.expiresAt !== null && <Row label={CONFIRM_COPY.EXPIRES} value={when(view.expiresAt)} />}
           </>
         ) : (

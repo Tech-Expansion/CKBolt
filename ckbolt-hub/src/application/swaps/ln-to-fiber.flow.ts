@@ -4,7 +4,7 @@ import {
   FIBER_HASH_ALGORITHM_SHA256,
   MSAT_PER_SAT,
 } from "../../common/constants/protocol.constants";
-import { holdInvoiceDescription, SWAP_DIRECTION } from "../../common/constants/swap.constants";
+import { HOLD_INVOICE_DESCRIPTION, SWAP_DIRECTION } from "../../common/constants/swap.constants";
 import { basisPointsOfCeil } from "../../common/utils/basis-points.util";
 import { formatBaseUnits } from "../../common/utils/pricing.util";
 import { earliestOf, requirePresent } from "../../common/utils/swaps.util";
@@ -55,6 +55,16 @@ const FIBER_PAYMENT_LEG_STATE: Readonly<Record<FiberPaymentState, PayoutLegState
  */
 const isHubRoutingChannel = (tlc: FiberOfferedTlc): boolean => tlc.channelPublic && !tlc.channelOpenedByPeer;
 
+/** The channels the guard closed in one pass, and every step of that pass that failed. */
+interface GuardPassResult {
+  closed: string[];
+  failures: unknown[];
+}
+
+type CloseOutcome = { channelId: string; closed: true } | { channelId: string; closed: false; error: unknown };
+
+const channelIdsOf = (tlcs: readonly FiberOfferedTlc[]): string[] => [...new Set(tlcs.map((tlc) => tlc.channelId))];
+
 /**
  * ln_to_fiber (docs/phase-3-plan.md section 3, direction A): the user pays a Lightning hold invoice on the hub's LND,
  * the hub pays the user's Fiber invoice, capped by `tlc_expiry_limit` so the Fiber lock ends before LND auto-cancels
@@ -99,7 +109,7 @@ export class LnToFiberFlow implements SwapFlow {
         amountSats: quote.sats,
         expirySeconds,
         cltvExpiry: requirePresent(plan.holdCltvExpiry, "holdCltvExpiry"),
-        memo: holdInvoiceDescription(swapId),
+        memo: HOLD_INVOICE_DESCRIPTION,
       }),
     );
     return paymentRequest;
@@ -148,19 +158,28 @@ export class LnToFiberFlow implements SwapFlow {
   /**
    * Force-closes each channel on which the peer still holds the hub's TLC past fiberPayoutForceCloseAt
    * (FIBER_PAYOUT_GUARD), unless that peer is a router the hub chose (isHubRoutingChannel) and not the payee: the
-   * on-chain settlement then opens before the TLC expires, so a peer that claims it with the preimage on chain does so
-   * while the Lightning hold still stands, and fnn reports the preimage as the payment's.
+   * hub's timeout claim can then follow the TLC's expiry even when CKB epochs run long, without relying on fnn's own
+   * close. A late preimage claim before that claim confirms is covered by the Lightning margin (see FIBER_PAYOUT_GUARD).
+   *
+   * Channels that need no payee are closed first, and every close is tried: a failed close or a failed read of the payee
+   * never holds back another close. Any failure is thrown after the pass, naming what was closed and why the rest failed.
    */
   async guardPayout(swap: Swap, sentAt: number): Promise<string[]> {
     const now = this.deps.clock.now();
     const due = (await this.deps.fiber.offeredTlcs(swap.paymentHash)).filter(
       (tlc) => now >= fiberPayoutForceCloseAt({ ...tlc, commitmentDelayEpochs: this.commitmentDelayOf(tlc), sentAt }),
     );
-    const payee = due.some(isHubRoutingChannel) ? await this.payoutPayee(swap) : null;
-    const unsafe = due.filter((tlc) => !isHubRoutingChannel(tlc) || tlc.peer === payee);
-    const channelIds = [...new Set(unsafe.map((tlc) => tlc.channelId))];
-    for (const channelId of channelIds) await this.deps.fiber.forceCloseChannel(channelId);
-    return channelIds;
+    const pass = await this.forceClose(due.filter((tlc) => !isHubRoutingChannel(tlc)));
+    const routing = due.filter(isHubRoutingChannel);
+    if (routing.length > 0) {
+      const payeePass = await this.closeChannelsToPayee(swap, routing);
+      pass.closed.push(...payeePass.closed);
+      pass.failures.push(...payeePass.failures);
+    }
+    if (pass.failures.length > 0) {
+      throw new AggregateError(pass.failures, `payout guard closed [${pass.closed.join(", ")}]; ${pass.failures.length} step(s) failed`);
+    }
+    return pass.closed;
   }
 
   settleIncoming(_paymentHash: Hex32, preimage: Hex32): Promise<void> {
@@ -181,9 +200,38 @@ export class LnToFiberFlow implements SwapFlow {
     return (await this.deps.fiber.hasOfferedTlcs(payment.paymentHash)) ? { ...payout, state: PAYOUT_LEG_STATE.IN_FLIGHT } : payout;
   }
 
-  /** The node the payout pays: its invoice's payee. fnn sends a payment only to an invoice that names one. */
-  private async payoutPayee(swap: Swap): Promise<string | null> {
-    return (await this.deps.fiber.parseInvoice(swap.payoutInvoice)).payee;
+  /**
+   * Closes the routing channels whose peer is the payout's payee: its invoice's payee, which fnn needs to send at all.
+   * An invoice that names no payee could never have been sent, so every routing channel then counts as the payee's.
+   * A failed read closes none of them and is retried on the next pass: the guard acts hours before the expiry, and a
+   * hasty close would take an operator-chosen router's channel, with other swaps on it, on chain.
+   */
+  private async closeChannelsToPayee(swap: Swap, routing: readonly FiberOfferedTlc[]): Promise<GuardPassResult> {
+    let payee: string | null;
+    try {
+      payee = (await this.deps.fiber.parseInvoice(swap.payoutInvoice)).payee;
+    } catch (error) {
+      return { closed: [], failures: [error] };
+    }
+    return this.forceClose(routing.filter((tlc) => payee === null || tlc.peer === payee));
+  }
+
+  /** Force-closes each channel the TLCs are on, every one of them even when one fails. */
+  private async forceClose(tlcs: readonly FiberOfferedTlc[]): Promise<GuardPassResult> {
+    const outcomes = await Promise.all(channelIdsOf(tlcs).map((channelId) => this.forceCloseOne(channelId)));
+    return {
+      closed: outcomes.flatMap((outcome) => (outcome.closed ? [outcome.channelId] : [])),
+      failures: outcomes.flatMap((outcome) => (outcome.closed ? [] : [outcome.error])),
+    };
+  }
+
+  private async forceCloseOne(channelId: string): Promise<CloseOutcome> {
+    try {
+      await this.deps.fiber.forceCloseChannel(channelId);
+      return { channelId, closed: true };
+    } catch (error) {
+      return { channelId, closed: false, error };
+    }
   }
 
   /** The hub opens its channels with fnn's default delay; a channel a peer opened is counted with the delay assumed for it. */

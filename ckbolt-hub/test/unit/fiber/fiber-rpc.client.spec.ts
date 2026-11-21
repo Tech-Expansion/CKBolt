@@ -252,7 +252,8 @@ describe("fiber-rpc errors", () => {
     const error = new FiberInvoiceInvalidError("checksum failed");
     expect(error).toBeInstanceOf(HubError);
     expect(error).toMatchObject({ status: HttpStatus.BAD_REQUEST, code: API_ERROR_CODE.INVOICE_INVALID, detail: "checksum failed" });
-    expect(error.message).toContain("checksum failed");
+    // H10: the detail is for logs only; the client reads a fixed sentence.
+    expect(error.message).not.toContain("checksum failed");
   });
 
   it("isFiberRpcErrorMatching matches only fnn JSON-RPC errors whose message matches", () => {

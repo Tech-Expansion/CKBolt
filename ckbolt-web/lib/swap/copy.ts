@@ -130,6 +130,8 @@ export const STEP_LINE = {
   LOCKING: "Locking the quote…",
   LOCKED: "Locked",
   PAYING: "Paying from your wallet…",
+  /** CKB or a token to BTC: the browser node waits for the visitor's Confirm before it pays. */
+  CONFIRM_IN_NODE: "Confirm it in your Fiber node",
   SENT: "Sent; waiting for the hub",
   /** The visitor pays the hold invoice shown under the steps: from any Lightning wallet, or from their own Fiber node. */
   MANUAL: { ln_to_fiber: "Pay the invoice below", fiber_to_ln: "Pay the invoice below from your node" },
@@ -189,6 +191,11 @@ export const PROGRESS_COPY = {
   STEPS_LABEL: "Swap steps",
   STEP_STATUS: { pending: "Pending", active: "In progress", done: "Done", failed: "Failed" },
   HIDE: "Hide",
+  /** Hides the dialog and opens the header's Fiber node on its Confirm page. */
+  CONFIRM_IN_NODE: "Confirm in your Fiber node",
+  /** BTC to CKB or a token: the hold invoice still waits, SWAP_CARD.noPaymentHintAfterMs after the swap. */
+  NO_PAYMENT_YET: "No payment has reached the hub yet. If your wallet finds no route, it has no channel that reaches the hub.",
+  GET_HUB_CHANNEL: "Get a Lightning channel from the hub",
   RETRY: "Try again",
   NEW_QUOTE: "Get a new quote",
   NEW_SWAP: "New swap",

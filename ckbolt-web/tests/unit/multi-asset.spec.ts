@@ -26,7 +26,7 @@ import { shortOfChannelFunds } from "../../lib/wallets/fiber-wallet/node-page";
 
 /*
  * More tokens than CKB and RUSD (cWBTC first; any UDT the hub's FIBER_ASSETS lists): the browser node's UDT whitelist
- * built from the hub's entries (GET /v1/fiber/node `udtWhitelist`), merged into fiber-js 0.9.1's own config and read
+ * built from the hub's entries (GET /v1/fiber/node `udtWhitelist`), merged into fiber-js 0.10.1's own config and read
  * back to tell when a running node needs a restart; the channel reserve every token shares; the node's liquidity per
  * hub asset; decimals from the hub; and the faucet link.
  */
@@ -74,7 +74,7 @@ const HUB: FiberNodeDto = {
   },
 };
 
-/** fiber-js 0.9.1's real bundled testnet config, without starting a node. */
+/** fiber-js 0.10.1's real bundled testnet config, without starting a node. */
 async function bundledTestnetConfig(): Promise<string> {
   const { Fiber } = await import("@nervosnetwork/fiber-js");
   return Fiber.prototype.getDefaultConfig.call(Object.create(Fiber.prototype), "testnet", "https://rpc.example.test/");
@@ -158,7 +158,7 @@ test.describe("the hub's whitelist entries", () => {
 
 /* ------------------------------------------------------------------------------ the config's whitelist */
 
-test.describe("the browser node's whitelist in fiber-js 0.9.1's config", () => {
+test.describe("the browser node's whitelist in fiber-js 0.10.1's config", () => {
   test("fiber-js whitelists RUSD only on testnet, unanchored, auto-accepted from 10 RUSD", async () => {
     const original = await bundledTestnetConfig();
     expect(readUdtWhitelist(original)).toEqual([

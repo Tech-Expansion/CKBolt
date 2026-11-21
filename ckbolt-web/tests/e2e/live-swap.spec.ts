@@ -1,11 +1,13 @@
 import { test as base, expect, type Page } from "@playwright/test";
 import QRCode from "qrcode";
+import { secondsUntil } from "../../lib/hub/format";
 import { demoFiberInvoice } from "../../lib/payment-request";
-import { amountlessInvoice, apiError, hubAsset, installNoHub, lightningInvoice } from "./fakes/hub";
+import { PROGRESS_COPY } from "../../lib/swap/copy";
+import { amountlessInvoice, apiError, fastForward, hubAsset, installNoHub, lightningInvoice, pauseClock } from "./fakes/hub";
 import { deferred, FakeWebln, type WeblnReply } from "./fakes/lightning-wallet";
 import { expectNoHorizontalOverflow, expectNoSeriousAxe } from "./page-checks";
 import { hubChannel, installFakeNode, nodeCalls, nodeInvoices, openRunningNode, RUSD_SCRIPT, units } from "./support/fiber-node";
-import { createWalletNode, withoutWalletIsolation } from "./support/fiber-wallet";
+import { answerInNode, createWalletNode, withoutWalletIsolation } from "./support/fiber-wallet";
 import { isolate, LiveHub } from "./support/live-hub";
 import { CARD_TIMEOUT_MS, expectInsideViewport, STEP_TIMEOUT_MS, SwapCard, visibleSentences, visibleWords } from "./support/swap-card";
 
@@ -544,6 +546,62 @@ test.describe("BTC to CKB: the hub's hold invoice, paid from any wallet", () => 
     await card.expectStep(3, "active", "Pay the invoice below");
   });
 
+  test("unpaid 45 s after the swap, a hint under the invoice links a channel from the hub (new tab); gone once the hub holds the payment", async ({
+    card,
+    hub,
+    page,
+  }) => {
+    await page.clock.install();
+    await readyOwnNodeToFiber(card, hub);
+    await card.swap();
+    await card.expectStep(3, "active", "Pay the invoice below");
+    const hint = card.progress.getByTestId("swap-no-payment-hint");
+    await expect(hint).toHaveCount(0);
+
+    // The page's clock moves only when the test moves it, to just before and then exactly 45 s after the swap.
+    await pauseClock(page, hub);
+    const created = Date.parse(hub.current.createdAt);
+    const pageNow = () => page.evaluate(() => Date.now());
+    await fastForward(page, hub, created + 44_000 - (await pageNow()));
+    // The card read its clock again (its quote timer shows the time left then), and says nothing yet.
+    await expect(card.card.getByTestId("swap-quote-timer")).toHaveText(`${secondsUntil(hub.lastQuote.expiresAt, await pageNow())}s`);
+    await expect(hint).toHaveCount(0);
+    await fastForward(page, hub, created + 45_000 - (await pageNow()));
+    await expect(hint).toBeVisible();
+    await expect(hint).toContainText(PROGRESS_COPY.NO_PAYMENT_YET);
+    const link = hint.getByRole("link", { name: new RegExp(`^${PROGRESS_COPY.GET_HUB_CHANNEL}`) });
+    await expect(link).toHaveAttribute("href", "/app/guide#hub");
+    await expect(link).toHaveAttribute("target", "_blank");
+    // Under the invoice, which is still there to pay.
+    await expect(card.holdInvoice).toBeVisible();
+    const [invoiceBox, hintBox] = [await card.holdInvoice.boundingBox(), await hint.boundingBox()];
+    expect(hintBox!.y).toBeGreaterThanOrEqual(invoiceBox!.y + invoiceBox!.height - 1);
+
+    // The payment arrives: the hub holds it, and the hint goes with the invoice.
+    hub.holdPayment();
+    await page.clock.resume();
+    await card.expectStep(3, "done", "The hub holds your payment");
+    await expect(card.holdInvoice).toHaveCount(0);
+    await expect(hint).toHaveCount(0);
+  });
+
+  test("the hint goes once the quote expires and the invoice is no longer shown", async ({ card, hub, page }) => {
+    await page.clock.install();
+    await readyOwnNodeToFiber(card, hub);
+    await card.swap();
+    await card.expectStep(3, "active", "Pay the invoice below");
+    await pauseClock(page, hub);
+    const created = Date.parse(hub.current.createdAt);
+    const pageNow = () => page.evaluate(() => Date.now());
+    const hint = card.progress.getByTestId("swap-no-payment-hint");
+    await fastForward(page, hub, created + 60_000 - (await pageNow()));
+    await expect(hint).toBeVisible();
+    await fastForward(page, hub, Date.parse(hub.current.quoteExpiresAt) + 1_000 - (await pageNow()));
+    await expect(card.step(3)).toHaveAttribute("data-status", "failed");
+    await expect(card.holdInvoice).toHaveCount(0);
+    await expect(hint).toHaveCount(0);
+  });
+
   test("a WebLN extension that loads after the page is offered too", async ({ card, hub, page }) => {
     const webln = new FakeWebln();
     await webln.install(page, { late: true });
@@ -628,6 +686,15 @@ test.describe("a swap with the browser node", () => {
     await expect(card.step(1)).toContainText("Your invoice");
     await card.expectStep(2, "done", "Locked");
     expect(hub.swapBodies).toEqual([expect.objectContaining({ quoteId: hub.lastQuote.id, payoutInvoice: invoice })]);
+    // The node checks the hub's hold invoice, then waits for the visitor's Confirm in the node (security review W2). The
+    // node runs in its own tab, so the dialog says where and offers no button to open the header's popup.
+    await card.expectStep(3, "active", "Confirm it in your Fiber node");
+    await expect(card.progress.getByTestId("swap-confirm-in-node")).toHaveCount(0);
+    await expect(node.getByTestId("fiber-node-confirm").getByTestId("fiber-wallet-confirm-request")).toHaveAttribute("data-kind", "swap-payment", {
+      timeout: STEP_TIMEOUT_MS,
+    });
+    expect(await nodeCalls(node, "send_payment")).toEqual([]);
+    await answerInNode({ ui: node, scope: node }, "accept");
     await card.expectStep(3, "active", "Sent; waiting for the hub");
     expect(await nodeCalls(node, "send_payment")).toEqual([expect.objectContaining({ invoice: hub.current.pay.invoice })]);
 

@@ -2,6 +2,7 @@ import { LND_DEFAULT_HOLD_EXPIRY_DELTA_BLOCKS, MS_PER_SECOND } from "../../../sr
 import { TIMING_PROFILES, type TimingProfileName } from "../../../src/common/constants/timing.constants";
 import { loadHubConfig, type HubConfig } from "../../../src/config/hub.config";
 import { readEnvExample } from "../../support/env-example";
+import { TEST_PROXY_SECRET } from "../../support/proxy-secret";
 
 /**
  * HubConfig tunables of the security review's second wave: defaults documented in .env.example, validation, and the
@@ -90,21 +91,25 @@ describe("HubConfig: security tunables (wave 2)", () => {
   });
 
   describe("HUB_TRUST_PROXY needs a HUB_HOST only the proxy can reach", () => {
+    // A host that is not loopback also needs HUB_PROXY_SECRET to start (H2); every case here sets it, so only the
+    // trusted-proxy rule decides.
+    const withSecret = (env: Record<string, string>) => loadHubConfig({ ...env, HUB_PROXY_SECRET: TEST_PROXY_SECRET });
+
     it.each(["127.0.0.1", "::1", "localhost", "LOCALHOST", "10.8.0.2", "172.20.0.4", "192.168.1.10", "fd00::5", "0.0.0.0", "::"])(
       "accepts HUB_HOST=%s",
       (host) => {
-        expect(loadHubConfig({ HUB_TRUST_PROXY: "true", HUB_HOST: host }).server).toMatchObject({ host, trustProxy: true });
+        expect(withSecret({ HUB_TRUST_PROXY: "true", HUB_HOST: host }).server).toMatchObject({ host, trustProxy: true });
       },
     );
 
     it.each(["203.0.113.5", "8.8.8.8", "2001:db8::1", "hub.example.com"])("refuses HUB_HOST=%s, naming both variables", (host) => {
-      const load = () => loadHubConfig({ HUB_TRUST_PROXY: "true", HUB_HOST: host });
+      const load = () => withSecret({ HUB_TRUST_PROXY: "true", HUB_HOST: host });
       expect(load).toThrow(/^Invalid hub configuration: HUB_TRUST_PROXY=true needs HUB_HOST/);
       expect(load).toThrow(host);
     });
 
     it("leaves HUB_HOST free when the proxy is not trusted", () => {
-      expect(loadHubConfig({ HUB_TRUST_PROXY: "false", HUB_HOST: "203.0.113.5" }).server.host).toBe("203.0.113.5");
+      expect(withSecret({ HUB_TRUST_PROXY: "false", HUB_HOST: "203.0.113.5" }).server.host).toBe("203.0.113.5");
     });
   });
 });

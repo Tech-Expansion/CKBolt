@@ -40,3 +40,6 @@ export const ED25519_SIGNATURE_BYTES = 64;
 export const ED25519_PKCS8_SEED_PREFIX_HEX = "302e020100300506032b657004220420";
 /** DER header of an SPKI Ed25519 public key; the 32-byte raw key follows it. */
 export const ED25519_SPKI_KEY_PREFIX_HEX = "302a300506032b6570032100";
+
+/** Float slack for the spread limit (PRICE_MAX_SPREAD_BPS): 0.00197 and 0.00203 are 300 bps apart, not 300.0000000000008. */
+export const PRICE_SPREAD_TOLERANCE_BPS = 1e-6;

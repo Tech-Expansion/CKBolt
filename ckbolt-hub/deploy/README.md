@@ -44,9 +44,18 @@
   files, before `testnet env`, before the hub image is built, or while that image predates the generator. **The first
   time:** `testnet sync` (it warns about the image), `testnet build hub`, `python3 add_token.py --regenerate --apply --template-dir .sync-templates`
   on the server, then `testnet up hub` to recreate the hub. Details: add-token.md, "After every `testnet sync`".
+- Security review, round 2 (applied on testnet-vps on 2026-11-21; docs/security-review-2026-11.md):
+  - D9: URI-scoped macaroons;
+  - D1: bitcoind and LND on their own network;
+  - D7: log rotation, no-new-privileges and a socat connection limit;
+  - D8: images pinned by digest;
+  - D6: add_token.py, safer;
+  - D4: the tunnel needs HUB_PROXY_SECRET;
+  - H7 to H10 in the hub.
+  How it was applied: section 9, "Security round 2 on the server".
 - Peer channels capped (2026-11-07, in the code): `FIBER_PEER_CHANNELS_MAX_OPEN` in `hub.env` (default 10) stops
   `GET /v1/fiber/node` from offering node-funded token channels once that many are open (each locks about 180 CKB of
-  fnn-hub's wallet). fnn-hub still auto-accepts a channel opened directly with at least `minAmount`: fnn 0.9.1 has no
+  fnn-hub's wallet). fnn-hub still auto-accepts a channel opened directly with at least `minAmount`: fnn has no
   count limit (add-token.md, "Peer channels").
 
 The hub runs on **Mutinynet** (a custom signet with 30 s blocks and a working Lightning faucet) and **CKB testnet**
@@ -69,15 +78,15 @@ Below, `testnet <command>` is short for `npm --prefix deploy run testnet -- <com
 
 ```
 bitcoind (Mutinynet fork) ── lnd-hub [⇄ lnd-demo]        LND v0.21.4-beta on signet; lnd-hub ── Megalith (private)
-CKB testnet (public RPC)  ── fnn-hub [⇄ fnn-demo]        fnn v0.9.1 release, CKB and RUSD channels
+CKB testnet (public RPC)  ── fnn-hub [⇄ fnn-demo]        fnn v0.10.1 release, CKB and RUSD channels
 hub (CKBolt) ── lnd-hub, fnn-hub; demo wallet (optional) ── lnd-demo, fnn-demo
 ```
 
 | Service | Image | Role | Ports on the server |
 | --- | --- | --- | --- |
 | `bitcoind` | `ckbolt/bitcoind-mutinynet`, `testnet/bitcoind/Dockerfile` | Mutinynet full node (the fork Mutinynet's operators run, SHA-256 checked). Takes over the volume of the sync running since 2026-10-23 | none |
-| `lnd-hub` | `lightninglabs/lnd:v0.21.4-beta` | The hub's Lightning node, with a private channel to Megalith (the LSP of Alby Hub wallets) | **9735 public** (P2P) |
-| `fnn-hub` | `ckbolt/fnn:v0.9.1`, `devnet/fnn/Dockerfile` | The hub's Fiber node; RPC only on the Docker network | **8228 public** (P2P, and WebSocket for browser Fiber nodes on the same port) |
+| `lnd-hub` | `lightninglabs/lnd:v0.21.4-beta` (and its digest, `LND_DIGEST`) | The hub's Lightning node, with a private channel to Megalith (the LSP of Alby Hub wallets) | **9735 public** (P2P) |
+| `fnn-hub` | `ckbolt/fnn:v0.10.1`, `devnet/fnn/Dockerfile` | The hub's Fiber node; RPC only on the Docker network | **8228 public** (P2P, and WebSocket for browser Fiber nodes on the same port) |
 | `hub` | `ckbolt/hub`, `testnet/hub/Dockerfile` | The CKBolt hub, SQLite in volume `hub-data` | `127.0.0.1:18787` |
 | `lnd-demo`, `fnn-demo` | same | Optional demo wallet (`COMPOSE_PROFILES=demo`): testnet:smoke pays and receives with them; the hub offers them to visitors only with `DEMO_ENABLED=true` | none |
 
@@ -121,7 +130,7 @@ On the server, `/opt/ckbolt/testnet` (`DEPLOY_REMOTE_DIR`):
 | `hub.env` | The hub's settings (no secrets) | `testnet env` (from `hub.env.example`; later only appends new keys) |
 | `secrets/wallet/<node>.password` (600) | LND wallet unlock passwords, mounted into LND only | `testnet env` |
 | `secrets/wallet/<node>.seed` (600) | The 24 seed words of each LND wallet, written once | `testnet wallet` |
-| `secrets/hub/<node>/{tls.cert,*.macaroon}` (uid 1000, 600) | All the hub may read: TLS certificates and least-privilege macaroons (`info:read invoices:read invoices:write offchain:read offchain:write onchain:read`) | `testnet macaroons` |
+| `secrets/hub/<node>/{tls.cert,*.macaroon}` (uid 1000, 600) | All the hub may read: TLS certificates and least-privilege macaroons, with LND URI permissions for exactly the 13 calls the hub's LND adapter makes (`HUB_MACAROON_PERMISSIONS` in `deploy/scripts/lib/constants.ts`; until 2026-11-20 the broader `info:read invoices:read invoices:write offchain:read offchain:write onchain:read`) | `testnet macaroons` |
 
 Secrets are generated on the server (`/dev/urandom`) and never pass through this machine or a log; the scripts read
 back only the names of `.env` keys and the values of its non-secret ones. The SSH user must be root (as for `/opt` on
@@ -236,16 +245,18 @@ channels; flags `--direction ln_to_fiber|fiber_to_ln|both`, `--asset CKB|RUSD`, 
 | `HUB_TRUST_PROXY=false` | `hub.env` | One client through the tunnel. Set true only behind a public web server with `TRUST_PROXY=1` (section 10) |
 
 Timing on the `mutinynet` profile: a BTC to CKB payout through at most one Fiber hop needs a Lightning hold invoice of
-861 blocks for a payout invoice with Fiber's minimum final expiry delta (160 minutes): fnn locks any payout for at least
+901 blocks for a payout invoice with Fiber's minimum final expiry delta (160 minutes; 861 before the 30-minute
+Lightning margin of 2026-11-13): fnn locks any payout for at least
 400 minutes (the invoice's 160 plus a 4 h random expiry reserve), about 800 of Mutinynet's 30-second blocks. LDK payers
 such as Alby Hub accept at most 1,008 blocks for the whole route and keep 80 of them for a random offset
-(rust-lightning `router.rs`), so the nodes between them and the hub get 1,008 - 861 - 80 = 67 blocks: not enough for
-Megalith (144). **An Alby Hub wallet pays BTC to CKB only over a channel of its own with lnd-hub**: it connects to
+(rust-lightning `router.rs`), so the nodes between them and the hub get 1,008 - 901 - 80 = 27 blocks: not enough for
+Megalith (144) or the faucet node (80). **An Alby Hub wallet pays BTC to CKB only over a channel of its own with lnd-hub**: it connects to
 lnd-hub (`021d22f9…@203.0.113.10:9735`), then lnd-hub opens a channel to it with a push, for example
 `lncli openchannel --node_key=<wallet pubkey> --local_amt=30000 --push_amt=20000 --private`. LND payers (2,016 blocks)
 can pay through Megalith, whose route hint every hold invoice carries; payouts to Alby Hub wallets (CKB to BTC) go
 through Megalith too. On networks with 10-minute blocks the hold invoice is about 115 blocks and none of this applies.
-A visitor's Fiber invoice must set its final expiry delta between 160 and 233 minutes.
+A visitor's Fiber invoice must set its final expiry delta between 160 and 173 minutes (fnn and fiber-js default to
+160).
 
 ## 9. Operations
 
@@ -276,18 +287,125 @@ docker compose exec hub node -e "const db = require('better-sqlite3')('/data/hub
 
 **Restarts and upgrades.** The hub saves every transition before acting and resumes open swaps at start-up:
 `testnet compose -- restart hub` any time. Upgrade: `testnet sync`, `testnet build hub`, `testnet up hub`. Pinned:
-LND v0.21.4-beta, fnn v0.9.1 (not v0.10.0-rc: it cannot upgrade an existing database), the Mutinynet fork in
+LND v0.21.4-beta, fnn v0.10.1 (from 0.9.1: see "Upgrading fnn to 0.10" below), the Mutinynet fork in
 `bitcoind/Dockerfile`.
+
+**Upgrading fnn to 0.10** (from 0.9.1; rehearsed on the devnet on 2026-11-18). 0.10 speaks a new peer protocol (V2):
+existing V1 channels keep working, also with 0.9 peers, but a 0.10 node and a 0.9 node cannot open a new channel. So
+fnn-hub, fnn-demo and the web app's fiber-js move together, and testers with their own node upgrade it too. Fiber drops
+V1 channels in its next major release: close and reopen them before that.
+
+1. Set `SWAPS_PAUSED=true` in hub.env and recreate the hub; wait until no swap is open (the hub database has no swap
+   in a state other than `succeeded` or `failed`). The monitor alerts "Hub degraded" while the nodes are down below; it resolves by itself.
+2. `docker compose stop hub fnn-demo fnn-hub`, then back up both fnn volumes with the nodes stopped
+   (`docker run --rm -v <volume>:/v:ro -v "$PWD":/out alpine tar czf /out/<volume>-pre-0.10.tgz -C /v .`), and copy
+   the archives off the server.
+3. `testnet sync`, then `testnet build fnn-hub` (the image tag is now `ckbolt/fnn:v0.10.1`). Add
+   `store_sync_writes: true` under `fiber:` in the server's `fnn/hub.yml` and `fnn/demo.yml` if `sync` did not.
+4. Migrate each store once. fnn asks "Continue? [y/N]" on stdin, so in Docker it would exit and restart forever:
+   `printf 'y\n' | docker compose run --rm -T --no-deps --name fnn-hub-migrate fnn-hub`, wait for
+   "Migration complete" and "Store sync writes", then `docker stop fnn-hub-migrate`. The same for fnn-demo.
+5. `docker compose up -d fnn-hub fnn-demo`, check `list_channels` (every channel `ChannelReady`), then set
+   `SWAPS_PAUSED=false` and recreate the hub.
+
+Never restore a 0.9 fnn backup into a 0.10 node after channels moved (section 9): restore only into the version that
+wrote it.
 
 **Backups** (test money, but losing it costs faucet days): each LND seed (step 7) and static channel backup
 (`testnet compose -- cp lnd-hub:/root/.lnd/data/chain/bitcoin/signet/channel.backup ./lnd-hub.channel.backup`, then
 `scp` it home), the hub database (on the server: `docker compose exec hub node -e "require('better-sqlite3')('/data/hub.sqlite').backup('/data/hub-backup.sqlite').then(() => process.exit(0))"`),
-each fnn volume with the node stopped, and the server's `.env`.
+each fnn volume with the node stopped, and the server's `.env`. Copy every backup off the server: a backup kept in the
+same volume or on the same disk is lost with it.
+
+**Restoring.** Each part has its own rule, and some backups must never be restored:
+
+- **fnn: never restore an old copy of a node's store over a node that has run since.** Its channels have moved on. A
+  node restarted on an old state can broadcast a revoked commitment, and the peer then takes the whole channel as a
+  penalty. If a store is lost, start the node empty with the same key and let the peers close the channels: the funds
+  come back on chain to the node's address after the commitment delay. An fnn volume copy is only for moving a node
+  that was stopped when it was copied and has not run since.
+- **LND:** restore from the seed plus the static channel backup (`lncli restorechanneldb` / `--channel-backup` at
+  unlock). LND then asks every peer to force-close and recovers the funds on chain. Never copy an old `channel.db` back.
+- **Hub database:** old swap rows can resume from a stale state. Restore it like this:
+  1. Stop the hub.
+  2. Put the copy at `/data/hub.sqlite` (remove `hub.sqlite-wal` and `hub.sqlite-shm` first).
+  3. Start the hub with `SWAPS_PAUSED=true`: it takes no new swap, and it resumes every open swap from what the two nodes
+     report (start-up recovery).
+  4. Check that every open swap has settled, refunded or failed (`GET /v1/swaps/:id`, or the swap events in the
+     database), with the alerts quiet (docs/monitoring.md).
+  5. Remove `SWAPS_PAUSED` and restart.
+
+  A swap whose payout the nodes show as paid, but which the copy shows as unpaid, is resolved by the nodes' state, never
+  by the copy's.
 
 **Biscuit (fnn RPC on another host).** Here the hub reaches fnn on the Docker network, so no token is used. If fnn's
 RPC ever has to listen on a non-private address, fnn needs `RPC_BISCUIT_PUBLIC_KEY` and the hub `FIBER_RPC_TOKEN`
-(facts: `read("node"); read("channels"); read("invoices"); write("invoices"); read("payments"); write("payments");
-internal("store_changes");`, the last one for the pubsub WebSocket).
+(facts: `read("node"); read("channels"); write("channels"); read("peers"); read("invoices"); write("invoices");
+read("payments"); write("payments"); internal("store_changes");`, the last one for the pubsub WebSocket). With a key
+set, fnn refuses every call without a token, the kit's own `docker compose exec ... curl` calls included. The plan for
+turning it on is in docs/security-review-2026-11.md, "Biscuit RPC auth for fnn".
+
+**Image digests.** LND, cloudflared and socat run by tag and digest (`LND_VERSION` and `LND_DIGEST`, `CLOUDFLARED_VERSION`
+and `CLOUDFLARED_DIGEST`, `SOCAT_VERSION` and `SOCAT_DIGEST` in `.env`), and the Dockerfiles pin their base images the
+same way (`BASE_IMAGE` in `testnet/bitcoind/Dockerfile` and `devnet/fnn/Dockerfile`, `NODE_IMAGE` in
+`testnet/hub/Dockerfile`). The digest decides what runs: a new version with the old digest still runs the old image. To
+move one:
+
+1. Run `docker buildx imagetools inspect lightninglabs/lnd:<new tag>` on any machine with Docker. The first `Digest:`
+   line is the multi-platform index; use that one, not a platform's.
+2. Set the version and digest together. For the kit's images, in the server's `.env` (and `.env.example` plus the default in
+   `docker-compose.yml` in the repo). For a base image, in the Dockerfile's `ARG`, as `name:tag@sha256:...`.
+3. Run `docker compose pull <service>` (or `testnet build <service>` for a base image), then `testnet up <service>`.
+
+**Security round 2 on the server** (2026-11-20; docs/security-review-2026-11.md). Run this on the server in
+`/opt/ckbolt/testnet` unless a step says `testnet`. It recreates every container, so swaps are paused first:
+
+1. Pause swaps. Set `SWAPS_PAUSED=true` in hub.env, then run `docker compose up -d --no-deps --force-recreate hub`. Wait
+   until no swap is open, that is, until this prints an empty table:
+
+   ```bash
+   docker compose exec hub node -e "const db = require('better-sqlite3')('/data/hub.sqlite', { readonly: true });
+     console.table(db.prepare(\"SELECT id, state FROM swaps WHERE state NOT IN ('succeeded', 'failed') OR (state = 'failed' AND refunded = 0)\").all())"
+   ```
+
+   Back up the hub database, `.env`, `hub.env` and `fnn/*.yml` as in "Backups".
+2. Upload the kit and the source. Use `testnet sync`, after diffing the server's `docker-compose.yml` against the repo, or
+   upload by hand as before. Then check that both files still resolve: `docker compose config -q`.
+3. Build the hub (H7 to H10 and the pinned node image): `docker compose build hub`. Optionally, run
+   `docker compose build bitcoind fnn-hub` for the pinned Debian base. The binaries are unchanged.
+4. Re-bake the macaroons (D9) while lnd-hub runs. Either run `testnet macaroons` from this machine (it also hands the
+   files to uid 1000 and restarts the hub), or by hand:
+
+   ```bash
+   docker compose exec -T lnd-hub lncli --network=signet bakemacaroon --save_to=/root/.lnd/hub.macaroon \
+     uri:/lnrpc.Lightning/GetInfo uri:/lnrpc.Lightning/DecodePayReq uri:/lnrpc.Lightning/AddInvoice \
+     uri:/lnrpc.Lightning/LookupInvoice uri:/lnrpc.Lightning/ListInvoices uri:/lnrpc.Lightning/SubscribeInvoices \
+     uri:/lnrpc.Lightning/ChannelBalance uri:/lnrpc.Lightning/WalletBalance \
+     uri:/invoicesrpc.Invoices/AddHoldInvoice uri:/invoicesrpc.Invoices/SettleInvoice uri:/invoicesrpc.Invoices/CancelInvoice \
+     uri:/routerrpc.Router/SendPaymentV2 uri:/routerrpc.Router/TrackPaymentV2
+   docker compose cp lnd-hub:/root/.lnd/hub.macaroon secrets/hub/lnd-hub/hub.macaroon
+   # demo profile only: the same bakemacaroon on lnd-demo with --save_to=/root/.lnd/demo.macaroon, then
+   # docker compose cp lnd-demo:/root/.lnd/demo.macaroon secrets/hub/lnd-demo/demo.macaroon
+   chown -R 1000:1000 secrets/hub && chmod -R go-rwx secrets/hub && find secrets/hub -type f -exec chmod 600 {} +
+   ```
+
+   The old macaroon stays valid in LND. It was baked from root key 0, like `admin.macaroon`, and deleting that key would
+   revoke `admin.macaroon` too. The only copies are the two files the commands above overwrite.
+5. Recreate everything (D1, D7, D8): run `docker compose up -d`. It creates the `ckbolt-testnet_bitcoin` network and
+   recreates bitcoind, lnd-hub, fnn-hub, the hub and, with their profiles, lnd-demo, fnn-demo, fiber-ws and cloudflared.
+   The `edge` network is unchanged, so the faucet's tunnel keeps it. bitcoind takes up to 2 minutes to stop, and LND
+   unlocks itself again.
+6. Check:
+   - `testnet:check` without FAIL;
+   - `docker network inspect ckbolt-testnet_bitcoin --format '{{range .Containers}}{{.Name}} {{end}}'` lists only bitcoind, the LND nodes and the hub;
+   - `docker inspect --format '{{.HostConfig.SecurityOpt}} {{.HostConfig.LogConfig.Config}}' ckbolt-testnet-hub-1` shows `no-new-privileges` and the rotation;
+   - `python3 add_token.py --regenerate` (a dry run) has nothing to write.
+7. Resume swaps. Set `SWAPS_PAUSED=false`, then run `docker compose up -d --no-deps --force-recreate hub`.
+
+`testnet env` adds the new keys of `.env.example` (the digests, `FIBER_WS_MAX_CHILDREN`, `LOG_MAX_*`) and of
+`hub.env.example` (`QUOTE_RETENTION_DAYS`, `QUOTE_PRUNE_INTERVAL_MINUTES`) with their default values. Until it runs,
+Compose and the hub use the same defaults. With the tunnel on, `testnet env` now stops if hub.env has no
+`HUB_PROXY_SECRET` (D4); the server's hub.env has one.
 
 ## 10. The public web app: Cloudflare Tunnel (profile `tunnel`)
 
@@ -298,10 +416,12 @@ ran on the server since the public demo went live).
 | Service | Network | What it does |
 | --- | --- | --- |
 | `cloudflared` | `edge` only | Dials out to Cloudflare (`tunnel run` with `TUNNEL_TOKEN`); publishes nothing |
-| `fiber-ws` | `default` and `edge` | A plain TCP relay (socat) to fnn-hub's P2P port 8228, where fnn also serves the browser nodes' WebSocket; never its JSON-RPC 8227 |
-| `hub` | `default` and `edge` | The API, reached by the tunnel as `http://hub:8787` |
+| `fiber-ws` | `default` and `edge` | A plain TCP relay (socat) to fnn-hub's P2P port 8228, where fnn also serves the browser nodes' WebSocket; never its JSON-RPC 8227. At most `FIBER_WS_MAX_CHILDREN` (200) connections at once |
+| `hub` | `default`, `bitcoin` and `edge` | The API, reached by the tunnel as `http://hub:8787` |
 
-fnn-hub, LND and bitcoind stay off `edge`: the tunnel cannot reach their RPCs.
+fnn-hub, LND and bitcoind stay off `edge`: the tunnel cannot reach their RPCs. bitcoind, lnd-hub and lnd-demo are on
+`bitcoin` only (with the hub), so fiber-ws and the fnn nodes cannot reach LND's gRPC or bitcoind's RPC either. With the
+tunnel profile, hub.env must set `HUB_PROXY_SECRET`: `testnet env` stops without it, and `testnet:check` fails.
 
 1. In Cloudflare (Zero Trust, Networks, Tunnels) create a tunnel and copy its token. Public hostnames, in this order:
    `ckbolt-hub-api.<domain>` -> `http://hub:8787`; `ckbolt-hub-fiber.<domain>` -> `http://fiber-ws:8228`; anything
@@ -309,7 +429,8 @@ fnn-hub, LND and bitcoind stay off `edge`: the tunnel cannot reach their RPCs.
 2. In the server's `.env`: `COMPOSE_PROFILES=tunnel` (or `demo,tunnel`), `CLOUDFLARED_TUNNEL_TOKEN=<token>` by hand
    (`testnet env` refuses the profile while it is empty and never reads it back), and
    `FIBER_PUBLIC_WS_ADDRS=/dns4/ckbolt-hub-fiber.<domain>/tcp/443/wss/p2p/<fnn-hub's peer id>`.
-3. In `hub.env`: `HUB_PROXY_SECRET` (the web app's proxy sends it) and `HUB_TRUST_PROXY=true`.
+3. In `hub.env`: `HUB_PROXY_SECRET` (the web app's proxy sends it; the hub refuses to start without it, unless
+   `HUB_ALLOW_OPEN_API=true` says it runs without a web app on purpose) and `HUB_TRUST_PROXY=true`.
 4. `testnet up` starts cloudflared and fiber-ws with the rest.
 
 `docker-compose.yml` holds both services, so `testnet sync` keeps the tunnel (before 2026-11-09 the repo's copy lacked

@@ -229,6 +229,11 @@ test.describe("the guide's CKBolt hub card", () => {
 
     const channel = fiber.getByTestId("hub-card-fiber-channel");
     await expect(channel.getByRole("heading", { level: 4 })).toHaveText("Get a Fiber channel from the hub");
+    // The hub runs fnn 0.10: an older node cannot open a channel with it, and the "?" says so.
+    await expect(await openTip(channel, "Why a Fiber channel from the hub")).toContainText(
+      "It needs fnn 0.10 or later: the hub runs 0.10, and a 0.9 node cannot open a channel with it.",
+    );
+    await page.keyboard.press("Escape");
     // Not a node id: nothing is asked.
     await channel.getByTestId("hub-card-fiber-channel-node-id").fill("not a node id");
     await channel.getByTestId("hub-card-fiber-channel-request").click();

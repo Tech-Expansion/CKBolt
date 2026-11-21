@@ -2,7 +2,8 @@
 # bitcoind for Mutinynet, a custom signet with 30 s blocks. Stock Bitcoin Core cannot follow it: this is the fork the
 # Mutinynet operators run (github.com/benthecarman/bitcoin, release "mutinynet-inq-template-hash", 2026-05-17, the same
 # binary MutinyWallet/mutiny-net builds from). The archive is checked against the SHA-256 the release publishes.
-ARG BASE_IMAGE=debian:bookworm-slim
+# Pinned by tag and digest (the digest decides what is pulled); deploy/README.md "Image digests" says how to move it.
+ARG BASE_IMAGE=debian:bookworm-20261104-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 FROM ${BASE_IMAGE} AS download
 ARG TARGETARCH

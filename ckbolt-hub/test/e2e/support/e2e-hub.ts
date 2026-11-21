@@ -13,7 +13,7 @@ import { startHubApp, type HttpClient, type HubHttp, type ProviderOverride } fro
 import {
   DEVNET_PATHS,
   E2E_HUB_ENV,
-  E2E_PRICE_SOURCE_NAME,
+  E2E_PRICE_SOURCE_NAMES,
   ENV_PATH_SUFFIX,
   HUB_ROOT,
   TEMP_DATABASE_DIR_PREFIX,
@@ -68,7 +68,7 @@ const hidePushHints = (node: object): void => void Object.defineProperty(node, "
 
 export async function startE2eHub(options: E2eHubOptions): Promise<E2eHub> {
   const config = e2eHubConfig(options);
-  const prices = [new FakePriceSource(E2E_PRICE_SOURCE_NAME, systemClock)];
+  const prices = E2E_PRICE_SOURCE_NAMES.map((name) => new FakePriceSource(name, systemClock));
   const app = await startHubApp(config, [[PRICE_SOURCES, prices], ...(options.providers ?? [])], {
     logger: loadE2eSettings().hubLogLevels,
     // Before onModuleInit: the swap scheduler subscribes to the nodes' push hints there.

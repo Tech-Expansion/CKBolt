@@ -81,6 +81,11 @@ export interface NodePresence {
   onChainCkb?: string | null;
   /** Whole CKB the running node puts into a channel from the hub, or null when it does not run. */
   contributionCkb?: number | null;
+  /**
+   * The running node's own CKB address (from its funding lock), or null until it runs; a tab of an older page leaves it
+   * out. The funding page sends only to this address, or to the one kept next to the node's key (security review W7).
+   */
+  address?: string | null;
 }
 
 export interface MakeInvoiceParams {
@@ -102,7 +107,13 @@ export interface MakeInvoiceResult {
 
 export interface PayInvoiceParams {
   swapId: string;
+  /** The hub's Fiber hold invoice. */
   invoice: string;
+  /** The visitor's own Lightning invoice the swap pays out to: the hold invoice must have its payment hash. */
+  payoutInvoice: string;
+  /** What the visitor accepted to pay: the quote's pay asset and amount (base units). */
+  asset: FiberAssetId;
+  amount: string;
 }
 
 export interface PayInvoiceResult {
@@ -246,7 +257,14 @@ const makeInvoiceParams = (p: unknown): MakeInvoiceParams | null => {
   return { asset: p.asset, amount: p.amount, quoteExpiresAt: p.quoteExpiresAt, network: p.network, ...(request ? { request } : {}) };
 };
 
-const isPayInvoiceParams = (p: unknown): p is PayInvoiceParams => isRecord(p) && isString(p.swapId) && isString(p.invoice);
+const isPayInvoiceParams = (p: unknown): p is PayInvoiceParams =>
+  isRecord(p) &&
+  isString(p.swapId) &&
+  isString(p.invoice) &&
+  isString(p.payoutInvoice) &&
+  isFiberAssetId(p.asset) &&
+  typeof p.amount === "string" &&
+  POSITIVE_UNITS.test(p.amount);
 
 const BASE_UNITS = /^\d{1,30}$/;
 const POSITIVE_UNITS = /^[1-9]\d{0,29}$/;

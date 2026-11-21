@@ -1,5 +1,6 @@
-# fnn v0.9.1 config of fnn-hub (the hub's Fiber node) on CKB testnet. It is the bundled config/testnet/config.yml of
-# fnn v0.9.1 (bootnodes, Fiber scripts) with the `pubsub` RPC module added for the hub (FIBER_PUBSUB=true).
+# fnn v0.10.1 config of fnn-hub (the hub's Fiber node) on CKB testnet. It is the bundled config/testnet/config.yml of
+# fnn v0.10.1 (bootnodes, Fiber scripts) with the `pubsub` RPC module added for the hub (FIBER_PUBSUB=true), and
+# `store_sync_writes: true`, which the bundled file recommends for a node that holds others' funds.
 # `ckb.udt_whitelist` is generated from the hub's FIBER_ASSETS (docs/add-token.md): on the server
 # `python3 add_token.py ...` (or `--regenerate`), in the repo `npm run fnn-whitelist -- ...`; do not edit it by hand.
 # fnn-hub auto-accepts a UDT channel a node opens to it only where FIBER_ASSETS sets `peerChannels.minAmount` (its
@@ -11,6 +12,8 @@
 # on testnet.
 fiber:
   listening_addr: "/ip4/0.0.0.0/tcp/8228"
+  # Every store write waits for the disk (fnn 0.10): a power loss cannot lose the last channel updates.
+  store_sync_writes: true
   bootnode_addrs:
     - "/ip4/54.179.226.154/tcp/8228/p2p/Qmes1EBD4yNo9Ywkfe6eRw9tG1nVNGLDmMud1xJMsoYFKy"
     - "/ip4/16.163.7.105/tcp/8228/p2p/QmdyQWjPtbK4NWWsvy8s69NGJaQULwgeQDT5ZpNDrTNaeV"

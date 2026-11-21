@@ -4,16 +4,19 @@ import {
   FIBER_MIN_COMMITMENT_DELAY_EPOCHS,
   LND_MIN_CHANNEL_FUNDING_SATS,
   LND_MIN_HOLD_EXPIRY_DELTA_BLOCKS,
+  MS_PER_DAY,
   MS_PER_MINUTE,
   MS_PER_SECOND,
 } from "../common/constants/protocol.constants";
 import { CKB_ASSET_ID } from "../common/constants/assets.constants";
 import { INBOUND_CHANNEL_MIN_ACCEPT_TIMEOUT_SECONDS, INBOUND_CHANNEL_MIN_FUNDING } from "../common/constants/fiber-node.constants";
 import { PROXY_SECRET_MIN_LENGTH } from "../common/constants/http.constants";
+import { ALERT_WEBHOOK_FORMAT, ALERT_WEBHOOK_FORMATS, type AlertWebhookFormat } from "../common/constants/monitoring.constants";
 import { PERCENT_PER_WHOLE, REQUEST_QUOTE_TTL_MAX_SECONDS, REQUEST_QUOTE_TTL_MIN_SECONDS } from "../common/constants/pricing.constants";
+import { distinctPriceSourceNames } from "../common/utils/pricing.util";
 import { TIMING_PROFILES, type TimingProfileName } from "../common/constants/timing.constants";
 import { isMultiaddr, isWebSocketMultiaddr } from "../common/utils/multiaddr.util";
-import { isLocalBindHost } from "../common/utils/network.util";
+import { isLocalBindHost, isLoopbackHost } from "../common/utils/network.util";
 import { isLnNodeUri } from "../common/utils/node-id.util";
 import { createAssetRegistry, type AssetRegistry } from "../domain/assets";
 import { resolveAssetTerms, type AssetTerms } from "../domain/pricing";
@@ -115,7 +118,7 @@ export interface LnInboundChannelsConfig {
   enabled: boolean;
   /** Size of one channel, sats; at least LND's smallest channel. */
   capacitySats: bigint;
-  /** What of it starts on the wallet's side, sats; below the capacity. */
+  /** What of it starts on the wallet's side, sats; below the capacity. Always 0 on mainnet (LN_INBOUND_PUSH_SATS). */
   pushSats: bigint;
   /** Most channels one client (the rate limiter's client key) may have opened in a sliding day. */
   maxPerClientPerDay: number;
@@ -201,12 +204,29 @@ export interface HubConfig {
     /** How long a node gets to answer getInfo before the health check reports it unreachable, ms. */
     timeoutMs: number;
   };
+  /** The hub's monitor and its alerts (src/application/monitoring, docs/monitoring.md). */
+  monitoring: {
+    enabled: boolean;
+    intervalMs: number;
+    /** How often an alert that still holds is sent again, ms. */
+    repeatMs: number;
+    /** How long a swap may stay in a step before it is alerted, ms. */
+    swapLimits: { settleMs: number; payoutInFlightMs: number; payoutStartMs: number; refundMs: number };
+    /** Swap passes failing in a row before an alert. */
+    failedPassesAlert: number;
+    /** Where alerts go; null: the log only. */
+    webhook: { url: string; format: AlertWebhookFormat; telegramChatId: string | null; timeoutMs: number } | null;
+  };
   pricing: {
     sources: string[];
     httpTimeoutMs: number;
     maxPriceAgeMs: number;
     /** How long a fetched market price is reused (concurrent fetches share one round of requests), ms. 0 disables it. */
     priceCacheMs: number;
+    /** Fresh sources a coin's price needs (PRICE_MIN_SOURCES): one wrong or pushed feed cannot set it alone. */
+    minSources: number;
+    /** Most the sources may differ, highest less lowest in basis points of their median (PRICE_MAX_SPREAD_BPS). */
+    maxSpreadBps: number;
     /** Hub fee on every swap, basis points; an asset's own feeBps (FIBER_ASSETS) replaces it for that asset. */
     feeBps: number;
     /**
@@ -233,6 +253,10 @@ export interface HubConfig {
     termsByAsset: Readonly<Partial<Record<FiberAssetId, Partial<AssetTerms>>>>;
     /** 32-byte Ed25519 seed (hex) that signs quotes. Generated per process when absent (quotes then die with the process). */
     signingKeyHex: string | null;
+    /** How long after it expires a quote no swap uses is kept before it is deleted (QUOTE_RETENTION_DAYS), ms. */
+    quoteRetentionMs: number;
+    /** How often such quotes are deleted (QUOTE_PRUNE_INTERVAL_MINUTES), ms. */
+    quotePruneIntervalMs: number;
   };
   swaps: {
     pollIntervalMs: number;
@@ -321,6 +345,8 @@ const envSchema = z.object({
   HUB_PORT: z.coerce.number().int().positive().default(8787),
   HUB_CORS_ORIGINS: list.default(""),
   HUB_TRUST_PROXY: bool.default("false"),
+  /** true: serve requests without HUB_PROXY_SECRET although HUB_HOST is not loopback (assertProxySecretWhenReachable). */
+  HUB_ALLOW_OPEN_API: bool.default("false"),
   HUB_PROXY_SECRET: z.preprocess(
     unsetWhenBlank,
     z.string().min(PROXY_SECRET_MIN_LENGTH, `must be at least ${PROXY_SECRET_MIN_LENGTH} characters`).optional(),
@@ -377,7 +403,8 @@ const envSchema = z.object({
     .bigint()
     .min(LND_MIN_CHANNEL_FUNDING_SATS, `must be at least ${LND_MIN_CHANNEL_FUNDING_SATS} sats, the smallest channel LND opens`)
     .default(30_000n),
-  LN_INBOUND_PUSH_SATS: z.coerce.bigint().nonnegative().default(20_000n),
+  /** Default by network (lnInboundPushSats): 0 on mainnet, where any other value is refused (assertNoLnPushOnMainnet). */
+  LN_INBOUND_PUSH_SATS: z.coerce.bigint().nonnegative().optional(),
   LN_INBOUND_MAX_PER_CLIENT_PER_DAY: z.coerce.number().int().positive().default(1),
   LN_INBOUND_MAX_PER_NODE_PER_DAY: z.coerce.number().int().positive().default(1),
   LN_INBOUND_MAX_PER_DAY: z.coerce.number().int().positive().default(10),
@@ -401,7 +428,21 @@ const envSchema = z.object({
 
   PRICE_SOURCES: list.default("coingecko,binance,kucoin"),
   PRICE_HTTP_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
-  PRICE_MAX_AGE_SECONDS: z.coerce.number().int().positive().default(600),
+  PRICE_MAX_AGE_SECONDS: z.coerce.number().int().positive().default(120),
+  PRICE_MIN_SOURCES: z.coerce.number().int().positive().default(2),
+  MONITOR_ENABLED: bool.default("true"),
+  MONITOR_INTERVAL_SECONDS: z.coerce.number().int().positive().default(60),
+  MONITOR_SETTLE_MINUTES: z.coerce.number().int().positive().default(3),
+  MONITOR_PAYOUT_IN_FLIGHT_MINUTES: z.coerce.number().int().positive().default(15),
+  MONITOR_PAYOUT_START_MINUTES: z.coerce.number().int().positive().default(5),
+  MONITOR_REFUND_MINUTES: z.coerce.number().int().positive().default(10),
+  MONITOR_FAILED_PASSES: z.coerce.number().int().positive().default(3),
+  ALERT_REPEAT_MINUTES: z.coerce.number().int().positive().default(60),
+  ALERT_WEBHOOK_URL: z.preprocess(unsetWhenBlank, z.string().url().optional()),
+  ALERT_WEBHOOK_FORMAT: z.enum(ALERT_WEBHOOK_FORMATS).default("json"),
+  ALERT_TELEGRAM_CHAT_ID: z.preprocess(unsetWhenBlank, z.string().optional()),
+  ALERT_WEBHOOK_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
+  PRICE_MAX_SPREAD_BPS: z.coerce.number().int().positive().default(300),
   PRICE_CACHE_MS: z.coerce.number().int().nonnegative().default(15_000),
   FEE_BPS: z.coerce.number().int().nonnegative().default(50),
   OPTION_PREMIUM_BPS: z.coerce.number().int().nonnegative().default(50),
@@ -411,6 +452,8 @@ const envSchema = z.object({
   SWAP_MIN_SATS: z.coerce.bigint().nonnegative().default(1_000n),
   SWAP_MAX_SATS: z.coerce.bigint().positive().default(100_000n),
   QUOTE_SIGNING_KEY: z.string().regex(/^[0-9a-fA-F]{64}$/).optional(),
+  QUOTE_RETENTION_DAYS: z.coerce.number().int().positive().default(7),
+  QUOTE_PRUNE_INTERVAL_MINUTES: z.coerce.number().int().positive().default(60),
 
   SWAP_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(2_000),
   LN_PAY_TIMEOUT_SECONDS: z.coerce.number().int().positive().default(60),
@@ -473,6 +516,50 @@ function assertTrustedProxyHost(e: HubEnv): void {
   throw new Error(
     `Invalid hub configuration: HUB_TRUST_PROXY=true needs HUB_HOST (${e.HUB_HOST}) to be a loopback or private address, ` +
       "so that only the proxy in front of the hub can reach it",
+  );
+}
+
+/**
+ * A hub other machines can reach (HUB_HOST not loopback: a container, or a tunnel in front of it) serves only the web
+ * app's proxy, which proves itself with HUB_PROXY_SECRET. Without the secret every request would be served, outside the
+ * proxy's rate limits, so the hub refuses to start unless HUB_ALLOW_OPEN_API=true says that is intended.
+ */
+function assertProxySecretWhenReachable(e: HubEnv): void {
+  if (isLoopbackHost(e.HUB_HOST) || e.HUB_PROXY_SECRET !== undefined || e.HUB_ALLOW_OPEN_API) return;
+  throw new Error(
+    `Invalid hub configuration: HUB_HOST (${e.HUB_HOST}) lets other machines reach the hub, so it needs HUB_PROXY_SECRET ` +
+      "(the secret the web app's proxy sends); set HUB_ALLOW_OPEN_API=true only to serve requests without it on purpose",
+  );
+}
+
+/** A Telegram webhook writes to one chat, which the bot API needs named. */
+function assertTelegramChat(e: HubEnv): void {
+  if (!e.ALERT_WEBHOOK_URL || e.ALERT_WEBHOOK_FORMAT !== ALERT_WEBHOOK_FORMAT.TELEGRAM || e.ALERT_TELEGRAM_CHAT_ID) return;
+  throw new Error("Invalid hub configuration: ALERT_WEBHOOK_FORMAT=telegram needs ALERT_TELEGRAM_CHAT_ID");
+}
+
+/** A price needs PRICE_MIN_SOURCES fresh sources, so at least that many must be configured, or no quote is ever priced. */
+function assertEnoughPriceSources(e: HubEnv): void {
+  const sources = distinctPriceSourceNames(e.PRICE_SOURCES).length;
+  if (sources >= e.PRICE_MIN_SOURCES) return;
+  throw new Error(
+    `Invalid hub configuration: PRICE_MIN_SOURCES (${e.PRICE_MIN_SOURCES}) is more than the ${sources} ` +
+      "PRICE_SOURCES configured",
+  );
+}
+
+/** The only timing profile real Bitcoin may use: the others assume test networks' block times and payer limits. */
+const MAINNET_TIMING_PROFILE: TimingProfileName = "mainnet";
+
+/**
+ * A timing profile sized for another network's blocks plans the wrong expiries (Mutinynet's 30-second blocks on mainnet
+ * would let a Lightning payout outlive the Fiber leg it pays for), so a mainnet hub starts only with the mainnet profile.
+ * Test networks may borrow any profile, as the devnet and the tests do.
+ */
+function assertTimingProfileMatchesNetwork(e: HubEnv): void {
+  if (e.BTC_NETWORK !== "mainnet" || e.TIMING_PROFILE === MAINNET_TIMING_PROFILE) return;
+  throw new Error(
+    `Invalid hub configuration: BTC_NETWORK=mainnet needs TIMING_PROFILE=${MAINNET_TIMING_PROFILE} (it is ${e.TIMING_PROFILE})`,
   );
 }
 
@@ -624,11 +711,35 @@ function assertPeerChannelDelayUnverified(e: HubEnv, udts: readonly UdtAssetSett
   );
 }
 
+/** What an inbound Lightning channel pushes to the wallet when LN_INBOUND_PUSH_SATS is not set, on test networks. */
+const LN_INBOUND_TEST_NETWORK_PUSH_SATS = 20_000n;
+/** On real bitcoin the hub pushes nothing: a push is the hub's money given to anyone who asks for a channel. */
+const LN_INBOUND_MAINNET_PUSH_SATS = 0n;
+
+/** LN_INBOUND_PUSH_SATS, or its default for BTC_NETWORK: nothing on mainnet, LN_INBOUND_TEST_NETWORK_PUSH_SATS elsewhere. */
+const lnInboundPushSats = (e: HubEnv): bigint =>
+  e.LN_INBOUND_PUSH_SATS ?? (e.BTC_NETWORK === "mainnet" ? LN_INBOUND_MAINNET_PUSH_SATS : LN_INBOUND_TEST_NETWORK_PUSH_SATS);
+
+/**
+ * A push gives the hub's bitcoin to whoever asks for an inbound channel, and the caps per client, per wallet and per day
+ * can be worked around with new keys and addresses (docs/security-review-2026-11.md, H7). On mainnet the hub therefore
+ * pushes nothing, and refuses to start with a push set rather than offer an opt-in: paid channel requests are mainnet
+ * design (H11).
+ */
+function assertNoLnPushOnMainnet(e: HubEnv): void {
+  if (e.BTC_NETWORK !== "mainnet" || lnInboundPushSats(e) === LN_INBOUND_MAINNET_PUSH_SATS) return;
+  throw new Error(
+    `Invalid hub configuration: LN_INBOUND_PUSH_SATS (${e.LN_INBOUND_PUSH_SATS}) must be 0 or unset on BTC_NETWORK=mainnet: ` +
+      "the hub gives no bitcoin away with the Lightning channels it opens to wallets there",
+  );
+}
+
 /** The pushed part starts on the wallet's side, so the hub must keep some of the channel: LND refuses a push of it all. */
 function assertLnPushBelowCapacity(e: HubEnv): void {
-  if (e.LN_INBOUND_PUSH_SATS < e.LN_INBOUND_CAPACITY_SATS) return;
+  const pushSats = lnInboundPushSats(e);
+  if (pushSats < e.LN_INBOUND_CAPACITY_SATS) return;
   throw new Error(
-    `Invalid hub configuration: LN_INBOUND_PUSH_SATS (${e.LN_INBOUND_PUSH_SATS}) must be below LN_INBOUND_CAPACITY_SATS (${e.LN_INBOUND_CAPACITY_SATS})`,
+    `Invalid hub configuration: LN_INBOUND_PUSH_SATS (${pushSats}) must be below LN_INBOUND_CAPACITY_SATS (${e.LN_INBOUND_CAPACITY_SATS})`,
   );
 }
 
@@ -638,11 +749,12 @@ function assertLnPushBelowCapacity(e: HubEnv): void {
  */
 function assertLnPushWithinLimits(e: HubEnv): void {
   if (!e.LN_INBOUND_ENABLED) return;
-  const push = `LN_INBOUND_PUSH_SATS (${e.LN_INBOUND_PUSH_SATS})`;
-  if (e.LN_INBOUND_PUSH_SATS > e.SWAP_MAX_SATS) {
+  const pushSats = lnInboundPushSats(e);
+  const push = `LN_INBOUND_PUSH_SATS (${pushSats})`;
+  if (pushSats > e.SWAP_MAX_SATS) {
     throw new Error(`Invalid hub configuration: ${push} must be at most SWAP_MAX_SATS (${e.SWAP_MAX_SATS})`);
   }
-  if (e.LN_INBOUND_PUSH_SATS > e.LN_INBOUND_PUSH_BUDGET_SATS_PER_DAY) {
+  if (pushSats > e.LN_INBOUND_PUSH_BUDGET_SATS_PER_DAY) {
     throw new Error(
       `Invalid hub configuration: ${push} must be at most LN_INBOUND_PUSH_BUDGET_SATS_PER_DAY (${e.LN_INBOUND_PUSH_BUDGET_SATS_PER_DAY})`,
     );
@@ -676,12 +788,17 @@ export function loadHubConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
   assertPayoutFeeBudgetsBelow(e, e.FEE_BPS, "FEE_BPS");
   assertPayoutConfirmOutlastsRpcTimeout(e);
   assertTrustedProxyHost(e);
+  assertProxySecretWhenReachable(e);
+  assertTimingProfileMatchesNetwork(e);
+  assertEnoughPriceSources(e);
+  assertTelegramChat(e);
   assertNoLegacyAssetVariables(e);
   assertNoUdtOnMainnet(e);
   const udts = udtAssetSettings(e);
   assertUdtTermsValid(e, udts);
   assertInboundChannelsUsable(e, udts);
   assertPeerChannelDelayUnverified(e, udts);
+  assertNoLnPushOnMainnet(e);
   assertLnPushBelowCapacity(e);
   assertLnPushWithinLimits(e);
   assertLnInboundCredential(e);
@@ -742,7 +859,7 @@ export function loadHubConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
       inboundChannels: {
         enabled: e.LN_INBOUND_ENABLED,
         capacitySats: e.LN_INBOUND_CAPACITY_SATS,
-        pushSats: e.LN_INBOUND_PUSH_SATS,
+        pushSats: lnInboundPushSats(e),
         maxPerClientPerDay: e.LN_INBOUND_MAX_PER_CLIENT_PER_DAY,
         maxPerNodePerDay: e.LN_INBOUND_MAX_PER_NODE_PER_DAY,
         maxPerDay: e.LN_INBOUND_MAX_PER_DAY,
@@ -761,11 +878,33 @@ export function loadHubConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
       payoutInvoiceExtraSeconds: e.DEMO_PAYOUT_INVOICE_EXTRA_SECONDS,
     },
     health: { timeoutMs: e.HEALTH_CHECK_TIMEOUT_MS },
+    monitoring: {
+      enabled: e.MONITOR_ENABLED,
+      intervalMs: e.MONITOR_INTERVAL_SECONDS * MS_PER_SECOND,
+      repeatMs: e.ALERT_REPEAT_MINUTES * MS_PER_MINUTE,
+      swapLimits: {
+        settleMs: e.MONITOR_SETTLE_MINUTES * MS_PER_MINUTE,
+        payoutInFlightMs: e.MONITOR_PAYOUT_IN_FLIGHT_MINUTES * MS_PER_MINUTE,
+        payoutStartMs: e.MONITOR_PAYOUT_START_MINUTES * MS_PER_MINUTE,
+        refundMs: e.MONITOR_REFUND_MINUTES * MS_PER_MINUTE,
+      },
+      failedPassesAlert: e.MONITOR_FAILED_PASSES,
+      webhook: e.ALERT_WEBHOOK_URL
+        ? {
+            url: e.ALERT_WEBHOOK_URL,
+            format: e.ALERT_WEBHOOK_FORMAT,
+            telegramChatId: e.ALERT_TELEGRAM_CHAT_ID ?? null,
+            timeoutMs: e.ALERT_WEBHOOK_TIMEOUT_MS,
+          }
+        : null,
+    },
     pricing: {
       sources: e.PRICE_SOURCES,
       httpTimeoutMs: e.PRICE_HTTP_TIMEOUT_MS,
       maxPriceAgeMs: e.PRICE_MAX_AGE_SECONDS * MS_PER_SECOND,
       priceCacheMs: e.PRICE_CACHE_MS,
+      minSources: e.PRICE_MIN_SOURCES,
+      maxSpreadBps: e.PRICE_MAX_SPREAD_BPS,
       feeBps: e.FEE_BPS,
       optionPremiumBps: e.OPTION_PREMIUM_BPS,
       quoteTtlSeconds: e.QUOTE_TTL_SECONDS,
@@ -775,6 +914,8 @@ export function loadHubConfig(env: NodeJS.ProcessEnv = process.env): HubConfig {
       maxSats: e.SWAP_MAX_SATS,
       termsByAsset: Object.fromEntries(udts.flatMap(({ asset, terms }) => (Object.keys(terms).length === 0 ? [] : [[asset.id, terms]]))),
       signingKeyHex: e.QUOTE_SIGNING_KEY ?? null,
+      quoteRetentionMs: e.QUOTE_RETENTION_DAYS * MS_PER_DAY,
+      quotePruneIntervalMs: e.QUOTE_PRUNE_INTERVAL_MINUTES * MS_PER_MINUTE,
     },
     swaps: {
       pollIntervalMs: e.SWAP_POLL_INTERVAL_MS,

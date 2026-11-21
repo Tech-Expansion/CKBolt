@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import {
   ManualFiberStep,
   type FiberInvoiceRequest,
+  type FiberPayRequest,
   type FiberWalletApi,
   type FiberWalletState,
 } from "../../components/app/swap/contracts";
@@ -16,7 +17,7 @@ import type { HubStatus } from "../../hooks/use-hub-status";
 import { useSwapRunner, type SwapPlan, type SwapRun } from "../../hooks/use-swap-runner";
 import { localeDecimalMark } from "../../lib/amount";
 import type { OpenRequest } from "../../lib/get-paid/request";
-import { encodeUnsignedBolt11 } from "../../lib/bolt11";
+import { decodeBolt11, encodeUnsignedBolt11 } from "../../lib/bolt11";
 import { HubClient } from "../../lib/hub/client";
 import { HUB_CLIENT_TIMING, HUB_PROXY_BASE_PATH, type HttpMethod } from "../../lib/hub/constants";
 import {
@@ -42,6 +43,7 @@ import { CARD_ERROR, OWN_INVOICE_COPY, RUN_ERROR, STEP_LINE } from "../../lib/sw
 import { checkLimits, quotable } from "../../lib/swap/limits";
 import { primaryButtonState, type PrimaryAction, type PrimaryButtonInput } from "../../lib/swap/primary-button";
 import { isRunSettled } from "../../lib/swap/run-model";
+import { SWAP_CARD } from "../../lib/swap/constants";
 import { BridgeError } from "../../lib/wallets/fiber-browser/bridge-client";
 import {
   BRIDGE_ERROR,
@@ -319,6 +321,13 @@ class FakeHub {
   readonly cancels: { id: string; token: string | null; status: number }[] = [];
   /** Replaces the hold invoice of the next swap: a hub that hands out an invoice that is not the swap's. */
   holdInvoice: ((swap: SwapDto) => string) | null = null;
+  /** Changes the next swap as created: a hub whose swap is not the quote the visitor accepted. */
+  swapPatch: ((swap: SwapDto) => SwapDto) | null = null;
+  /**
+   * The preimage of a payout invoice, when the test knows it: the swap takes that invoice's payment hash, as the hub does
+   * (it reads the hash in the payout invoice). Otherwise the fake draws its own.
+   */
+  payoutPreimage: ((payoutInvoice: string) => Buffer | null) | null = null;
   readonly requests: { key: string; body: unknown }[] = [];
   readonly offContract: string[] = [];
   /** Everything sent to the hub, URL and body as text. */
@@ -431,7 +440,7 @@ class FakeHub {
     if (Date.parse(quote.expiresAt) <= Date.now()) return { status: 410, code: API_ERROR_CODE.QUOTE_EXPIRED, message: "The quote expired." };
     if ([...this.swaps.values()].some((s) => s.quoteId === quote.id)) return { status: 409, code: API_ERROR_CODE.CONFLICT, message: "Taken." };
     if (typeof body.payoutInvoice !== "string" || !body.payoutInvoice) return { status: 422, code: API_ERROR_CODE.INVOICE_INVALID, message: "No invoice." };
-    const preimage = randomBytes(32);
+    const preimage = this.payoutPreimage?.(body.payoutInvoice) ?? randomBytes(32);
     const hash = createHash("sha256").update(preimage).digest();
     const id = randomUUID();
     const at = new Date().toISOString();
@@ -457,6 +466,7 @@ class FakeHub {
       updatedAt: at,
       links: { self: `/v1/swaps/${id}`, events: `/v1/swaps/${id}/events` },
     };
+    if (this.swapPatch) swap = this.swapPatch(swap);
     if (this.holdInvoice) swap = { ...swap, pay: { ...swap.pay, invoice: this.holdInvoice(swap) } };
     this.swaps.set(id, swap);
     this.events.set(id, [{ at, type: SWAP_EVENT.CREATED, detail: "created" }]);
@@ -580,7 +590,9 @@ const NO_FIBER_WALLET: FiberWalletState = { kind: null, label: null, ready: fals
  */
 class FakeFiberWallet {
   readonly made: FiberInvoiceRequest[] = [];
-  readonly paid: { swapId: string; invoice: string }[] = [];
+  readonly paid: FiberPayRequest[] = [];
+  /** What payoutHashOf answers for the payout invoices it knows (the browser node reports the hash of those it made). */
+  readonly payoutHashes = new Map<string, string>();
   /** Answers to makeInvoice in order; then an invoice of the hub's network for exactly the amount. */
   readonly makeAnswers: ((request: FiberInvoiceRequest) => Promise<string>)[] = [];
   /** Answers to payInvoice in order; then sent. */
@@ -604,9 +616,20 @@ class FakeFiberWallet {
         if (manual) throw new ManualFiberStep();
         await (this.payAnswers.shift() ?? (async () => undefined))();
       },
+      payoutHashOf: (invoice) => this.payoutHashes.get(invoice) ?? null,
     };
   }
 }
+
+/** What the card asks the Fiber node to pay (fiber_to_ln): the hub's hold invoice and what the visitor accepted. */
+const fiberPayRequest = (patch: Partial<FiberPayRequest> = {}): FiberPayRequest => ({
+  swapId: randomUUID(),
+  invoice: "fibt1hold",
+  payoutInvoice: visitorInvoice(2_475),
+  asset: "CKB",
+  amount: CKB(1_000),
+  ...patch,
+});
 
 type TabAnswer = { result: unknown } | { error: { code: BridgeErrorCode; message: string } };
 
@@ -627,10 +650,14 @@ class FakeNodeTab {
   presence: NodePresence = runningPresence();
   readonly requests: BridgeRequest[] = [];
   readonly invoices: string[] = [];
+  /** The preimage of each invoice the node made: it reports sha256 of it as the invoice's payment hash, as fnn does. */
+  readonly preimages = new Map<string, Buffer>();
   makeInvoice: (params: MakeInvoiceParams) => TabAnswer = (params) => {
     const invoice = demoFiberInvoice("testnet", BigInt(params.amount));
+    const preimage = randomBytes(32);
     this.invoices.push(invoice);
-    return { result: { invoice, paymentHash: hex32() } };
+    this.preimages.set(invoice, preimage);
+    return { result: { invoice, paymentHash: createHash("sha256").update(preimage).digest("hex") } };
   };
   payInvoice: (params: PayInvoiceParams) => TabAnswer = () => ({ result: { paymentHash: hex32(), status: "Inflight" } });
   private readonly channel = new BroadcastChannel(BRIDGE_CHANNEL_NAME);
@@ -1219,7 +1246,9 @@ test.describe("the run", () => {
     await until(() => fiber.paid.length === 1, "the node's payment");
     expect(step(run(), 1)).toMatchObject({ status: "done", title: "Your invoice", line: STEP_LINE.INVOICE_PASTED });
     expect(hub.bodies("POST /v1/swaps")).toEqual([{ quoteId: quote.id, payoutInvoice: invoice }]);
-    expect(fiber.paid).toEqual([{ swapId: hub.swap.id, invoice: hub.swap.pay.invoice }]);
+    // With the hold invoice goes what the visitor accepted, for the node to check it against: the payout invoice, the
+    // quote's token and amount.
+    expect(fiber.paid).toEqual([{ swapId: hub.swap.id, invoice: hub.swap.pay.invoice, payoutInvoice: invoice, asset: "CKB", amount: quote.pay.amount }]);
     await until(() => step(run(), 3)?.line === STEP_LINE.SENT, "the payment to count as sent");
     expect(run()?.manualInvoice).toBeNull();
   });
@@ -1233,11 +1262,12 @@ test.describe("the run", () => {
   });
 
   test("own node, Fiber to BTC: the hold invoice is shown to pay by hand, and the hub's state moves the run on", async () => {
-    const { fiber, run } = await startRun(CKB_TO_BTC, OWN_NODE);
+    const { fiber, quote, run } = await startRun(CKB_TO_BTC, OWN_NODE);
     await holdShown(run);
     expect(run()?.manualInvoice).toBe(hub.swap.pay.invoice);
     expect(run()?.manualInvoice).toMatch(/^fibt/);
-    expect(fiber.paid).toEqual([{ swapId: hub.swap.id, invoice: hub.swap.pay.invoice }]);
+    const sentPayout = (hub.bodies("POST /v1/swaps")[0] as { payoutInvoice: string }).payoutInvoice;
+    expect(fiber.paid).toEqual([{ swapId: hub.swap.id, invoice: hub.swap.pay.invoice, payoutInvoice: sentPayout, asset: "CKB", amount: quote.pay.amount }]);
     expect(step(run(), 3)).toMatchObject({ status: "active", line: STEP_LINE.MANUAL.fiber_to_ln });
     expect(run()?.retry).toBeNull();
     expect(run()?.browserWallet).toBeNull();
@@ -1256,6 +1286,120 @@ test.describe("the run", () => {
       expect(run()?.manualInvoice, body.direction).toBeNull();
       expect(step(run(), 3), body.direction).toMatchObject({ status: "failed", line: STEP_LINE.EXPIRED });
       hub = new FakeHub();
+    }
+  });
+
+  test("BTC to CKB: at the quote's expiry step 3 says the quote expired, though the hub's invoice expired with it", async () => {
+    // As the hub makes it: timestamp in whole seconds, expiry the whole seconds left on the quote.
+    hub.holdInvoice = (swap) => {
+      const timestamp = Math.floor(Date.parse(swap.createdAt) / 1000);
+      return encodeUnsignedBolt11({
+        network: "signet",
+        amountSats: Number(swap.pay.amount),
+        paymentHash: Buffer.from(swap.paymentHash, "hex"),
+        description: "CKBolt",
+        expirySeconds: Math.floor((Date.parse(swap.quoteExpiresAt) - Date.parse(swap.createdAt)) / 1000),
+        timestamp,
+      });
+    };
+    const { runner, props, run } = await startRun(BTC_TO_CKB, OWN_NODE, { payoutInvoice: demoFiberInvoice("testnet", BigInt(CKB(792))) });
+    await holdShown(run);
+    await runner.rerender({ ...props, nowMs: Date.parse(hub.swap.quoteExpiresAt) });
+    expect(run()?.manualInvoice).toBeNull();
+    expect(step(run(), 3)).toMatchObject({ status: "failed", line: STEP_LINE.EXPIRED });
+  });
+
+  /** A hold invoice for `swap` made at its whole second (as LND stamps it), payable until `endsAt(quoteExpiresAtMs)`, in whole seconds. */
+  const holdEndingAt = (endsAt: (quoteExpiresAtMs: number) => number) => (swap: SwapDto) => {
+    const timestamp = Math.floor(Date.parse(swap.createdAt) / 1000);
+    const end = Math.floor(endsAt(Date.parse(swap.quoteExpiresAt)) / 1000);
+    return encodeUnsignedBolt11({
+      network: "signet",
+      amountSats: Number(swap.pay.amount),
+      paymentHash: Buffer.from(swap.paymentHash, "hex"),
+      description: "CKBolt",
+      expirySeconds: end - timestamp,
+      timestamp,
+    });
+  };
+  /** When the current swap's hold invoice stops being payable, by its own timestamp and expiry. */
+  const holdEndMs = () => {
+    const decoded = decodeBolt11(hub.swap.pay.invoice);
+    return (decoded.timestamp + decoded.expirySeconds) * 1000;
+  };
+
+  test("grace: a hold invoice that ended more than 5 s before the quote is refused with its own sentence, the clock before that point", async () => {
+    expect(SWAP_CARD.holdExpiryGraceMs).toBe(5_000);
+    hub.holdInvoice = holdEndingAt((quote) => quote - 10_000);
+    const { runner, props, run } = await startRun(BTC_TO_CKB, BROWSER_NODE, { browserWallet: true });
+    await holdShown(run);
+    const quote = Date.parse(hub.swap.quoteExpiresAt);
+    const end = holdEndMs();
+    expect(end).toBeLessThan(quote - SWAP_CARD.holdExpiryGraceMs);
+
+    await runner.rerender({ ...props, nowMs: end - 1 });
+    expect(run()?.manualInvoice).toBe(hub.swap.pay.invoice);
+    for (const nowMs of [end, end + 1_000, quote - SWAP_CARD.holdExpiryGraceMs - 1]) {
+      await runner.rerender({ ...props, nowMs });
+      expect(step(run(), 3), String(nowMs - quote)).toMatchObject({ status: "failed", line: LN_WALLET_MESSAGE.HOLD_INVOICE_EXPIRED });
+      expect(run()?.manualInvoice).toBeNull();
+      expect(run()?.browserWallet).toBeNull();
+    }
+    // It ended before the hub's own tolerance: that stays the reason, in the last 5 s and once the quote expired too.
+    for (const nowMs of [quote - 1_000, quote, quote + 60_000]) {
+      await runner.rerender({ ...props, nowMs });
+      expect(step(run(), 3), String(nowMs - quote)).toMatchObject({ status: "failed", line: LN_WALLET_MESSAGE.HOLD_INVOICE_EXPIRED });
+    }
+    await act(async () => runner.current.payInBrowser());
+    await pass(300);
+    expect(webln.paid).toEqual([]);
+  });
+
+  test("grace: a hold invoice ending in the last 5 s never shows the hub's sentence: payable until the quote expires, then the quote's expiry", async () => {
+    hub.holdInvoice = holdEndingAt((quote) => quote - 4_000);
+    const { runner, props, run } = await startRun(BTC_TO_CKB, BROWSER_NODE);
+    await holdShown(run);
+    const quote = Date.parse(hub.swap.quoteExpiresAt);
+    const end = holdEndMs();
+    expect(end).toBeGreaterThan(quote - SWAP_CARD.holdExpiryGraceMs);
+    expect(end).toBeLessThanOrEqual(quote - 4_000);
+    // Inside the last 5 s, even past the invoice's own end: still the invoice to pay, as the quote's timer runs out.
+    for (const nowMs of [quote - SWAP_CARD.holdExpiryGraceMs, end - 1, end, end + 1_000, quote - 1]) {
+      await runner.rerender({ ...props, nowMs });
+      expect(step(run(), 3), String(nowMs - quote)).toMatchObject({ status: "active", line: STEP_LINE.MANUAL.ln_to_fiber });
+      expect(run()?.manualInvoice).toBe(hub.swap.pay.invoice);
+    }
+    // The quote expired: its own line, never the hub's.
+    for (const nowMs of [quote, quote + 1, quote + 60_000]) {
+      await runner.rerender({ ...props, nowMs });
+      expect(step(run(), 3), String(nowMs - quote)).toMatchObject({ status: "failed", line: STEP_LINE.EXPIRED });
+      expect(step(run(), 3)?.line).not.toBe(LN_WALLET_MESSAGE.HOLD_INVOICE_EXPIRED);
+      expect(run()?.manualInvoice).toBeNull();
+    }
+  });
+
+  test("grace: the hub's real shape, an invoice ending in whole seconds up to 2 s before the quote, ends as the quote's expiry", async () => {
+    const shapes: [string, (quote: number) => number][] = [
+      // The last whole second at or before the quote: less than 1 s early.
+      ["whole second before", (quote) => quote],
+      // One whole second earlier: 1 to 2 s early, as when LND's timestamp and the hub's floor both round down.
+      ["a second earlier", (quote) => quote - 1_000],
+    ];
+    for (const [name, endsAt] of shapes) {
+      hub = new FakeHub();
+      hub.holdInvoice = holdEndingAt(endsAt);
+      const { runner, props, run } = await startRun(BTC_TO_CKB, BROWSER_NODE);
+      await holdShown(run);
+      const quote = Date.parse(hub.swap.quoteExpiresAt);
+      const end = holdEndMs();
+      expect(quote - end, name).toBeGreaterThanOrEqual(0);
+      expect(quote - end, name).toBeLessThan(2_000);
+      // A millisecond before the quote's end the invoice has ended (unless the quote ends on a whole second): still shown,
+      // nothing blamed on the hub.
+      await runner.rerender({ ...props, nowMs: quote - 1 });
+      expect(step(run(), 3), name).toMatchObject({ status: "active", line: STEP_LINE.MANUAL.ln_to_fiber });
+      await runner.rerender({ ...props, nowMs: quote });
+      expect(step(run(), 3), name).toMatchObject({ status: "failed", line: STEP_LINE.EXPIRED });
     }
   });
 
@@ -1370,8 +1514,167 @@ test.describe("the run", () => {
     expect(run()?.retry).toBeNull();
   });
 
+  /** Step 3 refuses the hold invoice: not shown, and a browser wallet asked anyway pays nothing. */
+  async function expectHoldRefused(runner: { current: { payInBrowser: () => void } }, run: () => SwapRun | null) {
+    await until(() => step(run(), 3)?.status === "failed", "the hold invoice check");
+    expect(step(run(), 3)?.line).toBe(LN_WALLET_MESSAGE.HOLD_INVOICE_MISMATCH);
+    expect(run()?.manualInvoice).toBeNull();
+    expect(run()?.browserWallet).toBeNull();
+    await act(async () => runner.current.payInBrowser());
+    await pass(300);
+    expect(webln.paid).toEqual([]);
+  }
+
+  /** The hold invoice the hub would make for `swap` as it stands: its amount and its hash. */
+  const holdFor = (swap: SwapDto) => lightningInvoice({ sats: Number(swap.pay.amount), hash: Buffer.from(swap.paymentHash, "hex"), expirySeconds: QUOTE_TTL_MS / 1000 });
+
+  test("BTC to CKB: the hub's swap and hold invoice both asking one sat more than the visitor accepted are refused", async () => {
+    hub.swapPatch = (swap) => ({ ...swap, pay: { ...swap.pay, amount: String(Number(swap.pay.amount) + 1) } });
+    hub.holdInvoice = holdFor;
+    const { runner, quote, run } = await startRun(BTC_TO_CKB, BROWSER_NODE, { browserWallet: true });
+    await expectHoldRefused(runner, run);
+    expect(hub.swap.pay.amount).toBe(String(Number(quote.pay.amount) + 1));
+  });
+
+  test("BTC to CKB: a swap that pays out to another invoice than the one the page sent is refused", async () => {
+    const other = demoFiberInvoice("testnet", BigInt(CKB(792)));
+    hub.swapPatch = (swap) => ({ ...swap, receive: { ...swap.receive, invoice: other } });
+    const { runner, run } = await startRun(BTC_TO_CKB, BROWSER_NODE, { browserWallet: true });
+    await expectHoldRefused(runner, run);
+  });
+
+  test("BTC to CKB: with the browser node, the hold invoice must carry the hash the node reported for its payout invoice", async () => {
+    const made = demoFiberInvoice("testnet", BigInt(CKB(792)));
+    const preimage = randomBytes(32);
+    hub.payoutPreimage = (invoice) => (invoice === made ? preimage : null);
+    // The node reports another hash than the one the hub's swap and hold invoice carry.
+    const { runner, fiber, run, start } = await newRun(BTC_TO_CKB, BROWSER_NODE, true);
+    fiber.makeAnswers.push(async () => made);
+    fiber.payoutHashes.set(made, hex32());
+    await start();
+    await expectHoldRefused(runner, run);
+  });
+
+  test("BTC to CKB: the hold invoice with the node's own hash is shown to pay", async () => {
+    const made = demoFiberInvoice("testnet", BigInt(CKB(792)));
+    const preimage = randomBytes(32);
+    hub.payoutPreimage = (invoice) => (invoice === made ? preimage : null);
+    const { fiber, run, start } = await newRun(BTC_TO_CKB, BROWSER_NODE, true);
+    fiber.makeAnswers.push(async () => made);
+    fiber.payoutHashes.set(made, `0x${createHash("sha256").update(preimage).digest("hex").toUpperCase()}`);
+    await start();
+    await holdShown(run);
+    expect(run()?.manualInvoice).toBe(hub.swap.pay.invoice);
+    expect(step(run(), 3)?.status).toBe("active");
+  });
+
+  test("BTC to CKB: a hold invoice past its expiry by the page's clock is refused with its own sentence, the quote still running", async () => {
+    // The hub's hold invoice is payable for 60 s only; the quote runs 150 s.
+    hub.holdInvoice = (swap) =>
+      encodeUnsignedBolt11({
+        network: "signet",
+        amountSats: Number(swap.pay.amount),
+        paymentHash: Buffer.from(swap.paymentHash, "hex"),
+        description: "CKBolt",
+        expirySeconds: 60,
+        timestamp: Math.floor(Date.parse(swap.createdAt) / 1000),
+      });
+    const { runner, props, run } = await startRun(BTC_TO_CKB, BROWSER_NODE, { browserWallet: true });
+    await holdShown(run);
+    const expiresAtMs = (Math.floor(Date.parse(hub.swap.createdAt) / 1000) + 60) * 1000;
+    await runner.rerender({ ...props, nowMs: expiresAtMs - 1 });
+    expect(run()?.manualInvoice).toBe(hub.swap.pay.invoice);
+    await runner.rerender({ ...props, nowMs: expiresAtMs });
+    expect(Date.parse(hub.swap.quoteExpiresAt)).toBeGreaterThan(expiresAtMs);
+    expect(step(run(), 3)).toMatchObject({ status: "failed", line: LN_WALLET_MESSAGE.HOLD_INVOICE_EXPIRED });
+    expect(run()?.manualInvoice).toBeNull();
+    expect(run()?.browserWallet).toBeNull();
+    await act(async () => runner.current.payInBrowser());
+    await pass(300);
+    expect(webln.paid).toEqual([]);
+  });
+
+  test("confirmInNode: CKB to BTC with the browser node while the node waits for the visitor's Confirm, and only then", async () => {
+    const held = deferred<void>();
+    const { fiber, run, start } = await newRun(CKB_TO_BTC, BROWSER_NODE);
+    fiber.payAnswers.push(() => held.promise);
+    await start();
+    await until(() => fiber.paid.length === 1, "the node to be asked");
+    // The node has not answered: it waits for Confirm on its own page; step 3 says so.
+    expect(run()?.confirmInNode).toBe(true);
+    expect(step(run(), 3)).toMatchObject({ status: "active", line: STEP_LINE.CONFIRM_IN_NODE });
+    expect(STEP_LINE.CONFIRM_IN_NODE).toBe("Confirm it in your Fiber node");
+    held.resolve();
+    await until(() => step(run(), 3)?.line === STEP_LINE.SENT, "the payment to count as sent");
+    expect(run()?.confirmInNode).toBe(false);
+  });
+
+  test("confirmInNode is false once the node declined, for the own node, and for BTC to CKB", async () => {
+    const declined = await newRun(CKB_TO_BTC, BROWSER_NODE);
+    declined.fiber.payAnswers.push(() => Promise.reject(new BridgeError(BRIDGE_ERROR.DECLINED, "You declined it in your Fiber node. Nothing was sent.")));
+    await declined.start();
+    await until(() => step(declined.run(), 3)?.status === "failed", "the declined payment");
+    expect(step(declined.run(), 3)?.line).toBe("You declined it in your Fiber node. Nothing was sent.");
+    expect(declined.run()?.confirmInNode).toBe(false);
+
+    hub = new FakeHub();
+    const own = await startRun(CKB_TO_BTC, OWN_NODE);
+    await holdShown(own.run);
+    expect(own.run()?.confirmInNode).toBe(false);
+
+    hub = new FakeHub();
+    const btc = await startRun(BTC_TO_CKB, BROWSER_NODE);
+    await holdShown(btc.run);
+    expect(btc.run()?.confirmInNode).toBe(false);
+    expect(step(btc.run(), 3)?.line).toBe(STEP_LINE.MANUAL.ln_to_fiber);
+  });
+
+  test("noPaymentYet: BTC to CKB, the hold invoice unpaid 45 s after the swap was created; not at 44 s", async () => {
+    expect(SWAP_CARD.noPaymentHintAfterMs).toBe(45_000);
+    const { runner, props, run } = await startRun(BTC_TO_CKB, BROWSER_NODE);
+    await holdShown(run);
+    const created = Date.parse(hub.swap.createdAt);
+    expect(run()?.noPaymentYet).toBe(false);
+    for (const [after, shown] of [
+      [44_000, false],
+      [44_999, false],
+      [45_000, true],
+      [90_000, true],
+    ] as const) {
+      await runner.rerender({ ...props, nowMs: created + after });
+      expect(run()?.noPaymentYet, `${after} ms`).toBe(shown);
+    }
+  });
+
+  test("noPaymentYet goes once the hub holds the payment, once the quote expired, and never shows for CKB to BTC", async () => {
+    const held = await startRun(BTC_TO_CKB, BROWSER_NODE);
+    await holdShown(held.run);
+    await held.runner.rerender({ ...held.props, nowMs: Date.parse(hub.swap.createdAt) + 45_000 });
+    expect(held.run()?.noPaymentYet).toBe(true);
+    hub.advance({ state: "incoming_accepted" }, SWAP_EVENT.INCOMING_ACCEPTED);
+    await until(() => held.run()?.swap?.state === "incoming_accepted", "the hub to hold the payment", POLL_WAIT_MS);
+    expect(held.run()?.noPaymentYet).toBe(false);
+
+    hub = new FakeHub();
+    const expired = await startRun(BTC_TO_CKB, BROWSER_NODE);
+    await holdShown(expired.run);
+    await expired.runner.rerender({ ...expired.props, nowMs: Date.parse(hub.swap.createdAt) + 45_000 });
+    expect(expired.run()?.noPaymentYet).toBe(true);
+    await expired.runner.rerender({ ...expired.props, nowMs: Date.parse(hub.swap.quoteExpiresAt) });
+    expect(expired.run()?.manualInvoice).toBeNull();
+    expect(expired.run()?.noPaymentYet).toBe(false);
+
+    for (const state of [OWN_NODE, BROWSER_NODE]) {
+      hub = new FakeHub();
+      const fiberToLn = await startRun(CKB_TO_BTC, state);
+      await until(() => fiberToLn.run()?.swap !== null && fiberToLn.run()?.swap !== undefined, "the swap");
+      await fiberToLn.runner.rerender({ ...fiberToLn.props, nowMs: Date.parse(hub.swap.createdAt) + 90_000 });
+      expect(fiberToLn.run()?.noPaymentYet, String(state.kind)).toBe(false);
+    }
+  });
+
   test("a Fiber payment the node refused may be tried again; the second one is sent", async () => {
-    const { runner, fiber, run, start } = await newRun(CKB_TO_BTC, BROWSER_NODE);
+    const { runner, fiber, quote, run, start } = await newRun(CKB_TO_BTC, BROWSER_NODE);
     fiber.payAnswers.push(() => Promise.reject(new BridgeError(BRIDGE_ERROR.NO_OUTBOUND, "Your node can send 100 CKB; this swap needs 1,000 CKB.")));
     await start();
     await until(() => step(run(), 3)?.status === "failed", "the refused payment");
@@ -1383,10 +1686,8 @@ test.describe("the run", () => {
       runner.current.retry();
     });
     await until(() => step(run(), 3)?.line === STEP_LINE.SENT, "the second payment");
-    expect(fiber.paid).toEqual([
-      { swapId: hub.swap.id, invoice: hub.swap.pay.invoice },
-      { swapId: hub.swap.id, invoice: hub.swap.pay.invoice },
-    ]);
+    const asked = { swapId: hub.swap.id, invoice: hub.swap.pay.invoice, payoutInvoice: hub.swap.receive.invoice, asset: "CKB", amount: quote.pay.amount };
+    expect(fiber.paid).toEqual([asked, asked]);
   });
 
   test("a Fiber payment the node did not answer in time counts as sent, and is not offered again", async () => {
@@ -1659,6 +1960,8 @@ test.describe("the run end to end with the browser node", () => {
     hub = new FakeHub();
     webln = new FakeWebln();
     tab = new FakeNodeTab();
+    // The hub's swap takes the payment hash of the node's payout invoice, as the real hub does.
+    hub.payoutPreimage = (invoice) => tab.preimages.get(invoice) ?? null;
   });
 
   async function connected() {
@@ -1714,7 +2017,9 @@ test.describe("the run end to end with the browser node", () => {
     // 2: one swap with that invoice.
     expect(hub.bodies("POST /v1/swaps")).toEqual([{ quoteId: quote.id, payoutInvoice: invoice }]);
     // 3: the node paid the hub's Fiber hold invoice; no browser wallet was asked.
-    expect(tab.calls(BRIDGE_METHOD.PAY_INVOICE)).toEqual([{ swapId: hub.swap.id, invoice: hub.swap.pay.invoice }]);
+    expect(tab.calls(BRIDGE_METHOD.PAY_INVOICE)).toEqual([
+      { swapId: hub.swap.id, invoice: hub.swap.pay.invoice, payoutInvoice: invoice, asset: "CKB", amount: quote.pay.amount },
+    ]);
     expect(webln.paid).toEqual([]);
     await until(() => step(run(), 3)?.line === STEP_LINE.SENT, "the payment to count as sent");
 
@@ -1844,7 +2149,7 @@ test.describe("the Fiber wallet", () => {
     await expect(wallet.current.api.makeInvoice({ asset: "CKB", amount: CKB(1), quoteExpiresAt: quoteExpiresAt(), network: "testnet" })).rejects.toThrow(
       FIBER_WALLET_PROBLEM.LOCKED,
     );
-    await expect(wallet.current.api.payInvoice({ swapId: randomUUID(), invoice: "fibt1hold" })).rejects.toThrow(FIBER_WALLET_PROBLEM.LOCKED);
+    await expect(wallet.current.api.payInvoice(fiberPayRequest())).rejects.toThrow(FIBER_WALLET_PROBLEM.LOCKED);
     expect(tab.calls(BRIDGE_METHOD.MAKE_INVOICE)).toEqual([]);
     expect(tab.calls(BRIDGE_METHOD.PAY_INVOICE)).toEqual([]);
   });
@@ -1854,7 +2159,7 @@ test.describe("the Fiber wallet", () => {
     const wallet = await renderFiberWallet();
     await act(async () => wallet.current.api.choose("browser-node"));
     await until(() => wallet.current.api.ready, "the node's status", STATUS_WAIT_MS);
-    const request = { swapId: randomUUID(), invoice: demoFiberInvoice("testnet", BigInt(CKB(1_000))) };
+    const request = fiberPayRequest({ invoice: demoFiberInvoice("testnet", BigInt(CKB(1_000))) });
 
     tab.payInvoice = () => ({ error: { code: BRIDGE_ERROR.NO_OUTBOUND, message: "Your node can send 100 CKB." } });
     await expect(wallet.current.api.payInvoice(request)).rejects.toMatchObject({ code: BRIDGE_ERROR.NO_OUTBOUND });
@@ -1873,7 +2178,7 @@ test.describe("the Fiber wallet", () => {
     await expect(wallet.current.api.makeInvoice({ asset: "CKB", amount: CKB(1), quoteExpiresAt: quoteExpiresAt(), network: "testnet" })).rejects.toBeInstanceOf(
       ManualFiberStep,
     );
-    await expect(wallet.current.api.payInvoice({ swapId: randomUUID(), invoice: "fibt1hold" })).rejects.toBeInstanceOf(ManualFiberStep);
+    await expect(wallet.current.api.payInvoice(fiberPayRequest())).rejects.toBeInstanceOf(ManualFiberStep);
     await pass(BRIDGE_TIMING.statusWindowMs + 200);
     expect(tab.requests).toEqual([]);
   });

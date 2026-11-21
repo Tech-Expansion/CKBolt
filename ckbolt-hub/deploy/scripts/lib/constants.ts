@@ -136,8 +136,16 @@ export const KIT_SECRET_BYTES: Readonly<Record<string, number>> = {
 /** Random bytes of each LND wallet unlock password (hex, so 48 characters: LND wants more than 8). */
 export const LND_WALLET_PASSWORD_BYTES = 24;
 
-/** The Compose profile of the Cloudflare Tunnel (cloudflared and fiber-ws); it needs CLOUDFLARED_TUNNEL_TOKEN. */
+/**
+ * The Compose profile of the Cloudflare Tunnel (cloudflared and fiber-ws); it needs CLOUDFLARED_TUNNEL_TOKEN, and
+ * HUB_PROXY_SECRET in hub.env (the tunnel puts the hub on the internet).
+ */
 export const TUNNEL_PROFILE = "tunnel";
+
+/** Keys of the server's hub.env the scripts check. They learn only whether each is set, never its value. */
+export const HUB_ENV_KEY = {
+  PROXY_SECRET: "HUB_PROXY_SECRET",
+} as const;
 
 /** The compose file that publishes and announces the P2P ports; PUBLIC_IP must be set when COMPOSE_FILE lists it. */
 export const PUBLIC_OVERLAY_FILE = "docker-compose.public.yml";
@@ -158,14 +166,26 @@ export const LND_CONTAINER_FILE = {
   TLS_CERT: "/root/.lnd/tls.cert",
 } as const;
 
-/** The least-privilege macaroon the hub and its demo wallet get (docs/phase-3-plan.md section 4). */
+/**
+ * The least-privilege macaroon the hub and its demo wallet get: exactly the gRPC methods the hub's LND adapter calls
+ * through the `lightning` package (src/infrastructure/lightning/lnd.rpc.ts), as LND URI permissions
+ * (docs/security-review-2026-11.md, D9). Entity permissions such as offchain:write also allowed deleting payments,
+ * changing channel fees or restoring channel backups. Kept equal to devnet/scripts/lib/devnet.constants.ts.
+ */
 export const HUB_MACAROON_PERMISSIONS: readonly string[] = [
-  "info:read",
-  "invoices:read",
-  "invoices:write",
-  "offchain:read",
-  "offchain:write",
-  "onchain:read",
+  "uri:/lnrpc.Lightning/GetInfo", // getWalletInfo: health, network, block height
+  "uri:/lnrpc.Lightning/DecodePayReq", // decodePaymentRequest: payout invoices
+  "uri:/lnrpc.Lightning/AddInvoice", // createInvoice: the demo wallet's invoices
+  "uri:/lnrpc.Lightning/LookupInvoice", // getInvoice: the hold invoice's state
+  "uri:/lnrpc.Lightning/ListInvoices", // subscribeToInvoices: where to resume the stream
+  "uri:/lnrpc.Lightning/SubscribeInvoices", // subscribeToInvoices: invoice updates
+  "uri:/lnrpc.Lightning/ChannelBalance", // getChannelBalance: payout liquidity
+  "uri:/lnrpc.Lightning/WalletBalance", // getChainBalance: on-chain funds (reported, never spent)
+  "uri:/invoicesrpc.Invoices/AddHoldInvoice", // createHodlInvoice
+  "uri:/invoicesrpc.Invoices/SettleInvoice", // settleHodlInvoice
+  "uri:/invoicesrpc.Invoices/CancelInvoice", // cancelHodlInvoice
+  "uri:/routerrpc.Router/SendPaymentV2", // subscribeToPayViaRequest: payouts
+  "uri:/routerrpc.Router/TrackPaymentV2", // getPayment, subscribeToPastPayment
 ];
 
 /** Per LND node: the macaroon it bakes for the hub (named as hub.env.example's paths) and the TLS certificate copy. */

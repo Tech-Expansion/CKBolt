@@ -17,7 +17,7 @@ v0 template, and the original template's design is kept: add content in its patt
 | Role | Font | Class |
 | --- | --- | --- |
 | Body | Instrument Sans (`--font-instrument`) | `font-sans` (default) |
-| Display headings, big figures | Instrument Serif 400 (`--font-instrument-serif`) | `font-display` |
+| Display headings, big figures | Instrument Sans 400 (`--font-instrument`), tracking −2.5% | `font-display` |
 | Labels, tags, code, small captions | JetBrains Mono (`--font-jetbrains`) | `font-mono` |
 
 - H1 (hero): `text-[clamp(3rem,6.6vw,7rem)] font-display leading-[0.9] tracking-tight`. On `/app`: `text-4xl lg:text-6xl`.
@@ -26,9 +26,27 @@ v0 template, and the original template's design is kept: add content in its patt
 - Lead: `text-xl text-muted-foreground leading-relaxed`. Body: `text-muted-foreground leading-relaxed`.
 - Big numbers: `font-display ... tabular-nums [overflow-wrap:anywhere]`, unit in a smaller muted span.
 
+## Brand
+
+The brand kit v1.0 (2026-11-18) is the reference: the guidelines at `/brand`, every file at `/brand-assets` (`/brand/kit` redirects there), the files
+themselves in `public/brand/` (logos, icons, share cards, tokens, and the kit's three zips, as supplied).
+
+- **Logo.** The mark (a hexagon folded into a C) before "CKBolt" in the header and the footer: `BrandMark`
+  (`components/brand/brand-mark.tsx`, the kit's own paths in `logo-paths.ts`, drawn in the current text color). Use the
+  kit's files everywhere else; never retype, recolor or redraw the logo.
+- **Icons and share card.** `app/favicon.ico`, `app/icon.svg`, `app/apple-icon.png` and the light share card as
+  `app/opengraph-image.png` and `app/twitter-image.png` (1200 × 630), all copied from the kit. `metadataBase` is the
+  public site, and the theme color is Paper.
+- **Type.** Two faces only: Instrument Sans for every sentence and heading (Medium only for titles), JetBrains Mono for
+  what a machine produced. The serif the v0 template named never rendered (its variable was not defined where
+  `--font-display` is), so the headings already showed Instrument Sans; the kit made it official.
+- **Voice.** Plain, exact, checkable: units, sources and dates on numbers; no hype, no exclamation marks, no mainnet
+  dates.
+
 ## Colour
 
-Warm monochrome in OKLCH (`app/globals.css`): `--background oklch(0.985 0.002 90)`, `--foreground oklch(0.12 0.01 60)`,
+Warm monochrome in OKLCH (`app/globals.css`); the values are the brand's (Paper `#FAFAF9`, Ink `#080503`, Text muted
+`#5E534A`, and the rest on `/brand`): `--background oklch(0.985 0.002 90)`, `--foreground oklch(0.12 0.01 60)`,
 `--muted-foreground oklch(0.45 0.02 60)`, `--border oklch(0.88 0.01 90)`, `--destructive`. No dark theme.
 
 - Surfaces, text, borders and buttons stay monochrome. Use foreground opacities: `/5` row dividers, `/10` default
@@ -47,13 +65,13 @@ Four tones (`lib/status-tone.ts`, `StatusTone`), each with tokens in `app/global
 
 | Tone | Means | Text | Bright (dots, rules) | Soft (fills) |
 | --- | --- | --- | --- | --- |
-| `ok` | alive, ready, done (also Fiber's identity) | `--fiber oklch(0.50 0.11 165)` | `--fiber-bright oklch(0.70 0.15 165)` | `--fiber-soft oklch(0.96 0.03 165)` |
-| `pending` | in progress, waiting, needs a look; Testnet | `--pending oklch(0.53 0.12 65)` | `--pending-bright oklch(0.78 0.15 75)` | `--pending-soft oklch(0.965 0.04 85)` |
-| `error` | failed | `--destructive` | `--destructive` | `--destructive-soft oklch(0.965 0.02 25)` |
+| `ok` | alive, ready, done (also Fiber's identity) | `--fiber #007654` | `--fiber-bright #00BA87` | `--fiber-soft #E0F9ED` |
+| `pending` | in progress, waiting, needs a look; Testnet | `--pending #9A5B00` | `--pending-bright #EFA831` | `--pending-soft #FFF2D8` |
+| `error` | failed | `--destructive #E40014` | `--destructive` | `--destructive-soft #FFEFEE` |
 | `off` | locked, stopped, not set up, closed | `--muted-foreground` | `foreground/30` | none |
 
 - The bright tokens are never text: they fail contrast on the background. Text on `--destructive-soft` stays
-  `foreground` (destructive on it is 4.26:1).
+  `foreground` (destructive on it is 4.37:1).
 - Shared pieces (`components/app/status.tsx`): `StatusDot` (pending pulses, still under reduced motion),
   `StatusBadge` (a tag in the tone, with an optional dot), `StatusNotice` (a 2px left rule in the bright tone, an icon,
   foreground text) and `statusRule` (a channel card's left rule). The mappings from state to tone are pure functions in
@@ -159,7 +177,7 @@ Section order today (`app/page.tsx`): Navigation, Hero, Problem and solution (`#
   `swap-own-invoice`, `swap-ln-invoice` (the pasted Lightning invoice), `swap-ln-invoice-scan`, `swap-hold-invoice`,
   `swap-hold-qr`, `swap-hold-copy`, `swap-hold-open`, `swap-webln`, `wallet-button-fiber`, `wallet-dialog-fiber`,
   `swap-progress`, `swap-step-<n>`, `swap-result`, `swap-manual-invoice`, `swap-banner`, `how-it-works`, `info-tip`
-  (every "?"). The public demo adds `swap-step-help`, `swap-report`, the guide's `testnet-guide*` and its hub card's
+  (every "?"), `swap-confirm-in-node`, `swap-no-payment-hint`. The public demo adds `swap-step-help`, `swap-report`, the guide's `testnet-guide*` and its hub card's
   `wallet-lightning-channel*` ([live-swap-ui.md](live-swap-ui.md), Public demo additions). Pay: `pay-card`,
   `pay-input`, `pay-scan`, `pay-kind`, `pay-preview`, `pay-token`, `pay-amount`, `pay-confirm`, `pay-waiting`,
   `pay-result`, `pay-error`, `pay-new`, `pay-route`; Get paid: `request-card`, `request-form`, `request-amount`, `request-asset`,

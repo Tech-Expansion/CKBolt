@@ -249,7 +249,8 @@ how to get the CKB they put on the browser node back.
 - **Header** (since 2026-10-27 the Fiber wallet button replaces "Fiber node"; see the last section): "Guide"
   (`/app/guide`) and "Fiber node" (`/app/fiber`, a plain anchor) sat next to "Open the app", on desktop and in the phone
   menu (a 2 by 2 grid of pills under the section links). The desktop row starts at `lg`
-  (below it the menu button shows) and "View architecture" shows from `xl`, so the row never wraps.
+  (below it the menu button shows) and "Brand" shows from `xl`, so the row never wraps. Since the brand kit (2026-11-18)
+  the header no longer has "View architecture": the footer and the phone menu link the architecture.
 - **CKBolt hub card** at the top of the guide (`/app/guide#hub`), read live through the proxy: status as the app reads
   `/v1/health` and `/v1/assets` (Live, Degraded with the reason behind a "?", Unavailable, Swaps paused); Lightning
   (`GET /v1/lightning/node`): the URIs with Copy, "Add it as a peer in your Lightning wallet (Alby Hub: Node →
@@ -453,3 +454,23 @@ Tests: `tests/unit/fiber-byo.spec.ts` (the calls, the shell quoting, the channel
 ("the user's own Fiber node": the new_invoice call for CKB and RUSD, the send_payment call with its fee cap, copied,
 no wider than a phone), `tests/e2e/guide.spec.ts` (connect_peer, a CKB and an RUSD channel, the whitelist entry, a 409,
 a ready channel).
+
+## Checked against what the visitor accepted (2026-11-20, security review W1, W2)
+
+From the security review of November 2026 (`../ckbolt-hub/docs/security-review-2026-11.md`, W1, W2, W8):
+
+- **CKB or a token to BTC.** The browser node checks the hub's Fiber hold invoice before it pays (`prepareSwapPayment`,
+  `lib/wallets/fiber-browser/swap-requests.ts`): the hash of the visitor's own Lightning invoice, the quoted amount and
+  token, the hub's node as payee, not expired, and a 0.5 % fee cap. It then asks for Confirm on its own page. Step 3
+  reads "Confirm it in your Fiber node" while it waits. When the header's popup runs the node, the progress dialog adds
+  "Confirm in your Fiber node" (`swap-confirm-in-node`): it hides the dialog and opens the popup on Confirm, since the
+  popup cannot be used under the modal dialog. A node in its own window or on the node page shows Confirm by itself.
+- **BTC to CKB or a token.** The page checks the hub's Lightning hold invoice (`checkSwapHoldInvoice`,
+  `lib/wallets/lightning/invoice-check.ts`): the quoted amount, the payout invoice the page sent and, when the browser
+  node made it, that invoice's hash. An invoice that has expired while the quote still runs is refused. Its expiry is
+  judged only until `SWAP_CARD.holdExpiryGraceMs` (5 s) before the quote's: the hub's invoice ends in whole seconds, up
+  to the hub's HOLD_INVOICE_EXPIRY_TOLERANCE_SECONDS early, and from there the quote's expiry explains it.
+- **No payment yet.** Once the hold invoice has waited `SWAP_CARD.noPaymentHintAfterMs` (45 s) unpaid, a line under it
+  (`swap-no-payment-hint`) says a wallet that finds no route has no channel to the hub, and links the guide's hub card.
+  On testnet (October to November 2026), all 14 BTC to CKB swaps that expired had no payment reach the hub at all,
+  while every paid one was paid within 44 s; testers tried again two to five times.

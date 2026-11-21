@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { BrowserContext, Page, Route } from "@playwright/test";
-import type { Network } from "../../../lib/bolt11";
+import { decodeBolt11, type Network } from "../../../lib/bolt11";
 import {
   SWAP_EVENT,
   type FiberAssetId,
@@ -12,7 +12,7 @@ import {
   type SwapDto,
 } from "../../../lib/hub/contract";
 import { demoFiberInvoice } from "../../../lib/payment-request";
-import { FakeHub, hubAsset, lightningInvoice, RATE } from "../fakes/hub";
+import { FakeHub, hubAsset, lightningInvoice, preimageOfHash, RATE } from "../fakes/hub";
 import {
   CWBTC_FIBER_ASSET,
   CWBTC_INBOUND_AMOUNT,
@@ -20,14 +20,20 @@ import {
   deliverHubUdtChannel,
   FakeCkbRpc,
   HUB_FIBER_NODE,
+  nodeInvoicePreimage,
   type FakeUdtOpen,
 } from "./fiber-node";
+import { InvoiceBook } from "./fiber-wallet";
 
 /*
  * The CKBolt hub for the live swap card's specs: tests/e2e/fakes/hub.ts (REST API v1, every request recorded, swaps
  * moved along by the test) plus what a run needs on top:
- * - every swap's payment hash is sha256 of a preimage the test knows, so "Swap complete" can show the preimage and the
- *   page can check it against the hash; for ln_to_fiber the hold invoice carries that hash, as the hub's would;
+ * - every swap's payment hash is the payout invoice's, as the hub reads it there: for ln_to_fiber the hash of the
+ *   browser node's invoice (support/fiber-node.ts `nodeInvoicePreimage`), for fiber_to_ln the visitor's Lightning
+ *   invoice's (fakes/hub.ts `preimageOfHash`); the preimage is known when a fake made that invoice, else drawn here, so
+ *   "Swap complete" can show the preimage and the page can check it against the hash. The hold invoice carries that
+ *   hash, as the hub's would: a Lightning one, or a Fiber one the browser node reads with parse_invoice (`book`), for the
+ *   swap's amount and token, payable to the hub's node;
  * - the hub's Fiber node (GET /v1/fiber/node, its inbound channels) for the browser node tab;
  * - the hub's Lightning node (GET /v1/lightning/node) and the channels it opens to wallets, for the Lightning dialog;
  * - the steps of a swap as the hub's engine takes them, with their events;
@@ -55,6 +61,8 @@ const LIGHTNING_PUBKEY_IN_PATH = /\/0[23][0-9a-f]{64}$/i;
 
 export class LiveHub extends FakeHub {
   fiberNode: FiberNodeDto = structuredClone(HUB_FIBER_NODE);
+  /** What the browser node's parse_invoice reads: the hub's Fiber hold invoices, and any invoice a test adds. */
+  readonly book = new InvoiceBook();
   /** GET /v1/lightning/node; null answers 404, as a hub without the route would. */
   lightningNode: LightningNodeDto | null = structuredClone(HUB_LIGHTNING_NODE);
   /** The channels lnd-hub has with each wallet, by its pubkey (GET /v1/lightning/inbound-channels/:pubkey). */
@@ -87,6 +95,8 @@ export class LiveHub extends FakeHub {
 
   override async install(target: Page | BrowserContext) {
     await super.install(target);
+    // The node runs in other pages and frames of the context: its parse_invoice reads the hub's hold invoices.
+    if ("newPage" in target) await this.book.install(target);
     // Registered after the fake's own route, so it answers these paths first.
     await target.route("**/api/hub/v1/fiber/**", (route) => this.fiberRoute(route));
     await target.route("**/api/hub/v1/lightning/**", (route) => this.lightningRoute(route));
@@ -156,7 +166,8 @@ export class LiveHub extends FakeHub {
 
   /**
    * BTC to CKB or RUSD: the swap takes the payment hash of the payout invoice the node made (0x or bare), as the real hub
-   * does, and its Lightning hold invoice carries that hash. The fake drew its own when it created the swap.
+   * does, and its Lightning hold invoice carries that hash. The fake already does so when it creates the swap from an
+   * invoice a fake node made; this sets it again (or for a payout invoice made elsewhere).
    */
   useNodeHash(hash: string) {
     const swap = this.current;
@@ -176,12 +187,42 @@ export class LiveHub extends FakeHub {
     this.advance({ state: "failed", failureReason: reason, refunded: true }, [SWAP_EVENT.EXPIRED, reason]);
   }
 
+  /** The payment hash of the swap's payout invoice (hex) and its preimage when a fake made it, as far as they are known. */
+  private payoutLock(swap: SwapDto): { hash: string | null; preimage: string | null } {
+    if (swap.pay.network === "lightning") {
+      // ln_to_fiber: the browser node's Fiber invoice; a pasted one (own node) cannot be read here.
+      const preimage = nodeInvoicePreimage(swap.receive.invoice);
+      return { hash: preimage ? createHash("sha256").update(Buffer.from(preimage, "hex")).digest("hex") : null, preimage };
+    }
+    // fiber_to_ln: the visitor's Lightning invoice.
+    let hash: string | null = null;
+    try {
+      hash = decodeBolt11(swap.receive.invoice).paymentHash?.toLowerCase() ?? null;
+    } catch {
+      // Not readable: the fake draws its own below.
+    }
+    return { hash, preimage: hash ? preimageOfHash(hash) : null };
+  }
+
   private lockToKnownPreimage(swap: SwapDto): string {
-    const preimage = randomBytes(32);
-    const hash = createHash("sha256").update(preimage).digest();
+    const payout = this.payoutLock(swap);
+    const preimage = payout.preimage ? Buffer.from(payout.preimage, "hex") : randomBytes(32);
+    const hash = payout.hash ? Buffer.from(payout.hash, "hex") : createHash("sha256").update(preimage).digest();
     swap.paymentHash = hash.toString("hex");
     this.preimages.set(swap.id, preimage.toString("hex"));
-    if (swap.pay.network !== "lightning") return demoFiberInvoice("testnet", BigInt(swap.pay.amount));
+    if (swap.pay.network !== "lightning") {
+      const hold = demoFiberInvoice("testnet", BigInt(swap.pay.amount));
+      this.book.register(hold, {
+        amount: BigInt(swap.pay.amount),
+        udt: this.fiberNode.assets.find((a) => a.id === swap.asset)?.udtTypeScript ?? null,
+        payee: this.fiberNode.nodeId,
+        paymentHash: `0x${swap.paymentHash}`,
+        description: HOLD_INVOICE_MEMO,
+        expirySeconds: HOLD_INVOICE_EXPIRY_SECONDS,
+        createdAtMs: this.now(),
+      });
+      return hold;
+    }
     return lightningInvoice({
       sats: Number(swap.pay.amount),
       network: (this.health.lightning.network ?? "signet") as Network,

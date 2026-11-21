@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { parseEnv } from "node:util";
 import { loadHubConfig } from "../../../src/config/hub.config";
 import { readEnvExample } from "../../support/env-example";
+import { TEST_PROXY_SECRET } from "../../support/proxy-secret";
 import { CWBTC_ENTRY, ONE_WHOLE, RUSD_ENTRY } from "./assets.fixtures";
 
 /**
@@ -162,12 +163,21 @@ describe("FIBER_PEER_CHANNELS_MAX_OPEN (fiberPeers.peerChannels.maxOpen)", () =>
     expect(maxOpenOf(documented)).toBe(maxOpenOf());
   });
 
-  it("loads the value deploy/testnet/hub.env.example sets, with the rest of that file (and the public address compose adds)", () => {
+  /** What the server adds to the kit's file: the public address (compose) and the proxy secret (the operator, in hub.env). */
+  const SERVER_ADDITIONS = { FIBER_PUBLIC_WS_ADDRS: "/ip4/203.0.113.7/tcp/8228/ws", HUB_PROXY_SECRET: TEST_PROXY_SECRET };
+
+  it("loads the value deploy/testnet/hub.env.example sets, with the rest of that file (and what the server adds to it)", () => {
     const hubEnv = deployHubEnv();
     expect(hubEnv[MAX_OPEN]).toBeDefined();
 
-    const config = loadHubConfig({ ...hubEnv, FIBER_PUBLIC_WS_ADDRS: "/ip4/203.0.113.7/tcp/8228/ws" });
+    const config = loadHubConfig({ ...hubEnv, ...SERVER_ADDITIONS });
 
     expect(config.fiberPeers.peerChannels.maxOpen).toBe(Number(hubEnv[MAX_OPEN]));
+  });
+
+  it("does not start from deploy/testnet/hub.env.example alone: its HUB_HOST is not loopback, so it needs HUB_PROXY_SECRET", () => {
+    const { HUB_PROXY_SECRET: _secret, ...withoutSecret } = SERVER_ADDITIONS;
+
+    expect(() => loadHubConfig({ ...deployHubEnv(), ...withoutSecret })).toThrow(/^Invalid hub configuration: HUB_HOST .*HUB_PROXY_SECRET/);
   });
 });

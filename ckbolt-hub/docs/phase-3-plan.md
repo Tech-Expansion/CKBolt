@@ -118,22 +118,36 @@ CCH, Boltz and Loop:
 - Keep LND's `holdexpirydelta` at 18 or more and set the hub's `LND_HOLD_EXPIRY_DELTA_BLOCKS` to the same value; alert
   on cancellations the hub did not request.
 - Treat only Fiber `Paid` and LND `SETTLED` as final.
-- **ln_to_fiber payout guard** (2026-11-09, `FIBER_PAYOUT_GUARD`, `SwapFlow.guardPayout`): fnn v0.9.1 lets a payee claim
-  the hub's TLC on chain with the preimage even after the TLC expires, and on-chain settlement opens only once the
-  channel's commitment delay has passed after a force close. fnn force-closes 2/3 of that delay before expiry, so a payee
-  that withholds the preimage could claim about a third of the delay after expiry (about 80 minutes with the default
-  1-epoch delay), after LND has given the Lightning hold back. While a payout is in flight, the hub force-closes a
-  payout channel whose peer still holds the TLC at `fiberPayoutForceCloseAt` (expiry minus the channel's delay counted
-  25 % long, minus 30 minutes; never sooner than 10 minutes after the send): settlement then opens before the expiry,
-  while the hold still stands, and fnn reports a preimage claimed on chain as the payment's, so the hub collects. Only a
-  public channel the hub opened itself, to a router that is not the payee, is left open: that router answers to its own
-  payee a hop delta earlier. Every other channel is closed: a private one (its peer is the payee), a public one whose
-  peer is the payee (a public node can be the payee; since 2026-11-12), and any channel a peer opened, public or not
-  (anyone can open one to the hub, announce it and route a payout through it; since 2026-11-12). Not covered: a channel
-  a peer opened with a delay between about 1.6 and 2.5 epochs (peer channels stay off until this is solved). Extending
-  the hold instead does not fit LDK's 1,008-block cap on Mutinynet. Checked on the devnet's real nodes
-  (2026-11-10, `test/e2e/payout-guard.e2e-spec.ts`): fnn-hub force-closes the private channel, the payee claims the TLC
-  on chain with the preimage, fnn-hub reports that preimage as the payout's, and the hub settles the Lightning hold.
+- **ln_to_fiber payout guard and Lightning margin** (2026-11-09, corrected 2026-11-13; `FIBER_PAYOUT_GUARD`,
+  `SwapFlow.guardPayout`, `lnMarginBlocks`; the fnn facts are in docs/research/fiber-node.md section 9). After a force
+  close, the peer holding the hub's TLC can claim it with the preimage from 1/3 of the commitment delay on, with no
+  expiry check, until the hub's timeout claim confirms. That claim needs 2/3 of the delay and CKB's median time past the
+  TLC's expiry, and fnn's watchtower sends it as soon as both hold. fnn force-closes by itself 2/3 of the delay before
+  the expiry (epochs counted at a fixed 4 hours), so a payee that withholds the preimage can still claim a few minutes
+  after the expiry, plus 2/3 of any epoch overrun. (Until 2026-11-12 this section said settlement waits the whole delay,
+  giving about 80 minutes after the expiry; that was wrong.)
+  - **Lightning margin.** LND gives the hold back `lnMarginBlocks` blocks after the latest Fiber payout expiry. On
+    `mutinynet` that is 60 blocks, about 30 minutes at its 30-second blocks (10 minutes before 2026-11-13; a run of
+    faster blocks shortens it): the median-time lag (about
+    3 minutes), the watchtower's 60-second cycle, a confirmation and the hub's own 2 to 3 minutes to see a claim and
+    settle, the rest for an outage of fnn or the CKB RPC around the expiry. It costs payout invoices: the hub takes
+    final expiry deltas of 160 to 173 minutes on `mutinynet` (fnn and fiber-js default to 160). `testnet` and `mainnet` keep
+    6 blocks at 450 s (45 minutes).
+  - **Guard.** While a payout is in flight, the hub force-closes a payout channel whose peer still holds the TLC at
+    `fiberPayoutForceCloseAt` (expiry minus the whole delay counted 25 % long, minus 30 minutes; never sooner than
+    10 minutes after the send). The timeout path then opens by the expiry even when epochs run long (up to about
+    8 hours for a 1-epoch channel), and nothing depends on fnn's own close. It cannot move the timeout claim before the
+    expiry: that is the margin's job. Only a public channel the hub opened itself, to a router that is not the payee, is
+    left open: that router answers to its own payee a hop delta earlier. Every other channel is closed: a private one
+    (its peer is the payee), a public one whose peer is the payee (a public node can be the payee; since 2026-11-12),
+    and any channel a peer opened, public or not (anyone can open one to the hub, announce it and route a payout
+    through it; since 2026-11-12). Channels that need no payee are closed first, every close is tried even when one
+    fails, and a payee the hub cannot read counts as every routing channel's peer (since 2026-11-13).
+  - Not covered: a channel a peer opened with a delay between about 1.6 and 2.5 epochs (peer channels stay off until
+    this is solved). Checked on the devnet's real nodes (2026-11-10 and 2026-11-12, `test/e2e/payout-guard.e2e-spec.ts`,
+    over a private channel and over a public channel whose peer is the payee): fnn-hub force-closes the channel, the
+    payee claims the TLC on chain with the preimage, fnn-hub reports that preimage as the payout's, and the hub settles
+    the Lightning hold.
 
 ### Free option and limits
 

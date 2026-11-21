@@ -1,14 +1,18 @@
 # CKBolt devnet
 
 A local network the hub can swap on, in Docker: Bitcoin regtest with two LND nodes, a CKB devnet with the Fiber
-contracts in genesis, and two release fnn v0.9.1 nodes. The `*-hub` nodes are the hub's; the `*-user` nodes play the
+contracts in genesis, and two release fnn v0.10.1 nodes. The `*-hub` nodes are the hub's; the `*-user` nodes play the
 user and back the hub's demo wallet.
 
 ```
 bitcoind (regtest 29.4) ── lnd-hub ⇄ lnd-user        LND v0.21.4-beta, one channel each way
-ckb (0.202.0 dev chain) ── fnn-hub ⇄ fnn-user        fnn v0.9.1 release, CKB channel + RUSD stand-in channel
+ckb (0.202.0 dev chain) ── fnn-hub ⇄ fnn-user        fnn v0.10.1 release, CKB channel + RUSD stand-in channel
         └─ ckb-miner (a block every second)
 ```
+
+**fnn 0.10.1 (2026-11-20).** The devnet runs fnn v0.10.1, and its genesis carries the v0.10.1 `commitment-lock` (the
+generation CKB testnet runs since 2026-10-21; with the 0.9.1 lock, V2 channels cannot settle on chain). A devnet made
+before this change has the old genesis: `npm run reset`, then `npm run bootstrap`.
 
 After `npm run bootstrap` you have:
 
@@ -16,8 +20,11 @@ After `npm run bootstrap` you have:
 - fnn wallets funded with 1,000,000 CKB and 1,000,000 RUSD stand-in each, from the dev chain's genesis key.
 - **RUSD stand-in**: an xUDT issued by the genesis key, in both fnn UDT whitelists (RUSD itself is not on devnet).
 - A CKB channel (200,000 CKB) and a RUSD channel (100,000 RUSD) between fnn-hub and fnn-user, balanced half and half.
-- A least-privilege macaroon for the hub (`info:read invoices:read invoices:write offchain:read offchain:write
-  onchain:read`) and one with the same rights for the demo wallet, plus TLS certificates, in `devnet/.secrets/`.
+- A least-privilege macaroon for the hub and one with the same rights for the demo wallet, plus TLS certificates, in
+  `devnet/.secrets/`. The rights are LND URI permissions for exactly the calls the hub's LND adapter makes
+  (`HUB_MACAROON_PERMISSIONS` in `scripts/lib/devnet.constants.ts`, the same list as the testnet kit's). A devnet
+  bootstrapped before 2026-11-20 has the broader entity macaroon (`info:read invoices:read invoices:write offchain:read
+  offchain:write onchain:read`): `npm run secrets`, then restart the hub.
 - `devnet/hub.env`: every variable the hub needs for this devnet (nodes, demo wallet, `UDT_RUSD_SCRIPT`).
 
 ## Prerequisites
@@ -135,9 +142,9 @@ doubling batches add in one run; 0 turns them off).
 | Path | What |
 | --- | --- |
 | `docker-compose.yml` | The services, volumes and inline `bitcoin.conf` / `lnd.conf` |
-| `ckb/dev.toml`, `ckb/contracts/` | Fiber v0.9.1's dev chain spec and contract binaries (`tests/nodes/deployer/dev.toml`, `tests/deploy/contracts/`), so the Fiber contracts, simple_udt and xUDT are in genesis |
+| `ckb/dev.toml`, `ckb/contracts/` | Fiber's dev chain spec and contract binaries (v0.9.1; `commitment-lock` from v0.10.1, the generation testnet runs since 2026-10-21) (`tests/nodes/deployer/dev.toml`, `tests/deploy/contracts/`), so the Fiber contracts, simple_udt and xUDT are in genesis |
 | `ckb/docker-entrypoint.sh` | Initialises the CKB data directory from that spec and runs the node on the stock `nervos/ckb` image; for `ckb-miner`, calls the node's `generate_block` every `CKB_BLOCK_INTERVAL_MS` (like Fiber's own harness), which keeps producing after the Docker VM clock jumps back, where `ckb miner` stalls the chain |
-| `fnn/Dockerfile` | Debian slim with the fnn v0.9.1 release binary (checksum verified); release timings, not the debug ones of Fiber's own harness. `fnn-hub` builds the image and `fnn-user` runs the same tag (two services building one tag race on a first start) |
+| `fnn/Dockerfile` | Debian slim with the fnn v0.10.1 release binary (checksum verified); release timings, not the debug ones of Fiber's own harness. `fnn-hub` builds the image and `fnn-user` runs the same tag (two services building one tag race on a first start) |
 | `fnn/config.yml` | Shared fnn config; per-node values come from the environment in `docker-compose.yml` |
 | `scripts/bootstrap.ts`, `scripts/steps/` | The bootstrap, one file per step |
 | `scripts/smoke.ts`, `scripts/smoke/` | The smoke test |

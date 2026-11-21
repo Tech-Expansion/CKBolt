@@ -7,6 +7,7 @@ import type { ActivityEntry, SwapLeg } from "@/lib/wallets/fiber-browser/activit
 import type { NodePresence } from "@/lib/wallets/fiber-browser/bridge-protocol";
 import { startBridgeServer } from "@/lib/wallets/fiber-browser/bridge-server";
 import { CKB_ASSET, swapLiquidity } from "@/lib/wallets/fiber-browser/channels";
+import { scriptToAddress } from "@/lib/wallets/fiber-browser/ckb-address";
 import type { ConfirmationQueue } from "@/lib/wallets/fiber-browser/confirmations";
 import { browserRandomBytes } from "@/lib/wallets/fiber-browser/keys";
 import { WrongPasswordError, type KeystoreRecord } from "@/lib/wallets/fiber-browser/keystore";
@@ -25,7 +26,13 @@ import {
   type OnChainDeps,
 } from "@/lib/wallets/fiber-browser/pay-requests";
 import { makeReceiveInvoice, readRequestInvoiceStatus, type RequestInvoiceDeps } from "@/lib/wallets/fiber-browser/request-invoices";
-import { makePayoutInvoice, payHoldInvoice, type SwapRequestDeps } from "@/lib/wallets/fiber-browser/swap-requests";
+import {
+  makePayoutInvoice,
+  prepareSwapPayment,
+  sendSwapPayment,
+  swapPaymentConfirmView,
+  type SwapRequestDeps,
+} from "@/lib/wallets/fiber-browser/swap-requests";
 import { BRIDGE_TIMING, INVOICE_STATUS_OPEN, type BrowserNodeNetwork } from "@/lib/wallets/fiber-browser/constants";
 
 export interface BridgeContext {
@@ -54,7 +61,17 @@ export interface BridgeContext {
   keystore: KeystoreRecord | null;
 }
 
-/** What the node tab tells the swap form about itself. */
+/** The node's CKB address from its funding lock, or null while the lock is unknown (or not one an address can name). */
+function addressOf(lock: Script | null, network: BrowserNodeNetwork): string | null {
+  if (!lock) return null;
+  try {
+    return scriptToAddress(lock, network);
+  } catch {
+    return null;
+  }
+}
+
+/** What the node tab tells the swap form (and the funding page) about itself. */
 export function presenceOf(ctx: BridgeContext): NodePresence {
   // Only the hub's channels count for a swap; a hub on another network has none with this node.
   const hubNode = ctx.hubNode && ctx.hubNode.network === ctx.network ? ctx.hubNode : null;
@@ -73,6 +90,7 @@ export function presenceOf(ctx: BridgeContext): NodePresence {
     liquidity,
     onChainCkb: ctx.balance === null ? null : ctx.balance.toString(),
     contributionCkb: ctx.contributionCkb,
+    address: addressOf(ctx.nodeLock, ctx.network),
   };
 }
 
@@ -158,7 +176,12 @@ export function useBridgeServer(ctx: BridgeContext): void {
         return result;
       },
       payInvoice: async (params) => {
-        const sent = await payHoldInvoice(deps(), params);
+        // Checked first (the hub's swap, the hash of the visitor's own invoice, amount, token, payee); then, like Pay,
+        // nothing is sent until the visitor confirms it in the node.
+        const prepared = await prepareSwapPayment(deps(), params);
+        const sent = await latest.current.confirmations.ask(swapPaymentConfirmView(prepared), () => sendSwapPayment(deps(), prepared), {
+          timeoutMs: BRIDGE_TIMING.confirmTimeoutMs,
+        });
         latest.current.record(
           swapEntry({
             leg: "payment",

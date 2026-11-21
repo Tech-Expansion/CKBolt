@@ -3,20 +3,22 @@ import type Database from "better-sqlite3";
 import type { ChannelOpenLog } from "../../application/ports/channel-open-log.port";
 import type { Clock } from "../../application/ports/clock.port";
 import type { InboundOpenStore } from "../../application/ports/inbound-open-store.port";
+import type { QuoteRetention } from "../../application/ports/quote-retention.port";
 import type { SwapStore } from "../../application/ports/swap-store.port";
-import { CHANNEL_OPEN_LOG, CLOCK, HUB_CONFIG, INBOUND_OPEN_STORE, SWAP_STORE } from "../../application/ports/tokens";
+import { CHANNEL_OPEN_LOG, CLOCK, HUB_CONFIG, INBOUND_OPEN_STORE, QUOTE_RETENTION, SWAP_STORE } from "../../application/ports/tokens";
 import type { HubConfig } from "../../config/hub.config";
 import { SqliteChannelOpenLog } from "./sqlite-channel-open-log";
 import { openHubDatabase } from "./sqlite.database";
 import { SqliteInboundOpenStore } from "./sqlite-inbound-open-store";
+import { SqliteQuoteRetention } from "./sqlite-quote-retention";
 import { SqliteSwapStore } from "./sqlite-swap-store";
 
 /** The hub's one database connection, shared by the stores below; not exported. */
 const HUB_DATABASE = Symbol("HUB_DATABASE");
 
 /**
- * Provides SWAP_STORE, CHANNEL_OPEN_LOG and INBOUND_OPEN_STORE (SQLite at `config.database.path`, one database for all)
- * to every module.
+ * Provides SWAP_STORE, CHANNEL_OPEN_LOG, INBOUND_OPEN_STORE and QUOTE_RETENTION (SQLite at `config.database.path`, one
+ * database for all) to every module.
  * The database closes on application shutdown, the last lifecycle step: after every module's onModuleDestroy (the swap
  * scheduler stops there) and after the HTTP server has closed, so nothing that is still running finds it closed.
  */
@@ -43,8 +45,13 @@ const HUB_DATABASE = Symbol("HUB_DATABASE");
       useFactory: (db: Database.Database): InboundOpenStore => new SqliteInboundOpenStore(db),
       inject: [HUB_DATABASE],
     },
+    {
+      provide: QUOTE_RETENTION,
+      useFactory: (db: Database.Database): QuoteRetention => new SqliteQuoteRetention(db),
+      inject: [HUB_DATABASE],
+    },
   ],
-  exports: [SWAP_STORE, CHANNEL_OPEN_LOG, INBOUND_OPEN_STORE],
+  exports: [SWAP_STORE, CHANNEL_OPEN_LOG, INBOUND_OPEN_STORE, QUOTE_RETENTION],
 })
 export class PersistenceModule implements OnApplicationShutdown {
   constructor(@Inject(SWAP_STORE) private readonly store: SwapStore) {}

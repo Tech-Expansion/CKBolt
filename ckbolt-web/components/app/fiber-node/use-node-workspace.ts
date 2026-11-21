@@ -138,10 +138,12 @@ export function useNodeWorkspace(config: BrowserNodeConfig): NodeWorkspace {
     [localStore, config.network],
   );
 
-  const { rememberNodeId } = nodeKey;
+  const address = useMemo(() => (fundingLock ? scriptToAddress(fundingLock, config.network) : null), [fundingLock, config.network]);
+  const { rememberNode } = nodeKey;
+  const runningNodeId = state.info?.nodeId ?? null;
   useEffect(() => {
-    if (state.info) rememberNodeId(state.info.nodeId);
-  }, [state.info, rememberNodeId]);
+    if (runningNodeId) rememberNode(runningNodeId, address);
+  }, [runningNodeId, address, rememberNode]);
 
   // The hub's id, kept for when the hub cannot be reached or runs on another network.
   const [keptHubId, setKeptHubId] = useState(() => readKnownHubNodeId(localStore, config.network));
@@ -172,7 +174,6 @@ export function useNodeWorkspace(config: BrowserNodeConfig): NodeWorkspace {
     keystore: nodeKey.record,
   });
 
-  const address = useMemo(() => (fundingLock ? scriptToAddress(fundingLock, config.network) : null), [fundingLock, config.network]);
   const decimalsOf = useCallback((asset: string) => hub.assets.find((a) => a.id === asset)?.decimals ?? CKB_DECIMALS, [hub.assets]);
   const symbolOf = useCallback((asset: string) => hub.assets.find((a) => a.id === asset)?.symbol ?? asset, [hub.assets]);
   const lookOf = useCallback(

@@ -2,7 +2,7 @@
 
 import type { SwapRun } from "@/hooks/use-swap-runner";
 import { PROGRESS_COPY } from "@/lib/swap/copy";
-import { HoldInvoicePay, ManualPay } from "./manual-pay";
+import { HoldInvoicePay, ManualPay, NoPaymentHint } from "./manual-pay";
 import { ProgressSteps } from "./progress-steps";
 import { SwapResult } from "./swap-result";
 
@@ -19,7 +19,10 @@ export function RunView({ run, onPayInBrowser }: { run: SwapRun; onPayInBrowser:
       {ended && swap ? <SwapResult outcome={outcome} swap={swap} symbol={plan.symbol} /> : <ProgressSteps steps={run.steps} />}
       {run.manualInvoice &&
         (plan.quote.direction === "ln_to_fiber" ? (
-          <HoldInvoicePay invoice={run.manualInvoice} browserWallet={run.browserWallet} onPayInBrowser={onPayInBrowser} />
+          <>
+            <HoldInvoicePay invoice={run.manualInvoice} browserWallet={run.browserWallet} onPayInBrowser={onPayInBrowser} />
+            {run.noPaymentYet && <NoPaymentHint />}
+          </>
         ) : (
           <ManualPay
             invoice={run.manualInvoice}

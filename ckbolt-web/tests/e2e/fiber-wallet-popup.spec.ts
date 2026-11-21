@@ -26,6 +26,7 @@ import {
   units,
 } from "./support/fiber-node";
 import {
+  answerInNode,
   browserHasDip,
   createWalletNode,
   DIP_PROBE_TIMEOUT_MS,
@@ -142,7 +143,9 @@ test.describe("the popup's route", () => {
     const headers = wallet.headers();
     expect(headers["document-isolation-policy"]).toBe("isolate-and-credentialless");
     expect(headers["x-frame-options"]).toBe("SAMEORIGIN");
-    expect(headers["content-security-policy"]).toBe("frame-ancestors 'self'; object-src 'none'; base-uri 'self'; form-action 'self'");
+    // proxy.ts's strict policy since W4 (tests/e2e/node-csp.spec.ts), framed by this site only.
+    expect(headers["content-security-policy"]).toMatch(/^default-src 'self'; script-src 'self' 'nonce-[^']+' 'strict-dynamic' /);
+    expect(headers["content-security-policy"]).toMatch(/; frame-ancestors 'self'$/);
     expect(headers["cross-origin-opener-policy"]).toBeUndefined();
     expect(headers["cross-origin-embedder-policy"]).toBeUndefined();
     expect(headers["x-content-type-options"]).toBe("nosniff");
@@ -270,10 +273,10 @@ test.describe("the header's Fiber node", () => {
 
     // Password rules, then a running node: what a swap can move, its CKB, the hub, its pages.
     const home = ui.getByTestId("fiber-wallet-home");
-    await home.getByLabel("Password, at least 8 characters").fill("short");
+    await home.getByLabel("Password, at least 12 characters").fill("short");
     await home.getByLabel("Repeat the password").fill("short");
     await home.getByRole("button", { name: "Create node" }).click();
-    await expect(home.getByTestId("fiber-node-key-error")).toHaveText("Use at least 8 characters.");
+    await expect(home.getByTestId("fiber-node-key-error")).toHaveText("Use at least 12 characters.");
     await createWalletNode(ui);
     const { nodeId } = await nodeIdentity(wallet.scope);
     await expect(ui.getByTestId("fiber-wallet-ready")).toContainText("Ready to swap");
@@ -415,7 +418,7 @@ async function clickInsideNode(page: Page) {
     await expect(ui.getByText(FALLBACK_COPY.TIP)).toBeVisible();
     return;
   }
-  const field = ui.getByLabel("Password, at least 8 characters");
+  const field = ui.getByLabel("Password, at least 12 characters");
   await pressOn(page, field);
   await page.mouse.up();
   await expect(field).toBeFocused();
@@ -695,6 +698,13 @@ test.describe("the node's pages", () => {
     await expect(fund).toHaveText("Fund from a wallet");
     await expect(fund).toHaveAttribute("href", `/app/fiber/fund?address=${address}`);
     await expect(fund).toHaveAttribute("target", "_blank");
+    // The funding page in a new tab: the running node confirms its own address over the bridge (W7), so the form shows.
+    const [fundPage] = await Promise.all([context.waitForEvent("page"), fund.click()]);
+    await expect(fundPage.getByTestId("fund-fiber-node")).toBeVisible({ timeout: WALLET_TIMEOUT_MS });
+    await expect(fundPage.getByTestId("fund-node-address")).toContainText(address);
+    await expect(fundPage.getByTestId("fund-node-mismatch")).toHaveCount(0);
+    await expect(fundPage.getByTestId("fund-node-unconfirmed")).toHaveCount(0);
+    await fundPage.close();
     await funds.getByRole("button", { name: "About funding the node" }).click();
     await expect(ui.getByRole("dialog", { name: "About funding the node" })).toContainText("testnet CKB or RUSD");
   });
@@ -1003,7 +1013,7 @@ test.describe("the node and the swap card", () => {
     await expect(swaps.first()).toHaveAttribute("data-kind", "swap");
 
     // The node made the payout invoice before the swap had an id; the swap the card kept carries the same payment hash
-    // (the fake hub draws its own, so it takes the node's here, as the real hub does): one entry, with both sides.
+    // (the fake hub locks the swap to the node's invoice, as the real hub does): one entry, with both sides.
     const nodeHash = await shareNodeHash(hub, frame);
     hub.holdPayment();
     await card.expectStep(3, "done", "The hub holds your payment");
@@ -1041,6 +1051,16 @@ test.describe("the node and the swap card", () => {
     await expect(card.amount).toHaveValue("10,000", { timeout: WALLET_TIMEOUT_MS });
     await card.expectPrimary("Swap", { enabled: true });
     await card.swap();
+    // The node waits for the visitor's Confirm on its own page, in the popup (security review W2): the dialog's "Confirm in
+    // your Fiber node" hides it and opens the popup there; View brings the dialog back.
+    await card.expectStep(3, "active", "Confirm it in your Fiber node");
+    await card.progress.getByTestId("swap-confirm-in-node").click();
+    await expect(card.progress).toBeHidden();
+    await expect(page.getByTestId("fiber-wallet-popover")).toBeVisible();
+    await expect(wallet.ui.getByTestId("fiber-wallet-confirm-request")).toHaveAttribute("data-kind", "swap-payment", { timeout: WALLET_TIMEOUT_MS });
+    await answerInNode(wallet, "accept");
+    await page.getByTestId("fiber-wallet-close").click();
+    await card.banner.getByRole("button", { name: "View" }).click();
     await card.expectStep(3, "active", "Sent; waiting for the hub");
     hub.holdPayment();
     hub.startPayout();

@@ -3,9 +3,12 @@ import { DemoModule } from "./application/demo/demo.module";
 import { FiberNodeModule } from "./application/fiber-node/fiber-node.module";
 import { HealthModule } from "./application/health/health.module";
 import { LightningNodeModule } from "./application/lightning-node/lightning-node.module";
+import { MonitoringModule } from "./application/monitoring/monitoring.module";
 import { PricingModule } from "./application/pricing/pricing.module";
+import { QuoteRetentionModule } from "./application/quote-retention/quote-retention.module";
 import { SwapsModule } from "./application/swaps/swaps.module";
 import { HubConfigModule } from "./config/config.module";
+import { AlertsModule } from "./infrastructure/alerts/alerts.module";
 import { FiberModule } from "./infrastructure/fiber/fiber.module";
 import { LightningModule } from "./infrastructure/lightning/lightning.module";
 import { PersistenceModule } from "./infrastructure/persistence/persistence.module";
@@ -33,7 +36,10 @@ const DEMO_MODULE = DemoModule.register({ imports: [SwapsModule] });
     FiberModule,
     PersistenceModule,
     PricesModule,
+    AlertsModule,
+    MonitoringModule,
     PricingModule,
+    QuoteRetentionModule,
     SwapsModule,
     DEMO_MODULE,
     HealthModule,

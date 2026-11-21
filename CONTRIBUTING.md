@@ -73,9 +73,11 @@ Playwright's bundled Chromium lacks; those tests skip themselves there and run i
   (`fiberHeldTlcFailsAt`).
 - fnn can report a payment `Failed` while a part is still out: payouts go in one part (`max_parts: 1`), a matching
   preimage is success, and a `Failed` payout is final only once no outbound TLC for the hash is still pending.
-- fnn lets a payee claim the hub's TLC on chain with the preimage even after its expiry; the payout guard
-  (`FIBER_PAYOUT_GUARD`) force-closes the payout channel early so that claim lands in time. Only a public channel the
-  hub opened to a router that is not the payee stays open.
+- After a force close, fnn lets a payee claim the hub's TLC on chain with the preimage even after its expiry, until the
+  hub's timeout claim confirms (ckbolt-hub/docs/research/fiber-node.md section 9). The Lightning margin
+  (`lnMarginBlocks`) keeps the hold for those minutes, and the payout guard (`FIBER_PAYOUT_GUARD`) force-closes the
+  payout channel early so long epochs cannot delay the timeout claim. Only a public channel the hub opened to a router
+  that is not the payee stays open.
 
 ## Web app rules
 

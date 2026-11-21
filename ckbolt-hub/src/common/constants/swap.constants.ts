@@ -91,8 +91,11 @@ export const PAYOUT_SEND_EVENTS: readonly SwapEventType[] = [SWAP_EVENT.PAYOUT_S
 
 /* ------------------------------------------------------------------------------------------- invoices, logs */
 
-/** Description (Fiber) or memo (Lightning) of the hold invoices the hub issues. */
-export const holdInvoiceDescription = (swapId: string): string => `CKBolt swap ${swapId}`;
+/**
+ * Description (Fiber) or memo (Lightning) of the hold invoices the hub issues. It names no swap: a swap id lets anyone
+ * read the swap, and an invoice is seen by wallets, payers and the nodes on its route.
+ */
+export const HOLD_INVOICE_DESCRIPTION = "CKBolt swap";
 
 /** Random bytes in a swap's cancel token: too many to guess, so a plain hash is enough to keep it by. */
 export const CANCEL_TOKEN_BYTES = 32;

@@ -86,16 +86,24 @@ export const LND_CONTAINER_FILE = {
 } as const;
 
 /**
- * Least-privilege macaroon the hub and the demo wallet use (docs/phase-3-plan.md section 4). onchain:read lets the
- * hub's getBalances read the wallet balance (WalletBalance).
+ * Least-privilege macaroon the hub and the demo wallet use: exactly the gRPC methods the hub's LND adapter calls
+ * (src/infrastructure/lightning/lnd.rpc.ts), as LND URI permissions (docs/security-review-2026-11.md, D9). Kept equal to
+ * the testnet kit's (deploy/scripts/lib/constants.ts), so the devnet runs the hub with the macaroon the server bakes.
  */
 export const HUB_MACAROON_PERMISSIONS = [
-  "info:read",
-  "invoices:read",
-  "invoices:write",
-  "offchain:read",
-  "offchain:write",
-  "onchain:read",
+  "uri:/lnrpc.Lightning/GetInfo",
+  "uri:/lnrpc.Lightning/DecodePayReq",
+  "uri:/lnrpc.Lightning/AddInvoice",
+  "uri:/lnrpc.Lightning/LookupInvoice",
+  "uri:/lnrpc.Lightning/ListInvoices",
+  "uri:/lnrpc.Lightning/SubscribeInvoices",
+  "uri:/lnrpc.Lightning/ChannelBalance",
+  "uri:/lnrpc.Lightning/WalletBalance",
+  "uri:/invoicesrpc.Invoices/AddHoldInvoice",
+  "uri:/invoicesrpc.Invoices/SettleInvoice",
+  "uri:/invoicesrpc.Invoices/CancelInvoice",
+  "uri:/routerrpc.Router/SendPaymentV2",
+  "uri:/routerrpc.Router/TrackPaymentV2",
 ] as const;
 
 /** Names of the macaroons the bootstrap bakes and copies to devnet/.secrets/<service>/. */

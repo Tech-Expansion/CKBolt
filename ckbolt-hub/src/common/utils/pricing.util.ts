@@ -67,3 +67,8 @@ export function formatBaseUnits(amount: bigint, decimals: number): string {
   const fraction = (amount % unit).toString().padStart(decimals, "0").replace(TRAILING_ZEROS, "");
   return fraction ? `${whole}${DECIMAL_POINT}${fraction}` : whole.toString();
 }
+
+/** PRICE_SOURCES as the hub uses them: trimmed, lower case, each name once, blanks dropped, in config order. */
+export const distinctPriceSourceNames = (names: readonly string[]): string[] => [
+  ...new Set(names.map((name) => name.trim().toLowerCase()).filter(Boolean)),
+];

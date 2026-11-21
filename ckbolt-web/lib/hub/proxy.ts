@@ -2,6 +2,7 @@ import { clientAddressKey } from "../client-address";
 import { API_ERROR_CODE, HUB_PROXY_ERROR_CODE, HUB_PROXY_HEADER, type HubErrorCode } from "./contract";
 import type { HubProxyConfig } from "./config";
 import {
+  API_CONTENT_SECURITY_POLICY,
   FORWARDED_HEADER_VALUE_PATTERN,
   HTTP_HEADER,
   HTTP_STATUS,
@@ -10,6 +11,7 @@ import {
   HUB_PROXY_LOG_PREFIX,
   JSON_CONTENT_TYPE,
   MS_PER_SECOND,
+  NO_SNIFF,
   NO_STORE,
   RATE_LIMIT_KEY,
   type HttpMethod,
@@ -26,7 +28,21 @@ export interface HubProxyDeps {
 }
 
 /** Response headers passed back from the hub; everything else is dropped. */
-const PASSED_HEADERS = [HTTP_HEADER.CONTENT_TYPE, HTTP_HEADER.RETRY_AFTER] as const;
+const PASSED_HEADERS = [HTTP_HEADER.RETRY_AFTER] as const;
+
+/**
+ * Every answer of the proxy is JSON from this site's origin, whatever the hub (or a tunnel's error page) sent: it is
+ * served as JSON that cannot run as a page, so nothing the hub returns can script the site.
+ */
+const PROXY_RESPONSE_HEADERS: Readonly<Record<string, string>> = {
+  [HTTP_HEADER.CONTENT_TYPE]: JSON_CONTENT_TYPE,
+  [HTTP_HEADER.CACHE_CONTROL]: NO_STORE,
+  [HTTP_HEADER.CONTENT_SECURITY_POLICY]: API_CONTENT_SECURITY_POLICY,
+  [HTTP_HEADER.CONTENT_TYPE_OPTIONS]: NO_SNIFF,
+};
+
+/** 3xx: the hub never redirects, so a redirect (a misrouted tunnel) is not followed by the visitor's browser. */
+const isRedirect = (status: number): boolean => status >= HTTP_STATUS.REDIRECT_FIRST && status <= HTTP_STATUS.REDIRECT_LAST;
 
 const isTimeout = (e: unknown): boolean => e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError");
 
@@ -34,7 +50,7 @@ const isTimeout = (e: unknown): boolean => e instanceof Error && (e.name === "Ti
 export function errorResponse(status: number, code: HubErrorCode, message: string, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify({ error: { code, message } }), {
     status,
-    headers: { [HTTP_HEADER.CONTENT_TYPE]: JSON_CONTENT_TYPE, [HTTP_HEADER.CACHE_CONTROL]: NO_STORE, ...headers },
+    headers: { ...PROXY_RESPONSE_HEADERS, ...headers },
   });
 }
 
@@ -202,17 +218,21 @@ export class HubProxy {
         ? errorResponse(HTTP_STATUS.GATEWAY_TIMEOUT, HUB_PROXY_ERROR_CODE.HUB_TIMEOUT, HUB_MESSAGE.TIMEOUT)
         : errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, HUB_PROXY_ERROR_CODE.HUB_UNAVAILABLE, HUB_MESSAGE.UNREACHABLE);
     }
+    if (isRedirect(upstream.status)) {
+      return errorResponse(HTTP_STATUS.SERVICE_UNAVAILABLE, HUB_PROXY_ERROR_CODE.HUB_UNAVAILABLE, HUB_MESSAGE.UNREADABLE);
+    }
     return new Response(text, { status: upstream.status, headers: this.responseHeaders(upstream) });
   }
 
   private responseHeaders(upstream: Response): Record<string, string> {
-    const headers: Record<string, string> = { [HTTP_HEADER.CACHE_CONTROL]: NO_STORE };
+    const headers: Record<string, string> = { ...PROXY_RESPONSE_HEADERS };
     for (const name of PASSED_HEADERS) {
       const value = upstream.headers.get(name);
       if (value) headers[name] = value;
     }
+    // Only a created resource names where it lives (201 with Location, the hub's REST contract).
     const location = upstream.headers.get(HTTP_HEADER.LOCATION);
-    if (location) headers[HTTP_HEADER.LOCATION] = proxiedLocation(location);
+    if (location && upstream.status === HTTP_STATUS.CREATED) headers[HTTP_HEADER.LOCATION] = proxiedLocation(location);
     return headers;
   }
 }

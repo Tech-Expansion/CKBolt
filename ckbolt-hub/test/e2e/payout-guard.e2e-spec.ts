@@ -1,12 +1,12 @@
 import { createHash, randomBytes } from "node:crypto";
 import { CLOCK } from "../../src/application/ports/tokens";
 import type { Clock } from "../../src/application/ports/clock.port";
-import { FIBER_CHANNEL_READY_STATE } from "../../src/common/constants/fiber-rpc.constants";
+import { FIBER_CHANNEL_CLOSED_STATE, FIBER_CHANNEL_READY_STATE } from "../../src/common/constants/fiber-rpc.constants";
 import { MS_PER_HOUR, MS_PER_MINUTE } from "../../src/common/constants/protocol.constants";
 import { SWAP_DIRECTION, SWAP_STATE } from "../../src/common/constants/swap.constants";
 import { canonicalHex } from "../../src/common/utils/hex.util";
 import { createSwap, getSwap, lightningSideQuote, postQuote, waitForSwap } from "../support/hub-http";
-import { swapSides } from "./support/devnet-nodes";
+import { swapSides, type DevnetNodes } from "./support/devnet-nodes";
 import { useE2eContext } from "./support/e2e-flow";
 import type { FnnChannel } from "../../devnet/scripts/lib/fiber";
 
@@ -19,6 +19,13 @@ import type { FnnChannel } from "../../devnet/scripts/lib/fiber";
  *
  * The hub runs with a clock a test can move forward, so it acts as if 2 hours had passed without waiting for them;
  * the CKB devnet's epochs last about ten blocks, so the channel's commitment delay passes in seconds of real time.
+ *
+ * Each case opens its own channel right after the previous case force-closed one. fnn 0.9.1 can then build a funding
+ * transaction on a cell its watchtower's settlement also spends, and CKB rejects it ("Funding transaction ... failed to
+ * be confirmed with final status Rejected"; fixed in fnn 0.10 by fiber PR #1707, "hold cells across funding and the
+ * watchtower"). So a case waits until no channel between the two nodes is still opening, closing or settling on chain,
+ * and calls open_channel again, a bounded number of times and with a warning each time, when the channel it asked for
+ * is aborted or never shows.
  */
 
 const SATS = BigInt(3_101);
@@ -51,6 +58,83 @@ async function until<T>(read: () => Promise<T>, done: (value: T) => boolean, wha
 const sameId = (a: string, b: string): boolean => canonicalHex(a) === canonicalHex(b);
 const holdsTlcFor = (channel: FnnChannel, hash: string): boolean => channel.pending_tlcs.some((tlc) => sameId(tlc.payment_hash, hash));
 
+/**
+ * The close flag fnn v0.9.1 keeps on a Closed channel while its watchtower still settles the commitment on chain
+ * (fiber-json-types CloseFlags; list_channels writes the flags as names joined by "|"). The flag goes once settled.
+ */
+const WAITING_ONCHAIN_SETTLEMENT_FLAG = "WAITING_ONCHAIN_SETTLEMENT";
+/** open_channel calls a case makes at most before it fails: see the funding race in the header. */
+const OPEN_CHANNEL_ATTEMPTS = 3;
+/** How long a channel open_channel asked for may take to show in list_channels before the call counts as lost. */
+const OPEN_CHANNEL_APPEAR_MS = MS_PER_MINUTE;
+
+/** list_channels' state_flags as text (FnnChannel leaves them out of its type). */
+const stateFlags = (channel: FnnChannel): string => {
+  const flags: unknown = (channel.state as { state_flags?: unknown }).state_flags;
+  return typeof flags === "string" ? flags : JSON.stringify(flags ?? "");
+};
+const describeChannel = (channel: FnnChannel): string => `${channel.channel_id} ${channel.state.state_name} (${stateFlags(channel)})`;
+const isReady = (channel: FnnChannel | undefined): boolean => channel?.state.state_name === FIBER_CHANNEL_READY_STATE;
+const isClosed = (channel: FnnChannel | undefined): boolean => channel?.state.state_name === FIBER_CHANNEL_CLOSED_STATE;
+/** Ready, or closed with nothing left on chain: neither node's wallet or watchtower is busy with it. */
+const isAtRest = (channel: FnnChannel): boolean => isReady(channel) || (isClosed(channel) && !stateFlags(channel).includes(WAITING_ONCHAIN_SETTLEMENT_FLAG));
+
+/**
+ * Waits until every channel between fnn-hub and fnn-user, as either node lists it (closed ones included), is at rest:
+ * both nodes fund a channel the hub opens (fnn-user auto-accepts with its own funding), and both watchtowers settle one
+ * the hub force-closed.
+ */
+async function waitForChannelsAtRest(nodes: DevnetNodes): Promise<void> {
+  const busy = async (): Promise<string[]> => {
+    const [hubSide, userSide] = await Promise.all([
+      nodes.fiber.hub.channelsWith(nodes.pubkeys.fnnUser, true),
+      nodes.fiber.user.channelsWith(nodes.pubkeys.fnnHub, true),
+    ]);
+    const listed = [...hubSide.map((channel) => ({ node: "fnn-hub", channel })), ...userSide.map((channel) => ({ node: "fnn-user", channel }))];
+    return listed.filter(({ channel }) => !isAtRest(channel)).map(({ node, channel }) => `${node} ${describeChannel(channel)}`);
+  };
+  await until(busy, (channels) => channels.length === 0, "every channel between fnn-hub and fnn-user to be ready or settled on chain");
+}
+
+/**
+ * Opens a CKB channel fnn-hub -> fnn-user and returns it once ready. A channel the call produced that fnn aborts
+ * (Closed before ready), or none within OPEN_CHANNEL_APPEAR_MS, counts as the funding race: the nodes are left to come
+ * to rest and open_channel is called again, at most OPEN_CHANNEL_ATTEMPTS times. A channel that shows but neither gets
+ * ready nor closes fails the case as before ("timed out waiting for the payout channel to be ready").
+ */
+async function openPayoutChannel(nodes: DevnetNodes, isPublic: boolean): Promise<FnnChannel> {
+  const { fiber, pubkeys } = nodes;
+  const ckbChannelsWithClosed = async () =>
+    (await fiber.hub.channelsWith(pubkeys.fnnUser, true)).filter((c) => c.funding_udt_type_script === null);
+  const known = new Set((await ckbChannelsWithClosed()).map((c) => canonicalHex(c.channel_id)));
+  const newChannel = async () => (await ckbChannelsWithClosed()).find((c) => !known.has(canonicalHex(c.channel_id)));
+  const failures: string[] = [];
+
+  for (let attempt = 1; attempt <= OPEN_CHANNEL_ATTEMPTS; attempt += 1) {
+    await waitForChannelsAtRest(nodes);
+    // A channel an earlier attempt asked for may have shown and got ready after its attempt was given up.
+    const late = await newChannel();
+    if (isReady(late)) return late!;
+
+    await fiber.hub.openChannel(pubkeys.fnnUser, PAYOUT_CHANNEL_CKB, null, isPublic);
+    const startedAt = Date.now();
+    const outcome = await until(
+      newChannel,
+      (c) => isReady(c) || isClosed(c) || (c === undefined && Date.now() - startedAt > OPEN_CHANNEL_APPEAR_MS),
+      "the payout channel to be ready",
+    );
+    if (isReady(outcome)) return outcome!;
+
+    const why = outcome ? `its channel ended ${describeChannel(outcome)}` : `no channel showed within ${OPEN_CHANNEL_APPEAR_MS / 1_000} s`;
+    failures.push(`attempt ${attempt}: ${why}`);
+    if (outcome) known.add(canonicalHex(outcome.channel_id));
+    if (attempt < OPEN_CHANNEL_ATTEMPTS) {
+      console.warn(`payout guard e2e: open_channel attempt ${attempt} of ${OPEN_CHANNEL_ATTEMPTS} failed (${why}); retrying once the channels are at rest`);
+    }
+  }
+  throw new Error(`the payout channel never became ready after ${OPEN_CHANNEL_ATTEMPTS} open_channel calls: ${failures.join("; ")}`);
+}
+
 const CASES = [
   { channel: "a private channel", isPublic: false },
   { channel: "a public channel whose peer is the payee", isPublic: true },
@@ -72,13 +156,7 @@ describe.each(CASES)("payout guard on the devnet: a payee that holds the payout 
 
       // A fresh CKB channel fnn-hub -> fnn-user; every other CKB channel with fnn-user off for now, so the payout takes it.
       const ckbChannels = async () => (await fiber.hub.channelsWith(pubkeys.fnnUser)).filter((c) => c.funding_udt_type_script === null);
-      const before = new Set((await ckbChannels()).map((c) => c.channel_id));
-      await fiber.hub.openChannel(pubkeys.fnnUser, PAYOUT_CHANNEL_CKB, null, isPublic);
-      const payoutChannel = await until(
-        async () => (await ckbChannels()).find((c) => !before.has(c.channel_id)),
-        (c) => c?.state.state_name === FIBER_CHANNEL_READY_STATE,
-        "the payout channel to be ready",
-      );
+      const payoutChannel: FnnChannel | undefined = await openPayoutChannel(e2e.nodes, isPublic);
       expect(payoutChannel?.is_public === true).toBe(isPublic);
       const others = (await ckbChannels()).filter((c) => !sameId(c.channel_id, payoutChannel!.channel_id));
       for (const channel of others) await fiber.hub.setChannelEnabled(channel.channel_id, false);

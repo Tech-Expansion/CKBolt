@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@ckb-ccc/connector-react": "^2.2.2",
-    "@nervosnetwork/fiber-js": "0.9.1",
+    "@nervosnetwork/fiber-js": "0.10.1",
     "@noble/hashes": "^2.4.0",
     "@radix-ui/react-dialog": "1.1.4",
     "@radix-ui/react-popover": "1.1.4",
@@ -24,7 +24,7 @@
     "clsx": "^2.1.1",
     "jsqr": "^1.4.0",
     "lucide-react": "^0.454.0",
-    "next": "16.0.10",
+    "next": "16.4.6",
     "qrcode": "^1.5.4",
     "react": "19.2.0",
     "react-dom": "19.2.0",

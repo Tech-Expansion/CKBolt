@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { BrowserContext, Page, Route } from "@playwright/test";
 import { CHARSET, hrpExpand, polymod, toWords } from "../../../lib/bech32";
 import { encodeUnsignedBolt11, type Network } from "../../../lib/bolt11";
@@ -87,16 +87,35 @@ export const HEALTHY: HealthDto = {
 /** An error body in the contract's shape. */
 export const apiError = (code: string, message: string) => ({ error: { code, message } });
 
-/** An unsigned BOLT11 invoice that decodes like a real one; `timestamp` (Unix seconds) makes an old one. */
-export const lightningInvoice = (o: { sats: number; network?: Network; hash?: Buffer; expirySeconds?: number; description?: string; timestamp?: number }) =>
-  encodeUnsignedBolt11({
+/** The preimage (hex) of each payment hash (hex) lightningInvoice drew in this worker. */
+const drawnPreimages = new Map<string, string>();
+
+/**
+ * The preimage behind a payment hash lightningInvoice drew, or null: the visitor's wallet reveals it once the hub pays
+ * their invoice out, so the fake hub settles a CKB to BTC swap with it (support/live-hub.ts).
+ */
+export const preimageOfHash = (hash: string): string | null => drawnPreimages.get(hash.toLowerCase().replace(/^0x/, "")) ?? null;
+
+/**
+ * An unsigned BOLT11 invoice that decodes like a real one; `timestamp` (Unix seconds) makes an old one. Without `hash`
+ * it draws a preimage and uses its sha256, as a wallet does (preimageOfHash finds it again).
+ */
+export const lightningInvoice = (o: { sats: number; network?: Network; hash?: Buffer; expirySeconds?: number; description?: string; timestamp?: number }) => {
+  let hash = o.hash;
+  if (!hash) {
+    const preimage = randomBytes(32);
+    hash = createHash("sha256").update(preimage).digest();
+    drawnPreimages.set(hash.toString("hex"), preimage.toString("hex"));
+  }
+  return encodeUnsignedBolt11({
     network: o.network ?? "signet",
     amountSats: o.sats,
-    paymentHash: o.hash ?? randomBytes(32),
+    paymentHash: hash,
     description: o.description ?? "CKBolt",
     expirySeconds: o.expirySeconds ?? 600,
     timestamp: o.timestamp,
   });
+};
 
 const BOLT11_HRP: Record<Network, string> = { mainnet: "lnbc", testnet: "lntb", signet: "lntbs", regtest: "lnbcrt" };
 

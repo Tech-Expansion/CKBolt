@@ -14,12 +14,44 @@ const FIBER_NODE_ROUTE = '/app/fiber'
 const FIBER_WALLET_ROUTE = '/app/wallet'
 
 /**
- * Every path but the wallet's (path-to-regexp, as Next matches `source`): Next merges every rule that matches a path, so
- * the wallet must not match the rule that forbids framing at all.
+ * The same-origin hub proxy sets its own Content-Security-Policy (`default-src 'none'; sandbox`, lib/hub/constants.ts):
+ * a header from here would replace it, so the page rules below leave its answers alone.
  */
-const ALL_BUT_WALLET = `/:path((?!${FIBER_WALLET_ROUTE.slice(1)}$).*)`
+const HUB_PROXY_ROUTE = '/api/hub/'
 
-/** The content security policy, with who may frame the page. Script and connect sources stay open: wallet extensions inject scripts and CCC talks to CKB nodes. */
+/**
+ * Every path but the wallet's and the hub proxy's (path-to-regexp, as Next matches `source`): Next merges every rule that
+ * matches a path, so the wallet must not match the rule that forbids framing at all, and a header set here replaces the
+ * one a route sets.
+ */
+const ALL_BUT_WALLET = `/:path((?!${FIBER_WALLET_ROUTE.slice(1)}$|${HUB_PROXY_ROUTE.slice(1)}).*)`
+
+/**
+ * Every path but the two node pages and the hub proxy: the pages whose Content-Security-Policy this file sends. The node
+ * page and the wallet get theirs from proxy.ts, with a nonce per request (below).
+ */
+const ALL_BUT_NODE_PAGES = `/:path((?!${FIBER_WALLET_ROUTE.slice(1)}$|${FIBER_NODE_ROUTE.slice(1)}$|${HUB_PROXY_ROUTE.slice(1)}).*)`
+
+/**
+ * The rest of the site's content security policy: who may frame the page, no plugins, no base or form targets elsewhere.
+ * Script and connect sources stay open there: the funding page's CCC connector reaches the wallets and CKB nodes it
+ * chooses, wallet extensions (WebLN, CKB wallets) may inject scripts on /app and the funding page, and a nonce would make
+ * every static page render per request.
+ *
+ * The node pages, /app/fiber and /app/wallet (security review W4), get a strict policy from proxy.ts (lib/csp.ts):
+ * default-src 'self'; scripts only by Next.js's nonce ('strict-dynamic', no 'unsafe-inline' or 'unsafe-eval'), the
+ * root layout's one inline script by its hash; frame-ancestors as before ('self' for the wallet, 'none' for the node
+ * page). What it allows beyond this site, and why:
+ * - script-src 'wasm-unsafe-eval': fiber-js compiles its WASM node in its workers (WebAssembly only, not eval);
+ * - worker-src blob: fiber-js starts its two workers from blob: URLs of its own bundled code;
+ * - connect-src the CKB RPC origin (NEXT_PUBLIC_CKBOLT_FIBER_CKB_RPC_URL, default https://testnet.ckbapp.dev): the node,
+ *   its balance reader and CCC's client for Withdraw;
+ * - connect-src wss: Fiber peers on any host, since the hub's WebSocket addresses come from the hub at run time and a
+ *   channel with another node dials the address the visitor gives (ws: as well on a plain-http local server);
+ * - style-src 'unsafe-inline': React style attributes and CCC's connector; styles run no code;
+ * - img-src data: blob: https: token icons from the hub (any https host, checked by lib/token-display.ts), inline SVG
+ *   icons, QR codes and CCC's wallet icons.
+ */
 const contentSecurityPolicy = (frameAncestors) =>
   `frame-ancestors ${frameAncestors}; object-src 'none'; base-uri 'self'; form-action 'self'`
 
@@ -50,6 +82,10 @@ if (TEST_HOOKS && process.env.VERCEL_ENV === VERCEL_PRODUCTION) {
  */
 const DIST_DIR = process.env.CKBOLT_DIST_DIR || '.next'
 
+/** The brand kit page's first path, and where it lives now (BRAND_KIT_OLD_PATH and BRAND_KIT_PAGE_PATH in lib/brand/kit.ts). */
+const BRAND_KIT_OLD_PATH = '/brand/kit'
+const BRAND_KIT_PAGE_PATH = '/brand-assets'
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   distDir: DIST_DIR,
@@ -61,6 +97,9 @@ const nextConfig = {
   },
   output: 'standalone',
   poweredByHeader: false,
+  async redirects() {
+    return [{ source: BRAND_KIT_OLD_PATH, destination: BRAND_KIT_PAGE_PATH, permanent: true }]
+  },
   // The app asks wallets to sign, so it must not be framed by another site; only the wallet is framed, by this site.
   async headers() {
     return [
@@ -74,15 +113,16 @@ const nextConfig = {
       },
       {
         source: ALL_BUT_WALLET,
-        headers: [
-          { key: 'Content-Security-Policy', value: contentSecurityPolicy("'none'") },
-          { key: 'X-Frame-Options', value: 'DENY' },
-        ],
+        headers: [{ key: 'X-Frame-Options', value: 'DENY' }],
+      },
+      {
+        source: ALL_BUT_NODE_PAGES,
+        headers: [{ key: 'Content-Security-Policy', value: contentSecurityPolicy("'none'") }],
       },
       {
         source: FIBER_WALLET_ROUTE,
         headers: [
-          { key: 'Content-Security-Policy', value: contentSecurityPolicy("'self'") },
+          // Its Content-Security-Policy (frame-ancestors 'self') comes from proxy.ts.
           { key: 'X-Frame-Options', value: 'SAMEORIGIN' },
           // No COOP: it means nothing in an iframe, and the wallet's own window is the node page below.
           DOCUMENT_ISOLATION,
@@ -91,6 +131,7 @@ const nextConfig = {
       {
         source: FIBER_NODE_ROUTE,
         headers: [
+          // Its Content-Security-Policy (frame-ancestors 'none') comes from proxy.ts.
           // Chromium 137+: isolates this document alone. The node page opens no popups, so COOP below costs nothing here.
           DOCUMENT_ISOLATION,
           // Other browsers: classic cross-origin isolation. require-corp, because Safari has no credentialless; the page

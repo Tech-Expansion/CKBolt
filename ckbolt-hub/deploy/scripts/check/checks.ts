@@ -10,7 +10,7 @@ import type { Script } from "../../../src/domain/types";
 import type { AssetDto, FiberNodeDto, HealthDto } from "../../../src/interfaces/http/contract/responses";
 import type { BlockchainInfo } from "../lib/bitcoind";
 import { isServiceUp, type ComposePublisher, type ComposeServiceState } from "../lib/compose-state";
-import { CWBTC_FAUCET_URL, LND_STATE, MULTIADDR_PEER_ID_PROTOCOL, type LndService, type ServiceName } from "../lib/constants";
+import { CWBTC_FAUCET_URL, HUB_ENV_KEY, LND_STATE, MULTIADDR_PEER_ID_PROTOCOL, TUNNEL_PROFILE, type LndService, type ServiceName } from "../lib/constants";
 import { isChannelOfAsset, type FnnChannel, type FnnNodeInfo, type FnnPeer } from "../lib/fiber";
 import type { LndChannel, LndInfo, LndPendingChannel, LndWalletBalance } from "../lib/lnd";
 import type { FiberPeer } from "../lib/settings";
@@ -145,6 +145,26 @@ export function evaluateLnPeer(service: LndService, peers: readonly string[], pe
 
 export const evaluateHubSecrets = (service: LndService, present: boolean): CheckResult =>
   present ? ok(service, "the hub's macaroon and TLS certificate are in secrets/hub") : fail(service, "no macaroon for the hub", "testnet macaroons");
+
+/* --------------------------------------------------------------------------------------------------- tunnel */
+
+/**
+ * With the tunnel profile the hub is on the internet, so hub.env must set HUB_PROXY_SECRET (docs/security-review-2026-11.md,
+ * D4). Nothing to report without the tunnel. `secretSet` comes from a probe that never reads the value.
+ */
+export function evaluateTunnelProxySecret(tunnelOn: boolean, secretSet: boolean): CheckResult[] {
+  if (!tunnelOn) return [];
+  const area = TUNNEL_PROFILE;
+  return [
+    secretSet
+      ? ok(area, `hub.env sets ${HUB_ENV_KEY.PROXY_SECRET}`)
+      : fail(
+          area,
+          `the ${TUNNEL_PROFILE} profile is on but hub.env has no ${HUB_ENV_KEY.PROXY_SECRET}`,
+          `set ${HUB_ENV_KEY.PROXY_SECRET} in the server's hub.env (the web server's value; \`openssl rand -hex 32\`), then testnet up hub`,
+        ),
+  ];
+}
 
 /* ---------------------------------------------------------------------------------------------------- Fiber */
 

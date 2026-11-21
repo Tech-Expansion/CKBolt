@@ -589,6 +589,40 @@ tlc.expiry < now + 2/3 × commitment_delay_epoch(of that inbound channel) + 60 s
 
 ---
 
+## 9. Force close and TLC settlement on chain [V]
+
+Checked against fnn v0.9.1 and the commitment lock it runs, on 2026-11-12, by an independent review and confirmed by
+reading the watchtower. This corrects an earlier assumption that a TLC's on-chain settlement waits for the whole
+commitment delay after a force close.
+
+- **Which script.** fnn uses the commitment lock by type id (`hash_type: type`), so it runs whatever the type-id cell
+  holds ([config/testnet/config.yml L62-L79](https://github.com/nervosnetwork/fiber/blob/v0.9.1/config/testnet/config.yml#L62-L79)).
+  Testnet upgraded it on 2026-10-21 ([fiber-scripts migration](https://github.com/nervosnetwork/fiber-scripts/blob/6bfcebfb62f2eee2af2cec881eaa795595268c58/deployment/testnet/migrations/2026-10-21-013837.json));
+  the TLC timing logic below is the same in that build, the 2025-11 one and `main`.
+- **Paths of a pending TLC** ([commitment-lock main.rs L306-L346 at ea84410](https://github.com/nervosnetwork/fiber-scripts/blob/ea84410878048a142c506d71c32ee0d1f0fc1c20/contracts/commitment-lock/src/main.rs#L306-L346)):
+  - Preimage: the commitment cell's relative since must be at least **1/3 of the delay**, and there is **no expiry check**.
+  - Timeout: a relative since of at least **2/3 of the delay** and an absolute timestamp since at or past the TLC's
+    expiry, which CKB compares with its median time (the median of the last 37 blocks).
+  - The whole delay applies only to the two parties' own balances. Only the first settlement checks a delay.
+- **fnn's own force close (PR #623).** Every 60 s a channel with an offered TLC that expires before now + 2/3 of the
+  delay is force-closed; epochs count as a fixed 4 hours
+  ([channel.rs L3019-L3047](https://github.com/nervosnetwork/fiber/blob/v0.9.1/crates/fiber-lib/src/fiber/channel.rs#L3019-L3047)).
+  With the default 1-epoch delay that is 2 h 40 min before the expiry.
+- **Timeout claim.** The watchtower (every 60 s) sends it as soon as the commitment's epoch plus 2/3 of the delay is
+  reached and the chain's median time is past the expiry; it does not wait for the whole delay
+  ([watchtower/actor.rs L1396-L1416](https://github.com/nervosnetwork/fiber/blob/v0.9.1/crates/fiber-lib/src/watchtower/actor.rs#L1396-L1416)).
+- **A preimage claim after expiry** is accepted with no time check and reported as the payment's success
+  ([watchtower/actor.rs L1036-L1066](https://github.com/nervosnetwork/fiber/blob/v0.9.1/crates/fiber-lib/src/watchtower/actor.rs#L1036-L1066),
+  [channel.rs L3203-L3218](https://github.com/nervosnetwork/fiber/blob/v0.9.1/crates/fiber-lib/src/fiber/channel.rs#L3203-L3218)).
+  The payment fails only once an on-chain timeout settlement is recorded.
+
+**What this means for an ln_to_fiber payout.** A payee that withholds the preimage can claim the hub's TLC until the
+hub's timeout claim confirms: a few minutes after the expiry (the median-time lag of about 3 minutes, the watchtower's
+cycle, a confirmation), plus 2/3 of any epoch overrun when only fnn's own close applies. Closing the channel earlier
+(the hub's payout guard) removes the epoch term but cannot move the timeout claim before the expiry. The hub covers
+the remaining minutes with the Lightning margin: LND gives the hold back `lnMarginBlocks` blocks after the latest
+Fiber payout expiry (60 on the `mutinynet` profile since 2026-11-13: about 30 minutes at its 30-second blocks).
+
 ## Appendix A: source index (v0.9.1)
 - RPC docs: [P/crates/fiber-lib/src/rpc/README.md](https://github.com/nervosnetwork/fiber/blob/v0.9.1/crates/fiber-lib/src/rpc/README.md)
 - JSON types: [P/crates/fiber-json-types/src/invoice.rs](https://github.com/nervosnetwork/fiber/blob/v0.9.1/crates/fiber-json-types/src/invoice.rs), [payment.rs](https://github.com/nervosnetwork/fiber/blob/v0.9.1/crates/fiber-json-types/src/payment.rs), [channel.rs](https://github.com/nervosnetwork/fiber/blob/v0.9.1/crates/fiber-json-types/src/channel.rs)

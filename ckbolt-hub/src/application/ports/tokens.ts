@@ -16,6 +16,10 @@ export const SWAP_STORE = Symbol("SWAP_STORE");
 export const CHANNEL_OPEN_LOG = Symbol("CHANNEL_OPEN_LOG");
 /** The inbound Fiber channels the hub asked to open and may abandon unaccepted (InboundOpenStore), in the same database. */
 export const INBOUND_OPEN_STORE = Symbol("INBOUND_OPEN_STORE");
+/** Deletes quotes that expired long ago and that no swap uses (QuoteRetention), in the same database. */
+export const QUOTE_RETENTION = Symbol("QUOTE_RETENTION");
 export const ASSETS = Symbol("ASSETS");
 export const TIMING_PROFILE = Symbol("TIMING_PROFILE");
 export const HUB_CONFIG = Symbol("HUB_CONFIG");
+/** Where the hub's monitor sends alerts (AlertSink): a webhook when ALERT_WEBHOOK_URL is set, else the log. */
+export const ALERT_SINK = Symbol("ALERT_SINK");

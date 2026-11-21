@@ -56,7 +56,7 @@ test.describe("Diagnostics on the node page", () => {
     expect(d).toMatchObject({
       kind: "ckbolt-fiber-diagnostics",
       network: "testnet",
-      app: { fiberJsVersion: "0.9.1" },
+      app: { fiberJsVersion: "0.10.1" },
       hubNodeId: HUB_ID,
       nodeInfo: { version: "0.9.1", tlc: { feeProportionalMillionths: "1000" }, autoAccept: { autoAcceptChannelCkbFundingAmount: "0" } },
       channels: { includesClosed: true, count: 2 },
@@ -132,7 +132,7 @@ test.describe("Diagnostics on the node page", () => {
     await context.addInitScript((id) => localStorage.setItem("ckbolt:fiber-browser:testnet:hub-node-id", id), HUB_ID);
     await installFakeNode(context, { channels: [hubChannel({ local: units(1_000), remote: units(500) })], routes: { direct: NO_PATH, trampoline: null } });
     await page.goto("/app/fiber");
-    await page.getByLabel("Password, at least 8 characters").fill(NODE_PASSWORD);
+    await page.getByLabel("Password, at least 12 characters").fill(NODE_PASSWORD);
     await page.getByLabel("Repeat the password").fill(NODE_PASSWORD);
     await page.getByRole("button", { name: "Create node" }).click();
     await expect(panel(page)).toBeVisible({ timeout: 30_000 });

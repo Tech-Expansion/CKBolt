@@ -1,4 +1,4 @@
-# Shared fnn v0.9.1 config for the devnet nodes (fnn-hub, fnn-user). Settings that differ per node come from the
+# Shared fnn v0.10.1 config for the devnet nodes (fnn-hub, fnn-user). Settings that differ per node come from the
 # environment in docker-compose.yml (RPC_LISTENING_ADDR, FIBER_ANNOUNCED_*, CKB_NODE_RPC_URL) and the UDT whitelist
 # from devnet/state/fnn-udt.env (CKB_UDT_WHITELIST), which the bootstrap writes once the RUSD stand-in exists.
 # Environment values override this file.

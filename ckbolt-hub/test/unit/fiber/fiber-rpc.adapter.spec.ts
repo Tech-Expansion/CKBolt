@@ -96,7 +96,10 @@ describe("FiberRpcAdapter (FiberPort over fnn JSON-RPC)", () => {
       const error = await caught(adapter.parseInvoice("fibt1garbage"));
       expect(error).toBeInstanceOf(FiberInvoiceInvalidError);
       expect(error).toMatchObject({ status: HttpStatus.BAD_REQUEST, code: API_ERROR_CODE.INVOICE_INVALID });
-      expect((error as Error).message).toContain("checksum failed");
+      // H10: fnn's own text goes to the log-only detail, never to the sentence the client reads.
+      expect((error as FiberInvoiceInvalidError).detail).toContain("checksum failed");
+      expect((error as Error).message).not.toContain("checksum failed");
+      expect((error as Error).message).not.toContain("Failed to parse invoice");
     });
 
     it("turns an invoice the hub cannot read (unknown currency) into invoice_invalid", async () => {

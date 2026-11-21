@@ -22,17 +22,20 @@ describe("timing: checkLnToFiberPayout", () => {
 
   describe("the hub's payout lock cap (maxPayoutLockMs)", () => {
     it("never returns a limit above the cap, even when the plan and the blocks left allow more", () => {
-      // A swap planned at 410 min under a looser cap, checked after the cap was lowered to 405 min.
+      // A swap planned at 410 min (C = 901) under a looser cap, checked after the cap was lowered to 405 min. The blocks
+      // left allow 1901 - 18 - 1000 - 60 = 823 blocks x 30 s = 411.5 min and the plan 410: the cap wins.
       const p = profileWith("mutinynet", { maxPayoutLockMs: minutes(405) });
-      const result = checkLnToFiberPayout(p, { earliestHtlcExpiryHeight: ACCEPT_HEIGHT + 861, currentHeight: ACCEPT_HEIGHT, plannedTlcExpiryLimitMs: minutes(410) });
+      const result = checkLnToFiberPayout(p, { earliestHtlcExpiryHeight: ACCEPT_HEIGHT + 901, currentHeight: ACCEPT_HEIGHT, plannedTlcExpiryLimitMs: minutes(410) });
       expect(result).toEqual({ ok: true, payoutTlcExpiryLimitMs: minutes(405) });
     });
 
     it("refuses (the swap is refunded) when the cap is below what the payout invoice needs", () => {
+      // The blocks left (411.5 min, as above) would do; only the 399-minute cap is below the 410 - 10 = 400 min needed.
       const p = profileWith("mutinynet", { maxPayoutLockMs: minutes(399) });
-      expectRefusal(
-        checkLnToFiberPayout(p, { earliestHtlcExpiryHeight: ACCEPT_HEIGHT + 861, currentHeight: ACCEPT_HEIGHT, plannedTlcExpiryLimitMs: minutes(410) }),
+      const reason = expectRefusal(
+        checkLnToFiberPayout(p, { earliestHtlcExpiryHeight: ACCEPT_HEIGHT + 901, currentHeight: ACCEPT_HEIGHT, plannedTlcExpiryLimitMs: minutes(410) }),
       );
+      expect(reason).toContain("399 minutes");
     });
   });
 
@@ -40,18 +43,18 @@ describe("timing: checkLnToFiberPayout", () => {
     const planned = minutes(410);
 
     it("a hold invoice planned under a 40-block delta gets the planned limit back when accepted", () => {
-      // mutinynet, C = 820 + 40 + 20 + 3 = 883: 1883 - 40 - 1000 - 20 = 823 blocks x 30 s = 411.5 min, capped at 410.
+      // mutinynet, C = 820 + 40 + 60 + 3 = 923: 1923 - 40 - 1000 - 60 = 823 blocks x 30 s = 411.5 min, capped at 410.
       const p = profileWith("mutinynet", { lndHoldExpiryDeltaBlocks: 40 });
-      const result = checkLnToFiberPayout(p, { earliestHtlcExpiryHeight: ACCEPT_HEIGHT + 883, currentHeight: ACCEPT_HEIGHT, plannedTlcExpiryLimitMs: planned });
+      const result = checkLnToFiberPayout(p, { earliestHtlcExpiryHeight: ACCEPT_HEIGHT + 923, currentHeight: ACCEPT_HEIGHT, plannedTlcExpiryLimitMs: planned });
       expect(result).toEqual({ ok: true, payoutTlcExpiryLimitMs: planned });
     });
 
     it("counts the blocks left before the configured delta, not LND's default 18", () => {
-      // An HTLC expiring at 1861 (C = 861, sized for the default). LND set to 40 cancels it at 1821, so at height 1000
-      // the payout gets (1821 - 1000 - 20) x 30 s = 400.5 min, not the 410 min the default would leave.
+      // An HTLC expiring at 1901 (C = 901, sized for the default). LND set to 40 cancels it at 1861, so at height 1000
+      // the payout gets (1861 - 1000 - 60) x 30 s = 400.5 min, not the 410 min the default would leave.
       const p = profileWith("mutinynet", { lndHoldExpiryDeltaBlocks: 40 });
       const check = (currentHeight: number) =>
-        checkLnToFiberPayout(p, { earliestHtlcExpiryHeight: ACCEPT_HEIGHT + 861, currentHeight, plannedTlcExpiryLimitMs: planned });
+        checkLnToFiberPayout(p, { earliestHtlcExpiryHeight: ACCEPT_HEIGHT + 901, currentHeight, plannedTlcExpiryLimitMs: planned });
 
       expect(check(ACCEPT_HEIGHT)).toEqual({ ok: true, payoutTlcExpiryLimitMs: minutes(400.5) });
       expect(check(ACCEPT_HEIGHT + 1)).toEqual({ ok: true, payoutTlcExpiryLimitMs: minutes(400) });
@@ -64,19 +67,20 @@ describe("timing: checkLnToFiberPayout", () => {
   const plannedFor = (p: TimingProfile) =>
     expectPlan(planLnToFiber(p, { payoutFinalExpiryDeltaMs: FIBER_MIN_FINAL_EXPIRY_DELTA_MS }));
 
-  describe("mutinynet worked example (C = 861, planned limit 410 min, 20 margin blocks, 10 min Fiber margin)", () => {
+  describe("mutinynet worked example (C = 901, planned limit 410 min, 60 margin blocks, 10 min Fiber margin)", () => {
     const p = profile("mutinynet");
     const planned = minutes(410);
-    const earliest = ACCEPT_HEIGHT + 861;
+    const earliest = ACCEPT_HEIGHT + 901;
     const check = (currentHeight: number, earliestHtlcExpiryHeight = earliest) =>
       checkLnToFiberPayout(p, { earliestHtlcExpiryHeight, currentHeight, plannedTlcExpiryLimitMs: planned });
 
     it("a freshly accepted HTLC gets the planned limit back", () => {
+      // 1901 - 18 - 1000 - 60 = 823 blocks x 30 s = 411.5 min, capped at the planned 410.
       expect(check(ACCEPT_HEIGHT)).toEqual({ ok: true, payoutTlcExpiryLimitMs: planned });
     });
 
     it("the plan's 3 padding blocks absorb the first 3 blocks mined before payout", () => {
-      // 1861 - 18 - 1003 - 20 = 820 blocks x 30 s = 410 min.
+      // 1901 - 18 - 1003 - 60 = 820 blocks x 30 s = 410 min.
       expect(check(ACCEPT_HEIGHT + 3)).toEqual({ ok: true, payoutTlcExpiryLimitMs: planned });
     });
 
@@ -85,7 +89,7 @@ describe("timing: checkLnToFiberPayout", () => {
       expect(check(ACCEPT_HEIGHT + 4)).toEqual({ ok: true, payoutTlcExpiryLimitMs: 24_570_000 });
     });
 
-    it("still pays out when only the Fiber margin has been used up (800 blocks = 400 min)", () => {
+    it("still pays out when only the Fiber margin has been used up (1901 - 18 - 1023 - 60 = 800 blocks = 400 min)", () => {
       expect(check(ACCEPT_HEIGHT + 23)).toEqual({ ok: true, payoutTlcExpiryLimitMs: minutes(400) });
     });
 
@@ -97,6 +101,7 @@ describe("timing: checkLnToFiberPayout", () => {
     });
 
     it("refuses at and after LND's auto-cancel height, never reporting negative time", () => {
+      expect(autoCancelHeight(p, earliest)).toBe(1883);
       expectRefusal(check(autoCancelHeight(p, earliest)));
       expect(expectRefusal(check(earliest + 100))).toContain("0 minutes");
     });
@@ -137,7 +142,7 @@ describe("timing: checkLnToFiberPayout", () => {
   });
 
   describe("Fiber's 160-minute minimum is a hard floor", () => {
-    // planned = 160 min = 320 blocks at 30 s; with 20 margin blocks the HTLC must expire 18 + 20 + 320 blocks ahead.
+    // planned = 160 min = 320 blocks at 30 s; with 60 margin blocks the HTLC must expire 18 + 60 + 320 = 398 blocks ahead.
     const p = profile("mutinynet");
     const check = (earliestHtlcExpiryHeight: number) =>
       checkLnToFiberPayout(p, {
@@ -147,11 +152,11 @@ describe("timing: checkLnToFiberPayout", () => {
       });
 
     it("pays out when exactly 160 minutes fit", () => {
-      expect(check(ACCEPT_HEIGHT + 358)).toEqual({ ok: true, payoutTlcExpiryLimitMs: FIBER_MIN_FINAL_EXPIRY_DELTA_MS });
+      expect(check(ACCEPT_HEIGHT + 398)).toEqual({ ok: true, payoutTlcExpiryLimitMs: FIBER_MIN_FINAL_EXPIRY_DELTA_MS });
     });
 
     it("refuses when one block less is left, even though the Fiber margin would allow shrinking", () => {
-      expectRefusal(check(ACCEPT_HEIGHT + 357));
+      expectRefusal(check(ACCEPT_HEIGHT + 397));
     });
   });
 
@@ -187,6 +192,24 @@ describe("timing: checkLnToFiberPayout", () => {
       }
 
       expect(refused).toBe(true);
+    });
+
+    it("mutinynet: LND gives the hold back at least 30 minutes (60 fast blocks) after the latest Fiber payout expiry", () => {
+      // The room a payee's on-chain claim after the TLC's expiry needs (CKB median time, fnn's watchtower cycle, the
+      // hub's own detection and settle, an outage): docs/research/fiber-node.md section 9.
+      const p = profile("mutinynet");
+      const plan = plannedFor(p);
+      const earliest = ACCEPT_HEIGHT + plan.holdCltvExpiry;
+      let accepted = 0;
+      for (let height = ACCEPT_HEIGHT; height < autoCancelHeight(p, earliest); height += 1) {
+        const result = checkLnToFiberPayout(p, { earliestHtlcExpiryHeight: earliest, currentHeight: height, plannedTlcExpiryLimitMs: plan.payoutTlcExpiryLimitMs });
+        if (!result.ok) continue;
+        accepted += 1;
+        // Blocks at the fast interval: the Fiber TLC expires at most `limit` after the send, LND cancels after the blocks.
+        const msUntilAutoCancel = (autoCancelHeight(p, earliest) - height) * fastBlockMs(p);
+        expect(msUntilAutoCancel - result.payoutTlcExpiryLimitMs).toBeGreaterThanOrEqual(minutes(30));
+      }
+      expect(accepted).toBeGreaterThan(0);
     });
 
     it.each(PROFILE_NAMES)("%s: the fresh HTLC and the next 3 blocks get the planned limit", (name) => {

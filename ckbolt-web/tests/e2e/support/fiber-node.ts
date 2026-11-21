@@ -252,6 +252,14 @@ type FakeWindow = { __fakeFiber: FakeNodeState };
 
 /** The page function that makes the fake node's invoices (exposed by the test). */
 const INVOICE_BRIDGE = "__testFiberInvoice";
+/** The preimage (hex, no 0x) of each invoice a fake node made in this worker, by the invoice's text. */
+const madeInvoicePreimages = new Map<string, string>();
+
+/**
+ * The preimage of an invoice a fake node made (its text), or null: the real hub reads the payment hash of the payout
+ * invoice it is given, so the fake hub locks a BTC to CKB swap to it with this (./live-hub.ts).
+ */
+export const nodeInvoicePreimage = (invoice: string): string | null => madeInvoicePreimages.get(invoice.trim()) ?? null;
 /** The page function that reads an invoice for parse_invoice (exposed by a test that pays Fiber invoices; ./fiber-wallet.ts InvoiceBook). */
 const PARSE_BRIDGE = "__testParseFiberInvoice";
 /** The page function that derives the CKB lock args of a key, as fnn does (exposed by a test that withdraws). */
@@ -497,7 +505,8 @@ function fakeNodeScript({ opts, invoiceBridge, parseBridge, lockArgsBridge }: { 
         }
         case "new_invoice": {
           const paymentHash = "0x" + (await sha(unhex(String(p.payment_preimage))));
-          const invoice = await (w[invoiceBridge] as (amount: string) => Promise<string>)(String(p.amount));
+          // The test learns the preimage too, so its fake hub can lock a swap to this invoice's hash (./live-hub.ts).
+          const invoice = await (w[invoiceBridge] as (amount: string, preimage: string) => Promise<string>)(String(p.amount), String(p.payment_preimage));
           state.invoices[paymentHash] = { invoice, status: "Open" };
           return { invoice_address: invoice, invoice: { currency: p.currency, amount: p.amount, data: { payment_hash: paymentHash, attrs: [] } } };
         }
@@ -579,8 +588,8 @@ export const nodeInvoiceHash = (scope: NodeScope, invoice: string): Promise<stri
 
 /**
  * BTC to CKB or RUSD: the real hub's hold invoice carries the payment hash of the payout invoice the node made, so both
- * legs share it; the fake draws its own, so a test that follows the swap into the node's History takes the node's (the
- * swap's hash and its hold invoice, support/live-hub.ts `useNodeHash`).
+ * legs share it. The fake hub locks the swap to it when it creates the swap (support/live-hub.ts); this reads the hash
+ * and makes sure of it (`useNodeHash`), for a test that follows the swap into the node's History.
  */
 export async function shareNodeHash(hub: { current: { receive: { invoice: string } }; useNodeHash(hash: string): void }, scope: NodeScope): Promise<string> {
   const hash = await nodeInvoiceHash(scope, hub.current.receive.invoice);
@@ -697,7 +706,11 @@ export const nodePayments = (scope: NodeScope): Promise<Record<string, { invoice
  * Fiber node" link runs it too. Its invoices are Fiber testnet invoices for the amount asked.
  */
 export async function installFakeNode(context: BrowserContext, options: Partial<FakeNodeOptions> = {}) {
-  await context.exposeFunction(INVOICE_BRIDGE, (amountHex: string) => demoFiberInvoice("testnet", BigInt(amountHex)));
+  await context.exposeFunction(INVOICE_BRIDGE, (amountHex: string, preimage?: string) => {
+    const invoice = demoFiberInvoice("testnet", BigInt(amountHex));
+    if (preimage) madeInvoicePreimages.set(invoice, preimage.replace(/^0x/, "").toLowerCase());
+    return invoice;
+  });
   await context.addInitScript(fakeNodeScript, {
     opts: fakeOptions(options),
     invoiceBridge: INVOICE_BRIDGE,
@@ -720,7 +733,7 @@ const hubPanel = (page: Page) => page.getByTestId("fiber-node-hub");
 export async function createRunningNode(page: Page) {
   await expect(page.getByTestId("fiber-node-key")).toBeVisible({ timeout: NODE_PAGE_TIMEOUT_MS });
   await expect(hubPanel(page)).toContainText("Hub node", { timeout: NODE_PAGE_TIMEOUT_MS });
-  await page.getByLabel("Password, at least 8 characters").fill(NODE_PASSWORD);
+  await page.getByLabel("Password, at least 12 characters").fill(NODE_PASSWORD);
   await page.getByLabel("Repeat the password").fill(NODE_PASSWORD);
   await page.getByRole("button", { name: "Create node" }).click();
   await expect(page.getByTestId("fiber-node-address")).toBeVisible({ timeout: NODE_PAGE_TIMEOUT_MS });

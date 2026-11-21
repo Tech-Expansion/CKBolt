@@ -26,6 +26,7 @@ import {
 import { timingFail } from "../../domain/timing/timing.result";
 import type { HubConfig } from "../../config/hub.config";
 import type { Hex32, Swap, SwapState } from "../../domain/types";
+import type { OperatorEvents } from "../monitoring/operator-events";
 import type { Clock } from "../ports/clock.port";
 import { callNode } from "./payout-invoice.checks";
 import { SWAP_ERROR } from "./swap.errors";
@@ -55,6 +56,8 @@ export class SwapProcessor {
     private readonly journal: SwapJournal,
     private readonly clock: Clock,
     private readonly settings: ProcessorSettings,
+    /** Where the payout guard's closes and failures are reported for the hub's monitor; none in a bare engine. */
+    private readonly events?: Pick<OperatorEvents, "emit">,
   ) {
     this.steps = {
       [SWAP_STATE.PENDING]: (swap, flow) => this.checkForPayment(swap, flow),
@@ -238,9 +241,11 @@ export class SwapProcessor {
       const closed = await flow.guardPayout(swap, sentAt);
       for (const channelId of closed) {
         this.logger.warn(`Swap ${swap.id}: the payee still holds the payout; force-closed channel ${channelId} so it settles on chain in time`);
+        this.events?.emit({ kind: "payout-guard-closed", swapId: swap.id, channelId });
       }
     } catch (error) {
       this.logger.warn(`Swap ${swap.id}: could not check the payout's channels: ${describeError(error)}`);
+      this.events?.emit({ kind: "payout-guard-failed", swapId: swap.id, detail: describeError(error) });
     }
   }
 

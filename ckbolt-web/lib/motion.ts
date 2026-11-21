@@ -5,6 +5,12 @@
 export const MOTION_EVENT = "ckbolt:motion";
 const STORAGE_KEY = "ckbolt-motion";
 
+/**
+ * The root layout's inline script: it restores the visitor's Pause motion choice before the first paint. The node pages'
+ * Content-Security-Policy allows it by its hash (lib/csp.ts), so it is one constant, used as it is.
+ */
+export const MOTION_RESTORE_SCRIPT = `try{if(localStorage.getItem('${STORAGE_KEY}')==='paused')document.documentElement.dataset.motion='paused'}catch(e){}`;
+
 export function prefersReducedMotion(): boolean {
   return typeof window !== "undefined" && (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false);
 }

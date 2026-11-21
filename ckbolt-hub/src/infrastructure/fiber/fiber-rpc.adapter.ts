@@ -17,7 +17,7 @@ import { DuplicateHashError } from "../../common/errors/hub.error";
 import { ckbNetworkOfChainHash } from "../../common/utils/chain.util";
 import type { CkbNetwork, Hex32, Script } from "../../domain/types";
 import { ChannelOpenRequests } from "./channel-open-requests";
-import { FiberInvoiceInvalidError, FiberRpcError, FiberRpcResponseError, isFiberRpcErrorMatching } from "./fiber-rpc.errors";
+import { FiberInvoiceContentError, FiberInvoiceInvalidError, FiberRpcError, FiberRpcResponseError, isFiberRpcErrorMatching } from "./fiber-rpc.errors";
 import {
   PORT_STATE,
   fromRpcHash,
@@ -56,9 +56,13 @@ async function nullWhenNotFound<T>(call: Promise<T>, notFound: RegExp): Promise<
   }
 }
 
-/** A user invoice fnn refuses to parse, or one whose contents the hub cannot read, is the user's input error. */
+/**
+ * A user invoice fnn refuses to parse, or one whose contents the hub cannot read, is the user's input error. fnn's own
+ * text stays in the log-only detail; a sentence the hub wrote about the invoice's attributes is shown too.
+ */
 function asInvoiceError(error: unknown): unknown {
   if (error instanceof FiberRpcError) return new FiberInvoiceInvalidError(error.rpcMessage);
+  if (error instanceof FiberInvoiceContentError) return new FiberInvoiceInvalidError(error.detail, error.detail);
   if (error instanceof FiberRpcResponseError) return new FiberInvoiceInvalidError(error.detail);
   return error;
 }

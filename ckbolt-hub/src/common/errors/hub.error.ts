@@ -1,9 +1,13 @@
 import { HttpStatus } from "@nestjs/common";
 import { API_ERROR_CODE, type ApiErrorCode } from "../constants/api.constants";
 
-/** Options of a HubError: `cause` keeps the error it replaces, for logs (describeError prints the chain). */
+/**
+ * Options of a HubError, both for logs only (describeError prints them; the API never sends them): `cause` keeps the
+ * error it replaces, `detail` says what went wrong in words the user must not see, such as a node's own error text.
+ */
 export interface HubErrorOptions {
   cause?: unknown;
+  detail?: string;
 }
 
 /**
@@ -11,6 +15,9 @@ export interface HubErrorOptions {
  * what to do ("Use a testnet Fiber invoice."). The HTTP layer maps it to `{ error: { code, message } }` with `status`.
  */
 export class HubError extends Error {
+  /** For logs only (HubErrorOptions.detail). */
+  readonly detail?: string;
+
   constructor(
     message: string,
     readonly status: number = HttpStatus.BAD_REQUEST,
@@ -19,6 +26,7 @@ export class HubError extends Error {
   ) {
     super(message, options.cause === undefined ? undefined : { cause: options.cause });
     this.name = "HubError";
+    if (options.detail !== undefined) this.detail = options.detail;
   }
 }
 

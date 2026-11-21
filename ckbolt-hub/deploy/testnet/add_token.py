@@ -16,11 +16,13 @@ them. It never prints a secret: of hub.env it shows only FIBER_ASSETS.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -67,7 +69,10 @@ POLL_SECONDS = 10
 HEALTH_WAIT_SECONDS = 300
 DEFAULT_CHANNEL_WAIT_MINUTES = 60
 SECRET_DIR_MODE = 0o700
-OUT_DIR_MODE = 0o777
+# A file the script creates where none was (an fnn config the server lacks): fnn's configs hold no secret.
+NEW_FILE_MODE = 0o644
+# Suffix of a file being written beside the one it replaces (os.replace), as the deploy scripts name theirs.
+PENDING_SUFFIX = ".pending"
 
 
 class Refused(Exception):
@@ -221,14 +226,21 @@ def generator_command(demo_auto_accept: str | None) -> list:
     return command
 
 
-def compose_run_command(fiber_assets: str, fnn_dir: str, out_dir: str, demo_auto_accept: str | None) -> list:
-    """A one-off hub container with the kit's settings, FIBER_ASSETS replaced by the merged list (-e wins over hub.env)."""
+def compose_run_command(fiber_assets: str, fnn_dir: str, out_dir: str, demo_auto_accept: str | None, user: str | None = None) -> list:
+    """A one-off hub container with the kit's settings, FIBER_ASSETS replaced by the merged list (-e wins over hub.env).
+    `user` ("uid:gid") runs it as that user, so it can write into an out folder only that user may open."""
     return [
         "docker", "compose", "run", "--rm", "--no-deps", "-T",
+        *(["--user", user] if user else []),
         "-e", f"{FIBER_ASSETS_KEY}={fiber_assets}",
         "-v", f"{fnn_dir}:{CONTAINER_FNN_DIR}:ro", "-v", f"{out_dir}:{CONTAINER_OUT_DIR}",
         SERVICE_HUB, *generator_command(demo_auto_accept),
     ]
+
+
+def current_user() -> str | None:
+    """This process's "uid:gid" for `docker compose run --user`; None where the OS has no such ids (Windows)."""
+    return f"{os.getuid()}:{os.getgid()}" if hasattr(os, "getuid") and hasattr(os, "getgid") else None
 
 
 def udt_entry_matches(info: dict, script: dict) -> bool:
@@ -353,45 +365,197 @@ def say(text: str) -> None:
     print(text, flush=True)
 
 
-WHITELIST_KEY = re.compile(r"^(\s*)udt_whitelist:\s*$")
-ENTRY_START = re.compile(r"^\s*-\s+name:\s*(.+?)\s*$")
-SCRIPT_KEY = re.compile(r"^\s*script:\s*$")
-CODE_HASH_LINE = re.compile(r"^\s*code_hash:\s*(0x[0-9a-fA-F]+)")
-ARGS_LINE = re.compile(r'^\s*args:\s*"?\^?(0x[0-9a-fA-F]*)\$?"?\s*(#.*)?$')
+# ------------------------------------------------------------------------- fnn's YAML (pure, a block-style subset)
+class YamlSubsetError(Exception):
+    """YAML outside the block-style subset the kit's fnn configs use: the drop guard then cannot tell what fnn has."""
+
+
+FNN_CKB_KEY = "ckb"
+FNN_WHITELIST_KEY = "udt_whitelist"
+YAML_ITEM = "-"
+YAML_COMMENT = "#"
+YAML_DOUBLE_QUOTED_KEY = r'"(?:[^"\\]|\\.)*"'
+YAML_SINGLE_QUOTED_KEY = r"'(?:[^']|'')*'"
+YAML_PLAIN_KEY = r"""[^\s"'#:][^:]*?"""
+# `key: value` or `key:` (a nested block follows); the key plain or quoted.
+YAML_KEY = re.compile(rf"^({YAML_DOUBLE_QUOTED_KEY}|{YAML_SINGLE_QUOTED_KEY}|{YAML_PLAIN_KEY})\s*:(?:\s+(.*))?$")
+YAML_UNSUPPORTED_START = ("|", ">", "&", "*", "!", "%", "@", "`")
+YAML_EMPTY_FLOW = {"[]": list, "{}": dict}
+TOP_LEVEL_CKB = re.compile(r"^ckb\s*:\s*(#.*)?$")
+
+
+YAML_QUOTES = "'\""
+# A quote opens a scalar only at the start of a value: after a space, an item dash, a colon or a flow bracket or comma.
+YAML_QUOTE_OPENERS = " -:[{,"
+YAML_BACKSLASH = "\\"
+
+
+def _without_comment(line: str) -> str:
+    """The line without its comment: a # at the start or after a space, outside a quoted scalar ("\\" escapes inside
+    double quotes, '' inside single quotes)."""
+    quote, previous, skip_next = None, " ", False
+    for index, char in enumerate(line):
+        if skip_next:
+            skip_next = False
+        elif quote == '"' and char == YAML_BACKSLASH:
+            skip_next = True
+        elif quote == "'" and char == quote and line[index + 1:index + 2] == quote:
+            skip_next = True
+        elif quote and char == quote:
+            quote = None
+        elif not quote and char in YAML_QUOTES and previous in YAML_QUOTE_OPENERS:
+            quote = char
+        elif not quote and char == YAML_COMMENT and previous in " \t":
+            return line[:index]
+        previous = char
+    return line
+
+
+def _yaml_lines(text: str) -> list:
+    """(indent, content, line number) of every line that holds something, "- key: value" split into "-" and "key: value"
+    so that a sequence item's mapping reads like any nested mapping."""
+    lines = []
+    for number, raw in enumerate(text.split("\n"), 1):
+        content = _without_comment(raw.rstrip("\r")).rstrip()
+        if not content.strip():
+            continue
+        if content.lstrip(" ").startswith("\t"):
+            raise YamlSubsetError(f"line {number}: a tab in the indentation")
+        indent = len(content) - len(content.lstrip(" "))
+        body = content.strip()
+        while body == YAML_ITEM or body.startswith(YAML_ITEM + " "):
+            lines.append((indent, YAML_ITEM, number))
+            rest = body[len(YAML_ITEM):].lstrip(" ")
+            if not rest:
+                break
+            indent += len(body) - len(rest)
+            body = rest
+        else:
+            lines.append((indent, body, number))
+    return lines
+
+
+def _yaml_scalar(text: str, number: int) -> object:
+    """A scalar as a string (quotes removed), or an empty flow list or mapping; other flow or block forms are refused."""
+    if text in YAML_EMPTY_FLOW:
+        return YAML_EMPTY_FLOW[text]()
+    if text.startswith('"'):
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as error:
+            raise YamlSubsetError(f"line {number}: unreadable double-quoted scalar ({error.msg})") from error
+    if text.startswith("'"):
+        if len(text) < 2 or not text.endswith("'"):
+            raise YamlSubsetError(f"line {number}: unterminated single-quoted scalar")
+        return text[1:-1].replace("''", "'")
+    if text.startswith(("[", "{")) or text.startswith(YAML_UNSUPPORTED_START):
+        raise YamlSubsetError(f"line {number}: flow collections, block scalars, anchors and tags are not read")
+    return text
+
+
+def _yaml_node(lines: list, index: int, indent: int) -> tuple:
+    """The block node whose first line is lines[index], at `indent`: (value, index of the line after it). A line that is
+    neither an item nor `key: value` is a scalar (a sequence item such as `- "/ip4/..."`)."""
+    _, body, number = lines[index]
+    if body == YAML_ITEM:
+        return _yaml_sequence(lines, index, indent)
+    if not YAML_KEY.match(body):
+        return _yaml_scalar(body, number), index + 1
+    return _yaml_mapping(lines, index, indent)
+
+
+def _yaml_child(lines: list, index: int, indent: int, sequence_may_share_indent: bool) -> tuple:
+    """The nested node after a "key:" or "-" line at `indent`, or None when the next line is not inside it."""
+    if index < len(lines):
+        child_indent, body, _ = lines[index]
+        if child_indent > indent or (sequence_may_share_indent and child_indent == indent and body == YAML_ITEM):
+            return _yaml_node(lines, index, child_indent)
+    return None, index
+
+
+def _yaml_sequence(lines: list, index: int, indent: int) -> tuple:
+    items = []
+    while index < len(lines) and lines[index][0] == indent and lines[index][1] == YAML_ITEM:
+        item, index = _yaml_child(lines, index + 1, indent, sequence_may_share_indent=False)
+        items.append(item)
+    return items, index
+
+
+def _yaml_mapping(lines: list, index: int, indent: int) -> dict:
+    mapping = {}
+    while index < len(lines) and lines[index][0] == indent and lines[index][1] != YAML_ITEM:
+        _, body, number = lines[index]
+        match = YAML_KEY.match(body)
+        if not match:
+            raise YamlSubsetError(f"line {number}: expected `key: value`")
+        key = _yaml_scalar(match.group(1), number) if match.group(1)[0] in YAML_QUOTES else match.group(1)
+        if key in mapping:
+            raise YamlSubsetError(f"line {number}: {key} appears twice")
+        if match.group(2) is not None:
+            mapping[key], index = _yaml_scalar(match.group(2), number), index + 1
+        else:
+            mapping[key], index = _yaml_child(lines, index + 1, indent, sequence_may_share_indent=True)
+    if index < len(lines) and lines[index][0] > indent:
+        raise YamlSubsetError(f"line {lines[index][2]}: unexpected indentation")
+    return mapping, index
+
+
+def parse_yaml_block(text: str) -> object:
+    """A block-style YAML text (mappings, sequences, scalars, comments, empty [] and {}) as dicts, lists and strings.
+    Scalars stay strings. Anything else raises YamlSubsetError, so a caller never guesses at what it cannot read."""
+    lines = _yaml_lines(text)
+    if not lines:
+        return None
+    value, index = _yaml_node(lines, 0, lines[0][0])
+    if index < len(lines):
+        raise YamlSubsetError(f"line {lines[index][2]}: unexpected indentation")
+    return value
+
+
+def _top_level_ckb_block(text: str) -> str:
+    """The top-level `ckb:` block of an fnn config, the only part the guard reads (hand edits elsewhere cannot trip it)."""
+    block, inside = [], False
+    for raw in text.split("\n"):
+        line = raw.rstrip("\r")
+        at_top = bool(line) and not line[0].isspace() and not line.startswith(YAML_COMMENT)
+        if at_top:
+            inside = bool(TOP_LEVEL_CKB.match(line))
+        if inside:
+            block.append(line)
+    return "\n".join(block)
+
+
+def _unanchored(args: str) -> str:
+    """Whitelist args without the ^…$ anchors the generator writes (fnn reads args as a regex), in lower case."""
+    return re.sub(r"^\^(.*)\$$", r"\1", args.strip()).lower()
 
 
 def whitelisted_scripts(text: str | None) -> dict:
     """The scripts a fnn config's ckb.udt_whitelist names, {(code_hash, args) in lower case: entry name}; args are
-    read with or without the ^…$ anchors, so an older unanchored file compares with a generated one."""
-    found, inside, base, name, in_script, code_hash = {}, False, 0, None, False, None
-    for line in (text or "").splitlines():
-        key = WHITELIST_KEY.match(line)
-        if key:
-            inside, base = True, len(key.group(1))
+    read with or without the ^…$ anchors, so an older unanchored file compares with a generated one. Raises
+    YamlSubsetError for a `ckb` block outside the block-style subset the kit writes."""
+    document = parse_yaml_block(_top_level_ckb_block(text or "")) or {}
+    ckb = document.get(FNN_CKB_KEY) if isinstance(document, dict) else None
+    entries = ckb.get(FNN_WHITELIST_KEY) if isinstance(ckb, dict) else None
+    found = {}
+    for entry in entries if isinstance(entries, list) else []:
+        script = entry.get("script") if isinstance(entry, dict) else None
+        if not isinstance(script, dict) or not isinstance(script.get("code_hash"), str) or not isinstance(script.get("args"), str):
             continue
-        if not inside or not line.strip() or line.lstrip().startswith("#"):
-            continue
-        if len(line) - len(line.lstrip()) <= base and not line.lstrip().startswith("-"):
-            break
-        entry = ENTRY_START.match(line)
-        if entry:
-            name, in_script, code_hash = entry.group(1).strip('"'), False, None
-        elif SCRIPT_KEY.match(line):
-            in_script = True
-        elif in_script and CODE_HASH_LINE.match(line):
-            code_hash = CODE_HASH_LINE.match(line).group(1).lower()
-        elif in_script and code_hash and ARGS_LINE.match(line):
-            found[(code_hash, ARGS_LINE.match(line).group(1).lower())] = name
-            in_script = False
+        found[(script["code_hash"].strip().lower(), _unanchored(script["args"]))] = str(entry.get("name", ""))
     return found
 
 
 def dropped_tokens(files: dict) -> list:
-    """Tokens a node's current whitelist names that the regenerated one leaves out, as "<file>: <name>"."""
+    """Tokens a node's current whitelist names that the regenerated one leaves out, as "<file>: <name>". A whitelist that
+    cannot be read counts as a drop too (fail closed): the guard cannot tell what fnn has, so --allow-drop must say so."""
     dropped = []
     for name, (old, new) in files.items():
-        kept = whitelisted_scripts(new)
-        dropped += [f"{FNN_DIR}/{name}: {token}" for script, token in whitelisted_scripts(old).items() if script not in kept]
+        try:
+            kept = whitelisted_scripts(new)
+            dropped += [f"{FNN_DIR}/{name}: {token}" for script, token in whitelisted_scripts(old).items() if script not in kept]
+        except YamlSubsetError as error:
+            dropped.append(f"{FNN_DIR}/{name}: its udt_whitelist cannot be read ({error})")
     return dropped
 
 
@@ -406,11 +570,11 @@ def render_whitelists(kit: Kit, assets_json: str, demo_auto_accept: str | None, 
     """Validates the merged list and generates both files in the hub image, from `template_fnn_dir`'s copies (the
     repo's, which `testnet sync` uploads there) or else the kit's own; returns {name: (old, new)}, old being what the
     kit's fnn folder holds now (what fnn runs; None when the file does not exist yet)."""
+    # mkdtemp makes it owner-only (0o700); the generator writes into it as this process's own user (--user).
     out_dir = tempfile.mkdtemp(prefix="ckbolt-add-token-")
     try:
-        os.chmod(out_dir, OUT_DIR_MODE)  # the container writes as its `node` user
         result = subprocess.run(
-            compose_run_command(assets_json, template_fnn_dir or kit.fnn_dir, out_dir, demo_auto_accept),
+            compose_run_command(assets_json, template_fnn_dir or kit.fnn_dir, out_dir, demo_auto_accept, current_user()),
             cwd=kit.dir, capture_output=True, text=True, timeout=COMMAND_TIMEOUT_SECONDS,
         )
         say(result.stdout.rstrip())
@@ -439,10 +603,48 @@ def back_up(kit: Kit) -> str:
     return folder
 
 
+def _keep_owner(path: str, owner: os.stat_result) -> None:
+    """Gives `path` the owner and group of the file it replaces; refuses when this user may not (not root, not the owner)."""
+    if not hasattr(os, "chown") or (owner.st_uid, owner.st_gid) == (os.getuid(), os.getgid()):
+        return
+    try:
+        os.chown(path, owner.st_uid, owner.st_gid)
+    except PermissionError as error:
+        raise Refused(f"cannot keep the owner of {os.path.basename(path)}: run add_token.py as root or as its owner") from error
+
+
+def _sync_directory(directory: str) -> None:
+    """Makes the rename itself durable where the OS allows opening a directory (POSIX)."""
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def write_keeping_mode(path: str, text: str) -> None:
-    """Rewrites a file in place, so its owner and mode stay (hub.env is owner-only)."""
-    with open(path, "w", encoding="utf-8", newline="") as handle:
-        handle.write(text)
+    """Writes `text` to a temporary file beside `path`, then renames it over `path` (os.replace), so a crash or a full disk
+    leaves the old file or the new one, never half of one. The new file keeps the old one's mode and owner (hub.env is
+    owner-only); a file that did not exist gets NEW_FILE_MODE."""
+    directory = os.path.dirname(os.path.abspath(path))
+    previous = os.stat(path) if os.path.exists(path) else None
+    descriptor, pending = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", suffix=PENDING_SUFFIX, dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(pending, stat.S_IMODE(previous.st_mode) if previous else NEW_FILE_MODE)
+        if previous:
+            _keep_owner(pending, previous)
+        os.replace(pending, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(pending)
+        raise
+    _sync_directory(directory)
 
 
 def restart_fnn(kit: Kit, changed: dict) -> None:

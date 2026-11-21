@@ -7,8 +7,10 @@ import { after, describe, it } from "node:test";
 import { parseEnv } from "node:util";
 import { TESTNET_RUSD_TYPE_SCRIPT } from "../../src/common/constants/assets.constants";
 import { loadHubConfig } from "../../src/config/hub.config";
-import { BITCOIND_DATA_DIR, BITCOIND_VOLUME, COMPOSE_PROJECT } from "../scripts/lib/constants";
+import { BITCOIND_DATA_DIR, BITCOIND_VOLUME, COMPOSE_PROJECT, KIT_SECRET_BYTES } from "../scripts/lib/constants";
+import { envEntries, planEnvCompletion } from "../scripts/lib/env-file";
 import { resolveDeployPaths } from "../scripts/lib/paths";
+import { readableEnvKeys } from "../scripts/steps/env.step";
 import { hasDockerCompose } from "./support/fakes";
 
 /**
@@ -38,6 +40,15 @@ const VPS_ENV: Record<string, string> = {
   FNN_DEMO_KEY_PASSWORD: "fnn-demo-key-password",
   PUBLIC_IP,
 };
+/**
+ * What the operator fills in hub.env by hand (hub.env.example leaves it empty): the proxy secret, 64 hex characters as
+ * `openssl rand -hex 32` makes. The hub listens on 0.0.0.0 in its container, so it refuses to start without it.
+ */
+const PROXY_SECRET = "a1".repeat(32);
+const OPERATOR_HUB_ENV: Record<string, string> = { HUB_PROXY_SECRET: PROXY_SECRET };
+/** The hub's refusal to start on a reachable HUB_HOST without HUB_PROXY_SECRET (security review H2). */
+const NEEDS_PROXY_SECRET = /Invalid hub configuration: HUB_HOST \(0\.0\.0\.0\) lets other machines reach the hub, so it needs HUB_PROXY_SECRET/;
+
 /** Ports the other projects on the VPS hold: the kit must never publish them. */
 const OTHER_PROJECTS_PORTS = [80, 443, 3000, 8787, 6300, 5432];
 
@@ -59,13 +70,16 @@ after(() => {
   for (const dir of copies) rmSync(dir, { recursive: true, force: true });
 });
 
-/** A copy of the kit with an .env and a hub.env, as the server has them after `testnet sync` and `testnet env`. */
+/**
+ * A copy of the kit with an .env and a hub.env, as the server has them after `testnet sync` and `testnet env` and the
+ * operator has filled HUB_PROXY_SECRET in hub.env (a `hubEnv` entry replaces it, e.g. with "" for the bare example).
+ */
 function kitCopy(env: Record<string, string> = {}, hubEnv: Record<string, string> = {}): string {
   const dir = mkdtempSync(join(tmpdir(), "deploy-kit-"));
   copies.push(dir);
   cpSync(KIT, dir, { recursive: true, filter: (source) => !/[\\/](\.env|hub\.env|secrets)$/.test(source) });
   writeFileSync(join(dir, ".env"), envText(exampleText, { ...VPS_ENV, ...env }));
-  writeFileSync(join(dir, "hub.env"), envText(hubExampleText, hubEnv));
+  writeFileSync(join(dir, "hub.env"), envText(hubExampleText, { ...OPERATOR_HUB_ENV, ...hubEnv }));
   return dir;
 }
 
@@ -75,6 +89,10 @@ interface ComposePort {
   host_ip?: string;
 }
 interface ComposeService {
+  image?: string;
+  build?: { context: string; dockerfile?: string };
+  logging?: { driver?: string; options?: Record<string, string> };
+  security_opt?: string[];
   ports?: ComposePort[];
   environment?: Record<string, string | null>;
   command?: string[];
@@ -89,6 +107,7 @@ interface ComposeConfig {
   services: Record<string, ComposeService>;
   configs: Record<string, { content: string }>;
   volumes: Record<string, { name: string }>;
+  networks?: Record<string, { name?: string; external?: boolean; attachable?: boolean } | null>;
 }
 
 /** The variables of the kit's .env must come from the .env only: none of this machine's environment leaks in. */
@@ -193,6 +212,7 @@ describe("the kit on the VPS: docker-compose.yml + docker-compose.public.yml (do
     assert.equal(hub.pricing.signingKeyHex, QUOTE_KEY);
     assert.equal(hub.timing.lndHoldExpiryDeltaBlocks, 18);
     assert.equal(hub.server.trustProxy, false, "one client through the SSH tunnel");
+    assert.equal(hub.server.proxySecret, PROXY_SECRET, "hub.env's secret reaches the hub");
     assert.equal(hub.server.port, 8787);
     assert.equal(hub.demo.enabled, false);
     assert.deepEqual(hub.fiberPeers.inboundChannels.amounts, { CKB: 200_000_000_000n });
@@ -234,6 +254,12 @@ describe("the kit on the VPS: docker-compose.yml + docker-compose.public.yml (do
       const ports = (config.services[name]?.ports ?? []).map((port) => port.target);
       assert.ok(!ports.some((port) => [8080, 10009, 38332, 28332, 28333].includes(port)), `${name} publishes an RPC port`);
     }
+  });
+
+  it("gives the hub a configuration its loader refuses while hub.env's HUB_PROXY_SECRET is still empty, as in the example", () => {
+    const config = resolved({}, { HUB_PROXY_SECRET: "" });
+    assert.equal(config.services.hub?.environment?.HUB_PROXY_SECRET, "");
+    assert.throws(() => loadHubConfig(hubEnvironment(config)), NEEDS_PROXY_SECRET);
   });
 
   it("refuses to start without QUOTE_SIGNING_KEY", () => {
@@ -299,14 +325,16 @@ describe("the tunnel profile (Cloudflare Tunnel: cloudflared and fiber-ws)", { s
   it("puts cloudflared on the edge network only, with the hub and fiber-ws: it cannot reach a node's RPC", () => {
     const config = resolved({ COMPOSE_PROFILES: "tunnel", ...TOKEN });
     assert.deepEqual(networksOf(config.services.cloudflared), ["edge"]);
-    assert.deepEqual(networksOf(config.services.hub), ["default", "edge"]);
+    // The hub also joins `bitcoin`, where its LND nodes are (security review D1).
+    assert.deepEqual(networksOf(config.services.hub), ["bitcoin", "default", "edge"]);
     assert.deepEqual(networksOf(config.services["fiber-ws"]), ["default", "edge"]);
     for (const node of ["fnn-hub", "lnd-hub", "bitcoind"]) assert.ok(!networksOf(config.services[node]).includes("edge"), node);
   });
 
   it("relays fiber-ws to fnn-hub's P2P port only, never its JSON-RPC", () => {
     const command = resolved({ COMPOSE_PROFILES: "tunnel", ...TOKEN }).services["fiber-ws"]?.command ?? [];
-    assert.deepEqual(command, ["TCP-LISTEN:8228,fork,reuseaddr", "TCP:fnn-hub:8228"]);
+    // At most FIBER_WS_MAX_CHILDREN (200 in .env.example) relays at once (security review D7).
+    assert.deepEqual(command, ["TCP-LISTEN:8228,fork,reuseaddr,max-children=200", "TCP:fnn-hub:8228"]);
   });
 
   it("publishes the same host ports with and without the tunnel", () => {
@@ -340,6 +368,196 @@ describe("the demo profile", { skip: NO_COMPOSE }, () => {
     assert.equal(hub.demo.enabled, true);
     assert.equal(hub.demo.lnd?.grpcHost, "lnd-demo:10009");
     assert.equal(hub.demo.fiber?.rpcUrl, "http://fnn-demo:8227");
+  });
+});
+
+/* ------------------------------------------------------------------------- security review, round 2 (D1, D7, D8) */
+
+/** Every profile on: all eight services. */
+const ALL_PROFILES = { COMPOSE_PROFILES: "demo,tunnel", DEMO_ENABLED: "true", CLOUDFLARED_TUNNEL_TOKEN: "tunnel-token-from-cloudflare" };
+const ALL_SERVICES = ["bitcoind", "cloudflared", "fiber-ws", "fnn-demo", "fnn-hub", "hub", "lnd-demo", "lnd-hub"];
+/** The kit as the VPS runs it, with no profile, with every profile, and without the public overlay. */
+const KIT_VARIANTS: [string, Record<string, string>][] = [
+  ["no profile", {}],
+  ["demo and tunnel profiles", ALL_PROFILES],
+  ["docker-compose.yml alone, every profile", { ...ALL_PROFILES, COMPOSE_FILE: "docker-compose.yml", PUBLIC_IP: "" }],
+];
+const exampleEnv = parseEnv(exampleText) as Record<string, string>;
+const composeText = readFileSync(join(KIT, "docker-compose.yml"), "utf8");
+
+/** The services on each network, sorted: { network: [service, ...] }. */
+function networkMembers(config: ComposeConfig): Record<string, string[]> {
+  const members: Record<string, string[]> = {};
+  for (const [service, definition] of Object.entries(config.services)) {
+    for (const network of Object.keys(definition.networks ?? {})) (members[network] ??= []).push(service);
+  }
+  for (const list of Object.values(members)) list.sort();
+  return members;
+}
+
+describe("D1: bitcoind and LND on a network of their own, `bitcoin` (docker compose config)", { skip: NO_COMPOSE }, () => {
+  it("has exactly bitcoind, both LND nodes and the hub on it, with every profile on", () => {
+    const config = resolved(ALL_PROFILES);
+    assert.deepEqual(Object.keys(config.services).sort(), ALL_SERVICES);
+    assert.deepEqual(networkMembers(config).bitcoin, ["bitcoind", "hub", "lnd-demo", "lnd-hub"]);
+  });
+
+  for (const [variant, env] of KIT_VARIANTS) {
+    it(`keeps fnn-hub, fnn-demo, fiber-ws and cloudflared off it (${variant})`, () => {
+      const members = networkMembers(resolved(env));
+      for (const service of ["fnn-hub", "fnn-demo", "fiber-ws", "cloudflared"]) assert.ok(!(members.bitcoin ?? []).includes(service), service);
+      assert.ok((members.bitcoin ?? []).includes("hub"), "the hub reaches its LND there");
+      assert.ok((members.bitcoin ?? []).every((service) => ["bitcoind", "hub", "lnd-demo", "lnd-hub"].includes(service)), members.bitcoin?.join(", "));
+    });
+  }
+
+  it("puts bitcoind and the LND nodes on `bitcoin` only: not on default (fnn, fiber-ws), not on edge (the tunnel)", () => {
+    const config = resolved(ALL_PROFILES);
+    for (const service of ["bitcoind", "lnd-hub", "lnd-demo"]) assert.deepEqual(Object.keys(config.services[service]?.networks ?? {}), ["bitcoin"], service);
+  });
+
+  it("leaves the edge network as it was: cloudflared, fiber-ws and the hub; and default to the Fiber side", () => {
+    const members = networkMembers(resolved(ALL_PROFILES));
+    assert.deepEqual(members.edge, ["cloudflared", "fiber-ws", "hub"]);
+    assert.deepEqual(members.default, ["fiber-ws", "fnn-demo", "fnn-hub", "hub"]);
+  });
+
+  it("is the project's own network (ckbolt-testnet_bitcoin), not an external one another project such as the faucet could share", () => {
+    const network = resolved(ALL_PROFILES).networks?.bitcoin;
+    assert.equal(network?.name, `${COMPOSE_PROJECT}_bitcoin`);
+    assert.ok(!network?.external, "not external");
+    assert.ok(!network?.attachable, "not attachable");
+    assert.doesNotMatch(composeText, /^\s+faucet:/m, "the faucet is not a service of this kit");
+  });
+
+  it("still lets every node reach what it talks to: the hub its LND and fnn, LND bitcoind, fnn-demo fnn-hub", () => {
+    const config = resolved(ALL_PROFILES);
+    const shared = (a: string, b: string): string[] =>
+      Object.keys(config.services[a]?.networks ?? {}).filter((network) => network in (config.services[b]?.networks ?? {}));
+    for (const [a, b] of [["hub", "lnd-hub"], ["hub", "lnd-demo"], ["hub", "fnn-hub"], ["hub", "fnn-demo"], ["lnd-hub", "bitcoind"], ["lnd-demo", "bitcoind"], ["lnd-demo", "lnd-hub"], ["fnn-demo", "fnn-hub"], ["fiber-ws", "fnn-hub"], ["cloudflared", "hub"], ["cloudflared", "fiber-ws"]] as const) {
+      assert.ok(shared(a, b).length > 0, `${a} and ${b} share no network`);
+    }
+    const hub = loadHubConfig(hubEnvironment(config));
+    assert.equal(hub.lnd.grpcHost, "lnd-hub:10009");
+    assert.match(config.configs["lnd-conf"]?.content ?? "", /^bitcoind\.rpchost=bitcoind:38332$/m);
+  });
+});
+
+describe("D7: log rotation and no-new-privileges on every service (docker compose config)", { skip: NO_COMPOSE }, () => {
+  for (const [variant, env] of KIT_VARIANTS) {
+    it(`rotates every service's json-file log at 10m, keeping 5 files, and sets no-new-privileges (${variant})`, () => {
+      const config = resolved(env);
+      for (const [name, service] of Object.entries(config.services)) {
+        assert.deepEqual(service.logging, { driver: "json-file", options: { "max-size": "10m", "max-file": "5" } }, name);
+        assert.ok(service.security_opt?.includes("no-new-privileges:true"), `${name}: ${service.security_opt?.join(", ")}`);
+      }
+    });
+  }
+
+  it("takes LOG_MAX_SIZE and LOG_MAX_FILES from .env for every service", () => {
+    const config = resolved({ ...ALL_PROFILES, LOG_MAX_SIZE: "50m", LOG_MAX_FILES: "3" });
+    for (const [name, service] of Object.entries(config.services)) assert.deepEqual(service.logging?.options, { "max-size": "50m", "max-file": "3" }, name);
+  });
+
+  it("caps fiber-ws's relays at FIBER_WS_MAX_CHILDREN, 200 unless .env says otherwise", () => {
+    const command = (env: Record<string, string>) => resolved({ ...ALL_PROFILES, ...env }).services["fiber-ws"]?.command ?? [];
+    assert.deepEqual(command({}), ["TCP-LISTEN:8228,fork,reuseaddr,max-children=200", "TCP:fnn-hub:8228"]);
+    assert.deepEqual(command({ FIBER_WS_MAX_CHILDREN: "50" }), ["TCP-LISTEN:8228,fork,reuseaddr,max-children=50", "TCP:fnn-hub:8228"]);
+  });
+
+  it("documents the defaults in .env.example, equal to the compose file's own", () => {
+    assert.equal(exampleEnv.LOG_MAX_SIZE, "10m");
+    assert.equal(exampleEnv.LOG_MAX_FILES, "5");
+    assert.equal(exampleEnv.FIBER_WS_MAX_CHILDREN, "200");
+    assert.match(composeText, /max-size: \$\{LOG_MAX_SIZE:-10m\}/);
+    assert.match(composeText, /max-file: "\$\{LOG_MAX_FILES:-5\}"/);
+    assert.match(composeText, /max-children=\$\{FIBER_WS_MAX_CHILDREN:-200\}/);
+  });
+
+  it("applies the same defaults when the server's .env predates these keys", () => {
+    const withoutKeys = Object.fromEntries(Object.keys(exampleEnv).filter((key) => /^(LOG_MAX_|FIBER_WS_MAX_CHILDREN)/.test(key)).map((key) => [key, ""]));
+    // An empty value: Compose's `:-` default applies as for a missing key.
+    const config = resolved({ ...ALL_PROFILES, ...withoutKeys });
+    for (const [name, service] of Object.entries(config.services)) assert.deepEqual(service.logging?.options, { "max-size": "10m", "max-file": "5" }, name);
+    assert.ok(config.services["fiber-ws"]?.command?.[0]?.endsWith("max-children=200"));
+  });
+});
+
+/** An image pinned by tag and digest: name:tag@sha256:<64 hex>. */
+const PINNED_IMAGE = /^[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9_][A-Za-z0-9_.-]*@sha256:[0-9a-f]{64}$/;
+const DIGEST_KEYS = ["LND_DIGEST", "CLOUDFLARED_DIGEST", "SOCAT_DIGEST"];
+
+describe("D8: third-party images pinned by digest", () => {
+  it("names a sha256 digest for each third-party image in .env.example, next to its version", () => {
+    for (const key of DIGEST_KEYS) {
+      assert.match(exampleEnv[key] ?? "", /^sha256:[0-9a-f]{64}$/, key);
+      assert.ok(exampleEnv[key.replace("_DIGEST", "_VERSION")], `${key.replace("_DIGEST", "_VERSION")} is next to it`);
+    }
+  });
+
+  it("uses the same digests as the compose file's defaults, so a server .env without them runs the same images", () => {
+    const defaults = Object.fromEntries([...composeText.matchAll(/\$\{([A-Z_]+_DIGEST):-(sha256:[0-9a-f]{64})\}/g)].map((match) => [match[1], match[2]]));
+    assert.deepEqual(Object.keys(defaults).sort(), [...DIGEST_KEYS].sort());
+    for (const key of DIGEST_KEYS) assert.equal(defaults[key], exampleEnv[key], key);
+  });
+
+  it("reaches a server .env that predates it: `testnet env` adds the digests and the D7 settings with the example's values", () => {
+    const newKeys = [...DIGEST_KEYS, "FIBER_WS_MAX_CHILDREN", "LOG_MAX_SIZE", "LOG_MAX_FILES"];
+    const readable = readableEnvKeys(exampleText);
+    for (const key of newKeys) assert.ok(readable.includes(key), `${key} is not a secret: the scripts may read it back`);
+    const older = new Map(
+      [...envEntries(exampleText)].filter(([key]) => !newKeys.includes(key)).map(([key, value]) => [key, { set: true, value: readable.includes(key) ? value || "x" : null }]),
+    );
+    const plan = planEnvCompletion({ exampleText, probe: older, secretBytes: KIT_SECRET_BYTES, publicIp: PUBLIC_IP });
+    assert.deepEqual(
+      plan.fills.sort((a, b) => a.key.localeCompare(b.key)),
+      newKeys.map((key) => ({ key, kind: "value", value: exampleEnv[key] })).sort((a, b) => a.key.localeCompare(b.key)),
+    );
+  });
+
+  it("pins the bitcoind and fnn base image and the hub's node image by tag and digest, and builds only from them", () => {
+    const dockerfiles = [join(KIT, "bitcoind", "Dockerfile"), join(paths.hubRoot, "devnet", "fnn", "Dockerfile"), join(KIT, "hub", "Dockerfile")];
+    for (const file of dockerfiles) {
+      const text = readFileSync(file, "utf8");
+      const args = new Map([...text.matchAll(/^ARG ([A-Z_]+IMAGE)=(\S+)$/gm)].map((match) => [match[1] ?? "", match[2] ?? ""]));
+      assert.ok(args.size > 0, `${file}: no base image ARG`);
+      for (const [name, image] of args) assert.match(image, PINNED_IMAGE, `${file}: ${name}`);
+      const froms = [...text.matchAll(/^FROM\s+(\S+)/gm)].map((match) => match[1] ?? "");
+      assert.ok(froms.length > 0, file);
+      for (const from of froms) assert.match(from, /^\$\{[A-Z_]+IMAGE\}$/, `${file}: FROM ${from} is not the pinned ARG`);
+    }
+  });
+});
+
+describe("D8: the images the kit runs (docker compose config)", { skip: NO_COMPOSE }, () => {
+  it("runs every image it does not build by tag and digest: LND, cloudflared and socat", () => {
+    const config = resolved(ALL_PROFILES);
+    const pulled = Object.entries(config.services).filter(([, service]) => !service.build && !service.image?.startsWith("ckbolt/"));
+    assert.deepEqual(pulled.map(([name]) => name).sort(), ["cloudflared", "fiber-ws", "lnd-demo", "lnd-hub"]);
+    for (const [name, service] of pulled) assert.match(service.image ?? "", PINNED_IMAGE, name);
+    assert.equal(config.services["lnd-hub"]?.image, `lightninglabs/lnd:${exampleEnv.LND_VERSION}@${exampleEnv.LND_DIGEST}`);
+    assert.equal(config.services.cloudflared?.image, `cloudflare/cloudflared:${exampleEnv.CLOUDFLARED_VERSION}@${exampleEnv.CLOUDFLARED_DIGEST}`);
+    assert.equal(config.services["fiber-ws"]?.image, `alpine/socat:${exampleEnv.SOCAT_VERSION}@${exampleEnv.SOCAT_DIGEST}`);
+  });
+
+  it("builds its own images (bitcoind, fnn-hub, the hub) from Dockerfiles whose base images are pinned; fnn-demo reuses fnn-hub's", () => {
+    const config = resolved(ALL_PROFILES);
+    const built = Object.entries(config.services).filter(([, service]) => service.build);
+    assert.deepEqual(built.map(([name]) => name).sort(), ["bitcoind", "fnn-hub", "hub"]);
+    assert.equal(config.services["fnn-demo"]?.image, config.services["fnn-hub"]?.image);
+    assert.ok(!config.services["fnn-demo"]?.build, "fnn-demo never builds or pulls");
+  });
+
+  it("follows a digest set in .env: the digest decides what runs", () => {
+    const other = `sha256:${"ab".repeat(32)}`;
+    const config = resolved({ ...ALL_PROFILES, LND_DIGEST: other, SOCAT_DIGEST: other, CLOUDFLARED_DIGEST: other });
+    for (const name of ["lnd-hub", "lnd-demo", "fiber-ws", "cloudflared"]) assert.ok(config.services[name]?.image?.endsWith(`@${other}`), name);
+  });
+
+  it("falls back to the compose file's pinned digest when the server's .env has no digest yet", () => {
+    const config = resolved({ ...ALL_PROFILES, LND_DIGEST: "", SOCAT_DIGEST: "", CLOUDFLARED_DIGEST: "" });
+    assert.equal(config.services["lnd-hub"]?.image, `lightninglabs/lnd:${exampleEnv.LND_VERSION}@${exampleEnv.LND_DIGEST}`);
+    for (const name of ["lnd-hub", "lnd-demo", "fiber-ws", "cloudflared"]) assert.match(config.services[name]?.image ?? "", PINNED_IMAGE, name);
   });
 });
 
@@ -389,16 +607,28 @@ describe("hub.env.example", () => {
     }
   });
 
-  it("is accepted by the hub's loader with what docker-compose.yml adds", () => {
-    const hub = loadHubConfig({
-      ...example,
-      QUOTE_SIGNING_KEY: QUOTE_KEY,
-      DEMO_ENABLED: "false",
-      LND_HOLD_EXPIRY_DELTA_BLOCKS: "18",
-      FIBER_PUBLIC_WS_ADDRS: `/ip4/${PUBLIC_IP}/tcp/8228/ws`,
-      FIBER_PUBLIC_P2P_ADDRS: `/ip4/${PUBLIC_IP}/tcp/8228`,
-    });
+  /** What docker-compose.yml adds to hub.env for the hub. */
+  const COMPOSE_ADDS = {
+    QUOTE_SIGNING_KEY: QUOTE_KEY,
+    DEMO_ENABLED: "false",
+    LND_HOLD_EXPIRY_DELTA_BLOCKS: "18",
+    FIBER_PUBLIC_WS_ADDRS: `/ip4/${PUBLIC_IP}/tcp/8228/ws`,
+    FIBER_PUBLIC_P2P_ADDRS: `/ip4/${PUBLIC_IP}/tcp/8228`,
+  };
+
+  it("names HUB_PROXY_SECRET for the operator to fill, and leaves it empty: a secret never goes in the repository", () => {
+    assert.equal(example.HUB_PROXY_SECRET, "");
+    assert.equal(example.HUB_HOST, "0.0.0.0");
+  });
+
+  it("is accepted by the hub's loader with what docker-compose.yml adds and the secret the operator fills", () => {
+    const hub = loadHubConfig({ ...example, ...COMPOSE_ADDS, ...OPERATOR_HUB_ENV });
     assert.equal(hub.pricing.maxSats, 20_000n);
+    assert.equal(hub.server.proxySecret, PROXY_SECRET);
+  });
+
+  it("is refused by the hub's loader as it stands, with only what docker-compose.yml adds: HUB_PROXY_SECRET is empty", () => {
+    assert.throws(() => loadHubConfig({ ...example, ...COMPOSE_ADDS }), NEEDS_PROXY_SECRET);
   });
 });
 

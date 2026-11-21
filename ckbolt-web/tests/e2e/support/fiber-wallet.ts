@@ -138,7 +138,7 @@ export async function openWallet(page: Page, dip: boolean): Promise<Wallet> {
 export async function createWalletNode(ui: Wallet["ui"]) {
   const home = ui.getByTestId("fiber-wallet-home");
   await expect(home.getByTestId("fiber-node-create")).toBeVisible({ timeout: WALLET_TIMEOUT_MS });
-  await home.getByLabel("Password, at least 8 characters").fill(WALLET_PASSWORD);
+  await home.getByLabel("Password, at least 12 characters").fill(WALLET_PASSWORD);
   await home.getByLabel("Repeat the password").fill(WALLET_PASSWORD);
   await home.getByRole("button", { name: "Create node" }).click();
   await expect(ui.getByTestId("fiber-wallet-balance")).toBeVisible({ timeout: WALLET_TIMEOUT_MS });
@@ -216,6 +216,8 @@ export async function answerInNode(node: { ui: Wallet["ui"]; scope: NodeScope },
 
 export interface InvoiceFacts {
   amount: bigint;
+  /** 0x-prefixed; drawn when not given. */
+  paymentHash?: string;
   network?: FiberNetwork;
   udt?: Script | null;
   payee?: string;
@@ -234,51 +236,67 @@ const CURRENCY: Record<FiberNetwork, string> = { mainnet: "Fibb", testnet: "Fibt
 export const PAYEE_NODE_ID = `03${"5a".repeat(32)}`;
 const DEFAULT_EXPIRY_SECONDS = 3_600;
 
+/** What parse_invoice reads in every invoice of every book in this worker, by the invoice's text. */
+const readable = new Map<string, InvoiceFacts & { paymentHash: string }>();
+/** The contexts whose pages already have the parse bridge: one per context, whichever book installs it first. */
+const bridged = new WeakSet<BrowserContext>();
+
 /**
  * The Fiber invoices a test pastes, and what parse_invoice says about each, as fnn 0.9.1 writes it: timestamp in ms,
  * attributes in snake_case, the token as a molecule Script, and one payment hash per invoice. The fake node asks for it
- * through an exposed function (support/fiber-node.ts, parse_invoice).
+ * through an exposed function (support/fiber-node.ts, parse_invoice), installed once per context; the fake hub's own
+ * book (support/live-hub.ts) adds its Fiber hold invoices there too.
  */
 export class InvoiceBook {
-  private readonly facts = new Map<string, InvoiceFacts & { paymentHash: string }>();
+  private readonly own = new Set<string>();
 
   async install(context: BrowserContext) {
-    await context.exposeFunction("__testParseFiberInvoice", (invoice: string) => this.read(invoice));
+    if (bridged.has(context)) return;
+    bridged.add(context);
+    await context.exposeFunction("__testParseFiberInvoice", (invoice: string) => readInvoice(invoice));
   }
 
   /** A new Fiber invoice (right prefix, amount and checksum) whose parse gives `facts`. */
   add(facts: InvoiceFacts): string {
     const invoice = demoFiberInvoice(facts.network ?? "testnet", facts.amount);
-    this.facts.set(invoice, { ...facts, paymentHash: `0x${randomBytes(32).toString("hex")}` });
+    return this.register(invoice, facts);
+  }
+
+  /** Makes an invoice that already exists (the fake hub's hold invoice) read as `facts`. */
+  register(invoice: string, facts: InvoiceFacts): string {
+    const paymentHash = facts.paymentHash ?? `0x${randomBytes(32).toString("hex")}`;
+    readable.set(invoice, { ...facts, paymentHash });
+    this.own.add(invoice);
     return invoice;
   }
 
   /** The payment hash parse_invoice reads in `invoice`. */
   hashOf(invoice: string): string {
-    const facts = this.facts.get(invoice);
+    const facts = this.own.has(invoice) ? readable.get(invoice) : undefined;
     if (!facts) throw new Error("not an invoice of this book");
     return facts.paymentHash;
   }
+}
 
-  private read(invoice: string): unknown {
-    const facts = this.facts.get(invoice.trim());
-    if (!facts) return null;
-    const { network } = decodeFiberInvoice(invoice.trim());
-    const expiry = facts.expirySeconds === undefined ? DEFAULT_EXPIRY_SECONDS : facts.expirySeconds;
-    const attrs: Record<string, unknown>[] = [
-      { hash_algorithm: "sha256" },
-      { payee_public_key: facts.payee ?? PAYEE_NODE_ID },
-      ...(expiry === null ? [] : [{ expiry_time: hexQ(expiry) }]),
-      ...(facts.description ? [{ description: facts.description }] : []),
-      ...(facts.udt ? [{ udt_script: moleculeScriptHex(facts.udt) }] : []),
-    ];
-    return {
-      currency: CURRENCY[network],
-      amount: hexQ(facts.amount),
-      signature: "00",
-      data: { timestamp: hexQ(facts.createdAtMs ?? Date.now()), payment_hash: facts.paymentHash, attrs },
-    };
-  }
+/** parse_invoice's answer for `invoice`, as fnn 0.9.1 writes it, or null for an invoice no book holds. */
+function readInvoice(invoice: string): unknown {
+  const facts = readable.get(invoice.trim());
+  if (!facts) return null;
+  const { network } = decodeFiberInvoice(invoice.trim());
+  const expiry = facts.expirySeconds === undefined ? DEFAULT_EXPIRY_SECONDS : facts.expirySeconds;
+  const attrs: Record<string, unknown>[] = [
+    { hash_algorithm: "sha256" },
+    { payee_public_key: facts.payee ?? PAYEE_NODE_ID },
+    ...(expiry === null ? [] : [{ expiry_time: hexQ(expiry) }]),
+    ...(facts.description ? [{ description: facts.description }] : []),
+    ...(facts.udt ? [{ udt_script: moleculeScriptHex(facts.udt) }] : []),
+  ];
+  return {
+    currency: CURRENCY[network],
+    amount: hexQ(facts.amount),
+    signature: "00",
+    data: { timestamp: hexQ(facts.createdAtMs ?? Date.now()), payment_hash: facts.paymentHash, attrs },
+  };
 }
 
 /** The CKB lock args of a secret key (blake160 of its compressed public key), as fnn and CCC derive them. */

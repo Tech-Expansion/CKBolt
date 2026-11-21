@@ -43,7 +43,8 @@ No bottom bar. The pages stay mounted (`hidden` when not shown), so what was typ
   it). Escape still closes the popover. Passwords typed anywhere in the popup clear on every page change, when the
   popover hides and when the browser tab is hidden. Add funds, Channels and Withdraw need the running node and say
   "Opens once your node runs." until it runs.
-  - **Add funds**: the node's address with QR and Copy, "Fund from a wallet" (the funding page in a new tab), the
+  - **Add funds**: the node's address with QR and Copy, "Fund from a wallet" (the funding page in a new tab, which
+    funds only the node's own address: [The funding page's address](#the-funding-pages-address-2026-11-20-w7)), the
     faucet, "Get test cWBTC" while the hub serves cWBTC (2026-11-06), Refresh balance.
   - **Channels** (`channels-page.tsx`): first the hub, one card with a row per asset the hub funds (CKB, RUSD, cWBTC),
     ticked and opened in one press, with "Your node puts in" and Max for the CKB row (see [Channel with the hub: one
@@ -474,6 +475,83 @@ developer looking into a payment. Nothing in it pays, changes a channel or write
 - Tests: `tests/unit/diagnostics.spec.ts` (the JSON's fields, nothing secret, the dry runs and skips, the adapter),
   `tests/e2e/diagnostics.spec.ts` (copy, route check, a kept hub id never probed, axe and 390 px).
 
+### The pages' Content-Security-Policy (2026-11-20, W4)
+
+From the security review of November 2026 (`../ckbolt-hub/docs/security-review-2026-11.md`, W4). The two documents that
+run fiber-js, `/app/fiber` (also `?view=wallet`) and the popup's iframe `/app/wallet`, get a strict policy from
+`proxy.ts` (Next.js 16's Proxy, the former middleware; the policy is `nodePageCsp` in `lib/csp.ts`), with a fresh nonce
+per request. Next.js reads the nonce from the request's policy and puts it on every script it renders, so both pages
+render per request: `/app/wallet` calls `connection()`, `/app/fiber` reads its query. `next.config.mjs` sends every other
+page its framing policy as before and leaves these two, and the hub proxy, alone (`ALL_BUT_NODE_PAGES`); their
+`X-Frame-Options`, Document-Isolation-Policy and COOP/COEP stay in `next.config.mjs`.
+
+```
+default-src 'self';
+script-src 'self' 'nonce-<per request>' 'strict-dynamic' 'sha256-<the layout's motion script>' 'wasm-unsafe-eval';
+worker-src 'self' blob:;
+style-src 'self' 'unsafe-inline';
+img-src 'self' data: blob: https:;
+font-src 'self';
+connect-src 'self' <the CKB RPC's origin> wss:;
+object-src 'none'; base-uri 'self'; form-action 'self';
+frame-ancestors 'self'   (the wallet; 'none' on the node page)
+```
+
+- **Scripts** run by Next.js's nonce, and what they load through it (`'strict-dynamic'`): no host list, no
+  `'unsafe-inline'`, no `'unsafe-eval'` (only under `next dev`, for React). The root layout's one inline script of its
+  own, the Pause motion restore, is `MOTION_RESTORE_SCRIPT` in `lib/motion.ts`, allowed by its hash.
+- **fiber-js**: `'wasm-unsafe-eval'` compiles its WASM node (inlined in its bundle) and allows nothing else;
+  `worker-src blob:` starts its two workers, which it makes from blob: URLs of its own code; they inherit the policy.
+- **connect-src**: this site (the API routes, the hub proxy), the CKB RPC origin of this build
+  (`NEXT_PUBLIC_CKBOLT_FIBER_CKB_RPC_URL`, default `https://testnet.ckbapp.dev`: the node, the balance reader and CCC's
+  client for Withdraw), and `wss:` on any host, because the hub's WebSocket addresses come from the hub at run time
+  and a channel with another node dials the address the visitor types. A page served over plain http (a local
+  `next start`) adds `ws:`, as the node dials ws:// peers there (`needsTlsPeers`).
+- **Styles and images**: `'unsafe-inline'` styles (React style attributes, CCC's connector); images from this site,
+  `data:` and `blob:` (QR codes, inline SVG icons) and `https:` (the hub's token icons, checked by
+  `lib/token-display.ts`, and CCC's wallet icons).
+- **Checked in real Chrome** (2026-11-20, a production build on `next start`, `.env`'s testnet hub): a node created on
+  `/app/fiber` ran in about 3 s, with fiber-js 0.10.1 loaded from the server (7.4 MB transferred, 16.6 MB decoded), the
+  hub's `wss://` peer connected and the keystore written; the popup's iframe unlocked the same key and ran the node;
+  CCC's connector opened from Withdraw with its icons; no CSP violation and no console error in the pages, the iframe
+  or fiber-js's workers.
+- **The rest of the site keeps** `frame-ancestors`, `object-src 'none'`, `base-uri` and `form-action` only. A strict
+  policy there is not clean: a nonce makes every static page render per request, the funding page's CCC connector
+  reaches the wallets and CKB nodes it picks, and wallet extensions (WebLN, CKB wallets) may inject scripts on `/app`
+  and the funding page. Not tried in a browser.
+
+### The key's password and scrypt (2026-11-20, W6)
+
+- A new key's password needs **at least 12 characters** (`PASSWORD_MIN_LENGTH`, it was 8): the create form's label
+  reads "Password, at least 12 characters" and a shorter one "Use at least 12 characters.". Unlock and restore never
+  check the length: a key kept or backed up under a shorter password still opens.
+- A record whose scrypt parameters cost less than today's (`KDF_PARAMS`, N 2^16, r 8, p 1), less memory (N × r) or
+  less work (N × r × p) and no more of the other, is encrypted again with today's, under the same password, once that
+  password opens it: on unlock, and on restore before the backup is stored (`isWeakerKdf`, `strengthenKeystore` in
+  `keystore.ts`, called by `useNodeKey`). The node id, address and creation time stay; it costs one more scrypt run
+  (about a second, while the form still says "Opening the key…"). If it fails, the old record stays and the node starts
+  anyway. A record stronger than today's in either is left as it is, so nothing gets cheaper to attack. The backup to
+  download is the stored record, so it follows.
+
+### The funding page's address (2026-11-20, W7)
+
+The funding page (`/app/fiber/fund?address=…`) takes the URL's address only as a claim: a link can carry anyone's
+address. The form appears only once that address is the node's own (compared by lock script, so another spelling of the
+same lock counts; `lib/wallets/fiber-browser/fund-address.ts`), and it sends to the node's own spelling of it.
+
+- **Where the node's own address comes from**: first the node's tab, which adds `address` (from its funding lock) to its
+  bridge status (`NodePresence.address`, same origin only); then the address kept next to the key: the keystore record
+  now holds the node's public `address`, like its node id, written by the running node (`rememberNode`). A restored
+  backup's own address is dropped until the node runs; an older record has none.
+- **States** (`fund-node-page.tsx`): checking (`fund-node-checking`, "Checking that this is your Fiber node's
+  address…", under a second); the node's own (the form, as before); another address (`fund-node-mismatch`: "This
+  link's address is not your Fiber node's. This page sends nothing to it.", with "Fund your own node",
+  `fund-node-own`, the funding page for the node's address, and "Open your Fiber node"; the link's address is not
+  shown); cannot tell (`fund-node-unconfirmed`: "Open your Fiber node first", no node tab answered and this browser
+  keeps no address; the page asks again every 5 s and turns ready once the node runs, and "Open your Fiber node" opens
+  a new tab); no CKB testnet address in the link (`fund-node-missing`, as before).
+- Nothing else changed: "Fund this node" and "Fund from a wallet" still link to `fundNodeHref(address)`.
+
 ### Status colours
 
 The popup and the swap card use the status palette of the [style guide](style-guide.md#status-colours): the header
@@ -713,7 +791,9 @@ matches):
 | `/app/fiber` (as before) | `Document-Isolation-Policy`, `Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: require-corp` |
 
 A request to `/app/wallet` returns exactly one CSP (`frame-ancestors 'self'`) and `SAMEORIGIN`; every other page keeps
-`frame-ancestors 'none'` and `DENY` (checked by `tests/e2e/fiber-wallet-popup.spec.ts`). The route path is
+`frame-ancestors 'none'` and `DENY` (checked by `tests/e2e/fiber-wallet-popup.spec.ts`). Since 2026-11-20 the CSP of
+`/app/wallet` and `/app/fiber` comes from `proxy.ts`, with a nonce per request
+([The pages' Content-Security-Policy](#the-pages-content-security-policy-2026-11-20-w4)). The route path is
 `FIBER_WALLET_PATH` in `lib/wallets/fiber-popup/constants.ts`; a unit test checks that `next.config.mjs` names the same.
 
 ### Parts

@@ -1,5 +1,5 @@
-# CKBolt hub devnet: bitcoind regtest with two LND nodes, a CKB devnet built from Fiber v0.9.1's dev chain spec (the
-# Fiber contracts are in genesis) with a block producer, and two release fnn v0.9.1 nodes.
+# CKBolt hub devnet: bitcoind regtest with two LND nodes, a CKB devnet built from Fiber's dev chain spec (the
+# Fiber contracts are in genesis) with a block producer, and two release fnn v0.10.1 nodes.
 #
 # *-hub nodes are the hub's own; *-user nodes play the user and back the hub's demo wallet (DEMO_* in hub.env).
 # Host ports, versions and dev credentials can be overridden from the environment or an untracked devnet/.env
@@ -32,7 +32,7 @@ x-ckb: &ckb
 # fnn-hub builds the fnn image and fnn-user runs the same tag. Only one service may build it: two builds of one tag run
 # in parallel on a first `up` and the second fails with "image ... already exists".
 x-fnn: &fnn
-  image: ckbolt-devnet/fnn:v0.9.1
+  image: ckbolt-devnet/fnn:v0.10.1
   restart: unless-stopped
   init: true
   depends_on:

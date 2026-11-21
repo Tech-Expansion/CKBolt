@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { HUB_MACAROON_PERMISSIONS as DEVNET_HUB_MACAROON_PERMISSIONS } from "../../devnet/scripts/lib/devnet.constants";
 import { HUB_MACAROON_PERMISSIONS } from "../scripts/lib/constants";
 import { resolveDeployPaths } from "../scripts/lib/paths";
 import { installMacaroons } from "../scripts/steps/macaroons.step";
@@ -163,12 +164,107 @@ describe("testnet wallet", () => {
   });
 });
 
+/**
+ * Security review D9: the hub's and the demo wallet's macaroon allow exactly the gRPC methods the hub's LND adapter calls
+ * (LND URI permissions), spelled out here so that the test checks the contract, not the code.
+ */
+const HUB_LND_URIS = [
+  "uri:/lnrpc.Lightning/GetInfo",
+  "uri:/lnrpc.Lightning/DecodePayReq",
+  "uri:/lnrpc.Lightning/AddInvoice",
+  "uri:/lnrpc.Lightning/LookupInvoice",
+  "uri:/lnrpc.Lightning/ListInvoices",
+  "uri:/lnrpc.Lightning/SubscribeInvoices",
+  "uri:/lnrpc.Lightning/ChannelBalance",
+  "uri:/lnrpc.Lightning/WalletBalance",
+  "uri:/invoicesrpc.Invoices/AddHoldInvoice",
+  "uri:/invoicesrpc.Invoices/SettleInvoice",
+  "uri:/invoicesrpc.Invoices/CancelInvoice",
+  "uri:/routerrpc.Router/SendPaymentV2",
+  "uri:/routerrpc.Router/TrackPaymentV2",
+] as const;
+
+/**
+ * The gRPC methods each `lightning` package call of src/infrastructure/lightning/lnd.rpc.ts makes, read from the
+ * package's source (lnd_methods/*): subscribeToInvoices lists invoices to resume, then subscribes; getPayment tracks the
+ * payment through subscribeToPastPayment.
+ */
+const LND_METHODS_OF_PACKAGE_CALL: Readonly<Record<string, readonly string[]>> = {
+  cancelHodlInvoice: ["uri:/invoicesrpc.Invoices/CancelInvoice"],
+  createHodlInvoice: ["uri:/invoicesrpc.Invoices/AddHoldInvoice"],
+  createInvoice: ["uri:/lnrpc.Lightning/AddInvoice"],
+  decodePaymentRequest: ["uri:/lnrpc.Lightning/DecodePayReq"],
+  getChainBalance: ["uri:/lnrpc.Lightning/WalletBalance"],
+  getChannelBalance: ["uri:/lnrpc.Lightning/ChannelBalance"],
+  getInvoice: ["uri:/lnrpc.Lightning/LookupInvoice"],
+  getPayment: ["uri:/routerrpc.Router/TrackPaymentV2"],
+  getWalletInfo: ["uri:/lnrpc.Lightning/GetInfo"],
+  settleHodlInvoice: ["uri:/invoicesrpc.Invoices/SettleInvoice"],
+  subscribeToInvoices: ["uri:/lnrpc.Lightning/ListInvoices", "uri:/lnrpc.Lightning/SubscribeInvoices"],
+  subscribeToPastPayment: ["uri:/routerrpc.Router/TrackPaymentV2"],
+  subscribeToPayViaRequest: ["uri:/routerrpc.Router/SendPaymentV2"],
+};
+
+/** The `lightning` package functions lnd.rpc.ts imports: every call the hub's LND adapter makes with this macaroon. */
+function packageCallsOfLndRpc(): string[] {
+  const source = readFileSync(join(resolveDeployPaths().hubRoot, "src", "infrastructure", "lightning", "lnd.rpc.ts"), "utf8");
+  const imported = /import\s*\{([^}]*)\}\s*from\s*"lightning"/.exec(source)?.[1];
+  assert.ok(imported, "lnd.rpc.ts imports from the lightning package");
+  return imported
+    .split(",")
+    .map((name) => name.trim())
+    .filter((name) => name && !name.startsWith("type "));
+}
+
 describe("testnet macaroons", () => {
-  it("bakes exactly the hub's least-privilege permissions (no admin, no on-chain or channel writes)", () => {
-    assert.deepEqual([...HUB_MACAROON_PERMISSIONS].sort(), ["info:read", "invoices:read", "invoices:write", "offchain:read", "offchain:write", "onchain:read"]);
-    for (const forbidden of ["onchain:write", "address:write", "peers:write", "macaroon:generate", "signer:generate", "message:write"]) {
-      assert.ok(!HUB_MACAROON_PERMISSIONS.includes(forbidden), forbidden);
+  it("bakes exactly the 13 LND URI permissions of the calls the hub makes (security review D9)", () => {
+    assert.equal(HUB_MACAROON_PERMISSIONS.length, 13);
+    assert.deepEqual([...HUB_MACAROON_PERMISSIONS].sort(), [...HUB_LND_URIS].sort());
+    assert.equal(new Set(HUB_MACAROON_PERMISSIONS).size, HUB_MACAROON_PERMISSIONS.length, "no permission twice");
+  });
+
+  it("uses URI permissions only: no entity permission such as offchain:write, which also deletes payments and changes fees", () => {
+    for (const permission of HUB_MACAROON_PERMISSIONS) assert.match(permission, /^uri:\/(lnrpc\.Lightning|invoicesrpc\.Invoices|routerrpc\.Router)\/[A-Z][A-Za-z0-9]+$/, permission);
+  });
+
+  it("denies what the hub never calls: channels, payments history, fees, addresses, coins, backups, macaroons", () => {
+    const denied = [
+      "uri:/lnrpc.Lightning/ListChannels",
+      "uri:/lnrpc.Lightning/DeleteAllPayments",
+      "uri:/lnrpc.Lightning/DeletePayment",
+      "uri:/lnrpc.Lightning/UpdateChannelPolicy",
+      "uri:/lnrpc.Lightning/NewAddress",
+      "uri:/lnrpc.Lightning/SendCoins",
+      "uri:/lnrpc.Lightning/OpenChannel",
+      "uri:/lnrpc.Lightning/CloseChannel",
+      "uri:/lnrpc.Lightning/RestoreChannelBackups",
+      "uri:/lnrpc.Lightning/ExportAllChannelBackups",
+      "uri:/lnrpc.Lightning/BakeMacaroon",
+      "uri:/lnrpc.Lightning/SendPaymentSync",
+      "uri:/lnrpc.Lightning/ConnectPeer",
+      "uri:/routerrpc.Router/SendToRouteV2",
+      "uri:/walletrpc.WalletKit/SendOutputs",
+    ];
+    for (const permission of denied) assert.ok(!HUB_MACAROON_PERMISSIONS.includes(permission), permission);
+    for (const entity of ["info:read", "invoices:read", "invoices:write", "offchain:read", "offchain:write", "onchain:read", "onchain:write", "address:write", "peers:write", "macaroon:generate", "signer:generate", "message:write"]) {
+      assert.ok(!HUB_MACAROON_PERMISSIONS.includes(entity), entity);
     }
+  });
+
+  it("covers every call the hub's LND adapter makes (lnd.rpc.ts), and nothing it does not call", () => {
+    const calls = packageCallsOfLndRpc();
+    assert.ok(calls.length >= 10, `read ${calls.join(", ")}`);
+    const needed = new Set<string>();
+    for (const call of calls) {
+      const methods = LND_METHODS_OF_PACKAGE_CALL[call];
+      assert.ok(methods, `lnd.rpc.ts calls ${call}: add its LND methods to this test and, if the macaroon lacks them, to HUB_MACAROON_PERMISSIONS`);
+      for (const method of methods) needed.add(method);
+    }
+    assert.deepEqual([...needed].sort(), [...HUB_MACAROON_PERMISSIONS].sort());
+  });
+
+  it("is the same list on the devnet, so the devnet runs the hub with the macaroon the server bakes", () => {
+    assert.deepEqual([...DEVNET_HUB_MACAROON_PERMISSIONS], [...HUB_MACAROON_PERMISSIONS]);
   });
 
   it("copies the macaroon and TLS certificate of each running LND into secrets/hub/<node>, gives them to uid 1000 and restarts a running hub", async () => {

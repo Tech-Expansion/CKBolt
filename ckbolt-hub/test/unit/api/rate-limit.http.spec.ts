@@ -145,6 +145,20 @@ describe("rate limiting (HTTP)", () => {
       expectRateLimited(await getHealth("198.51.100.7"));
     });
 
+    it("with trustProxy, every IPv6 address of one /64 shares one budget; another /64 has its own", async () => {
+      await start({ server: { rateLimitPerMinute: 1, trustProxy: true } });
+      expect((await getHealth("2001:db8:1:2::1")).status).toBe(200);
+      expectRateLimited(await getHealth("2001:db8:1:2::2"));
+      expectRateLimited(await getHealth("2001:0db8:0001:0002:ffff:ffff:ffff:ffff"));
+      expect((await getHealth("2001:db8:1:3::1")).status).toBe(200);
+    });
+
+    it("with trustProxy, an IPv4-mapped entry counts as its IPv4 address", async () => {
+      await start({ server: { rateLimitPerMinute: 1, trustProxy: true } });
+      expect((await getHealth("203.0.113.1")).status).toBe(200);
+      expectRateLimited(await getHealth("::ffff:203.0.113.1"));
+    });
+
     it("with trustProxy and no header, the socket address is the key", async () => {
       await start({ server: { rateLimitPerMinute: 1, trustProxy: true } });
       expect((await getHealth()).status).toBe(200);

@@ -1,4 +1,1 @@
-<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <rect width="64" height="64" rx="14" fill="#0a0a0a"/>
-  <path d="M36.5 8 15 36h14l-3.5 20L49 27H34.5L36.5 8Z" fill="#fafafa"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64"><title>CKBolt icon</title><rect width="64" height="64" rx="14" fill="#080503"/><g transform="translate(13.49 12.16) scale(0.07842) translate(-112 -100)"><path d="M350 108 L575 215 L575 262 L430 332 L415 325 L415 230 L235 322 L235 383 L415 475 L415 380 L430 373 L575 440 L575 490 L350 598 L120 488 L120 225 Z" fill="#FAFAF9" stroke="#FAFAF9" stroke-width="14" stroke-linejoin="round"/></g></svg>

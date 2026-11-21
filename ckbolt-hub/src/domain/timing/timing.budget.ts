@@ -80,9 +80,9 @@ export const slowCommitmentDelayMs = (commitmentDelayEpochs: number): number =>
   (commitmentDelayEpochs * FIBER_EPOCH_MS * (PERCENT_PER_WHOLE + FIBER_PAYOUT_GUARD.epochSlackPercent)) / PERCENT_PER_WHOLE;
 
 /**
- * When the hub force-closes the private channel of an ln_to_fiber payout whose payee has not settled the hub's TLC
- * (constants FIBER_PAYOUT_GUARD): early enough that the channel's on-chain settlement, open once the commitment has
- * waited out the channel's delay, starts FIBER_PAYOUT_GUARD.marginMs before the TLC expires; never sooner than the grace
+ * When the hub force-closes the channel of an ln_to_fiber payout whose peer has not settled the hub's TLC (constants
+ * FIBER_PAYOUT_GUARD): the whole commitment delay, counted long, plus FIBER_PAYOUT_GUARD.marginMs before the TLC expires,
+ * so the timeout path (2/3 of the delay) is open by the expiry even when epochs run long; never sooner than the grace
  * after the payout was sent. With fnn's default delay (1 epoch) that is 5.5 hours before the expiry.
  */
 export const fiberPayoutForceCloseAt = (tlc: { expiresAt: number; commitmentDelayEpochs: number; sentAt: number }): number =>

@@ -1,10 +1,11 @@
-import { Inject, Injectable, Logger } from "@nestjs/common";
+import { Inject, Injectable, Logger, Optional } from "@nestjs/common";
 import { describeError } from "../../common/utils/error.util";
 import { matchesSecretDigest } from "../../common/utils/secret.util";
 import type { HubConfig } from "../../config/hub.config";
 import type { AssetRegistry } from "../../domain/assets";
 import type { TimingProfile } from "../../domain/timing/timing.types";
 import type { Swap, SwapEvent } from "../../domain/types";
+import { OPERATOR_EVENTS, type OperatorEvents } from "../monitoring/operator-events";
 import type { Clock } from "../ports/clock.port";
 import type { FiberPort } from "../ports/fiber.port";
 import type { LightningPort } from "../ports/lightning.port";
@@ -41,6 +42,8 @@ export class SwapEngineService implements SwapEngine {
     @Inject(TIMING_PROFILE) profile: TimingProfile,
     @Inject(CLOCK) clock: Clock,
     @Inject(HUB_CONFIG) config: HubConfig,
+    /** The hub's monitor hears the payout guard through it (MonitoringModule); absent in tests that build the engine bare. */
+    @Optional() @Inject(OPERATOR_EVENTS) events?: OperatorEvents,
   ) {
     const flows = createSwapFlows({ lightning, fiber, assets, profile, clock, config });
     const journal = new SwapJournal(store, clock);
@@ -52,7 +55,7 @@ export class SwapEngineService implements SwapEngine {
     } = config.swaps;
     const unpaidSwaps = new UnpaidSwapLimits(store, clock, { perClient, requestsPerClient, total, maxSharePercent, feeBudgets: config.swaps });
     this.creator = new SwapCreator({ pricing, assets, store, clock, flows, journal, unpaidSwaps });
-    this.processor = new SwapProcessor(flows, journal, clock, config.swaps);
+    this.processor = new SwapProcessor(flows, journal, clock, config.swaps, events);
   }
 
   createSwap(input: CreateSwapInput): Promise<CreatedSwap> {

@@ -4,7 +4,7 @@ import {
   MSAT_DECIMALS,
   MSAT_PER_SAT,
 } from "../../common/constants/protocol.constants";
-import { holdInvoiceDescription, SATS_UNIT_LABEL, SWAP_DIRECTION } from "../../common/constants/swap.constants";
+import { HOLD_INVOICE_DESCRIPTION, SATS_UNIT_LABEL, SWAP_DIRECTION } from "../../common/constants/swap.constants";
 import { sumOf } from "../../common/utils/amount.util";
 import { basisPointsOfCeil } from "../../common/utils/basis-points.util";
 import { formatBaseUnits } from "../../common/utils/pricing.util";
@@ -108,7 +108,7 @@ export class FiberToLnFlow implements SwapFlow {
         udtTypeScript: asset.udtTypeScript,
         expirySeconds,
         finalExpiryDeltaMs: requirePresent(plan.holdFinalExpiryDeltaMs, "holdFinalExpiryDeltaMs"),
-        description: holdInvoiceDescription(swapId),
+        description: HOLD_INVOICE_DESCRIPTION,
       }),
     );
     return invoice;

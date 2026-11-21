@@ -3,6 +3,7 @@ import { expect, test } from "@playwright/test";
 import { ccc } from "@ckb-ccc/core";
 import { presenceOf, type BridgeContext } from "../../components/app/fiber-node/use-bridge-server";
 import { normalizeAmountInput } from "../../lib/amount";
+import { config as proxyConfig } from "../../proxy";
 import { isClientNavigable } from "../../lib/site-links";
 import { swapLiquidity } from "../../lib/wallets/fiber-browser/channels";
 import { CkbRpcClient, readUdtAmount } from "../../lib/wallets/fiber-browser/ckb-rpc";
@@ -651,6 +652,7 @@ test.describe("the site's links and headers", () => {
   test("next.config.mjs, matched as Next matches it: only /app/wallet may be framed (by this site), isolated by DIP without COOP", async () => {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const config = require("../../next.config.mjs").default as { headers: () => Promise<{ source: string; headers: { key: string; value: string }[] }[]> };
+    const proxyMatcher: readonly string[] = proxyConfig.matcher;
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { getPathMatch } = require("next/dist/shared/lib/router/utils/path-match");
     // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -667,19 +669,44 @@ test.describe("the site's links and headers", () => {
       return headers;
     };
     const wallet = sent(FIBER_WALLET_PATH);
-    expect(wallet.get("content-security-policy")).toEqual(["frame-ancestors 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"]);
+    // Its Content-Security-Policy (frame-ancestors 'self', with a nonce per request) comes from proxy.ts since W4
+    // (tests/unit/node-csp.spec.ts): next.config.mjs sends none, so the page gets exactly one.
+    expect(wallet.get("content-security-policy")).toBeUndefined();
+    expect(proxyMatcher).toContain(FIBER_WALLET_PATH);
     expect(wallet.get("x-frame-options")).toEqual(["SAMEORIGIN"]);
     expect(wallet.get("document-isolation-policy")).toEqual(["isolate-and-credentialless"]);
     expect(wallet.get("cross-origin-opener-policy")).toBeUndefined();
     expect(wallet.get("cross-origin-embedder-policy")).toBeUndefined();
     expect(wallet.get("x-content-type-options")).toEqual(["nosniff"]);
-    for (const path of ["/", "/app", "/app/guide", "/app/fiber", "/app/fiber/fund", "/app/wallets", "/app/wallet/x", "/_next/static/chunks/a.js"]) {
+    for (const path of ["/", "/app", "/app/guide", "/app/fiber", "/app/fiber/fund", "/app/wallets", "/app/wallet/x", "/app/fiberx", "/_next/static/chunks/a.js"]) {
       const other = sent(path);
       expect(other.get("x-frame-options"), path).toEqual(["DENY"]);
-      expect(other.get("content-security-policy")?.[0], path).toContain("frame-ancestors 'none'");
-      expect(other.get("content-security-policy"), path).toHaveLength(1);
+      // Exactly one policy per page: next.config.mjs's framing policy, or proxy.ts's strict one on the node page.
+      if (proxyMatcher.includes(path)) {
+        expect(other.get("content-security-policy"), path).toBeUndefined();
+      } else {
+        expect(other.get("content-security-policy"), path).toEqual(["frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self'"]);
+      }
     }
+    expect(proxyMatcher).toEqual(["/app/fiber", FIBER_WALLET_PATH]);
     expect(sent("/app/fiber").get("cross-origin-opener-policy")).toEqual(["same-origin"]);
+    expect(sent("/app/fiber").get("document-isolation-policy")).toEqual(["isolate-and-credentialless"]);
+
+    // The hub proxy (security review W8): no page rule matches its answers, so the CSP its route sets (`default-src
+    // 'none'; sandbox`) is the one sent; the site-wide headers still apply.
+    for (const path of ["/api/hub/v1/health", "/api/hub/v1/swaps/x", "/api/hub/v1/fiber/node"]) {
+      const proxy = sent(path);
+      expect(proxy.get("content-security-policy"), path).toBeUndefined();
+      expect(proxy.get("x-frame-options"), path).toBeUndefined();
+      expect(proxy.get("x-content-type-options"), path).toEqual(["nosniff"]);
+      expect(proxy.get("referrer-policy"), path).toEqual(["strict-origin-when-cross-origin"]);
+      expect(proxy.get("permissions-policy"), path).toEqual(["camera=(self), microphone=(), geolocation=()"]);
+    }
+    // Only the proxy: other API routes and look-alike paths keep the page rule.
+    for (const path of ["/api/rate", "/api/lightning-stats", "/api/hubx", "/app/api/hub/v1/health"]) {
+      expect(sent(path).get("x-frame-options"), path).toEqual(["DENY"]);
+      expect(sent(path).get("content-security-policy")?.[0], path).toContain("frame-ancestors 'none'");
+    }
   });
 });
 

@@ -3,7 +3,7 @@
 # `npm --prefix deploy run testnet -- <command>`).
 #
 #   bitcoind (Mutinynet fork) ── lnd-hub [⇄ lnd-demo]        LND v0.21.4-beta on signet
-#   CKB testnet (public RPC)  ── fnn-hub [⇄ fnn-demo]        fnn v0.9.1 release, CKB and RUSD channels
+#   CKB testnet (public RPC)  ── fnn-hub [⇄ fnn-demo]        fnn v0.10.1 release, CKB and RUSD channels
 #   hub (CKBolt) ── lnd-hub, fnn-hub; demo wallet (optional) ── lnd-demo, fnn-demo
 #
 # This base file is safe on any machine: it needs no public address and publishes only the hub, on 127.0.0.1. A server
@@ -12,15 +12,35 @@
 # The demo wallet's nodes run only with the `demo` profile (COMPOSE_PROFILES=demo in .env); the hub uses them only with
 # DEMO_ENABLED=true. cloudflared, the Cloudflare Tunnel that makes the hub's API and fnn-hub's WebSocket public over
 # HTTPS and WSS, runs only with the `tunnel` profile, with fiber-ws, its way to fnn-hub's P2P port. cloudflared sits
-# on its own network, `edge`, with only the hub and fiber-ws: it cannot reach fnn's or LND's RPC or bitcoind.
+# on its own network, `edge`, with only the hub and fiber-ws: it cannot reach fnn's or LND's RPC or bitcoind. bitcoind
+# and LND have a network of their own, `bitcoin`, which only the hub joins besides them: fiber-ws and the fnn nodes
+# cannot reach LND's gRPC or bitcoind's RPC either (docs/security-review-2026-11.md, D1).
+# Every service rotates its logs (LOG_MAX_SIZE, LOG_MAX_FILES) and runs with no-new-privileges. Third-party images are
+# pinned by tag and digest: the digest decides what runs, so a new *_VERSION needs its *_DIGEST too (deploy/README.md,
+# "Image digests").
 # Settings: .env (from .env.example; Compose reads it) and hub.env (from hub.env.example). Secrets live in secrets/
 # (never in git): secrets/wallet/ holds the LND wallet passwords and seeds, secrets/hub/ only what the hub may read.
 name: ckbolt-testnet
 
+# Every service: json-file logs rotated at LOG_MAX_SIZE, keeping LOG_MAX_FILES files, so no log fills the disk.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: ${LOG_MAX_SIZE:-10m}
+    max-file: "${LOG_MAX_FILES:-5}"
+
+# Every service: no process may gain privileges it did not start with (setuid binaries). None of the images needs it.
+x-hardening: &hardening
+  logging: *logging
+  security_opt: ["no-new-privileges:true"]
+
 x-lnd: &lnd
-  image: lightninglabs/lnd:${LND_VERSION:-v0.21.4-beta}
+  <<: *hardening
+  image: lightninglabs/lnd:${LND_VERSION:-v0.21.4-beta}@${LND_DIGEST:-sha256:04d06edcc0f6e99a5e797ea34959f330add222226f840cd86afbc31f8f29627d}
   restart: unless-stopped
   stop_grace_period: 2m
+  # The bitcoin network only: bitcoind, the other LND node and the hub. Not on default, where fiber-ws and fnn run.
+  networks: [bitcoin]
   depends_on:
     bitcoind: { condition: service_healthy }
   configs:
@@ -36,7 +56,8 @@ x-lnd: &lnd
 # fnn-hub builds the image from the devnet's release-binary Dockerfile and fnn-demo runs the same tag. Only one service
 # builds it: two builds of one tag in parallel fail with "image ... already exists".
 x-fnn: &fnn
-  image: ckbolt/fnn:v0.9.1
+  <<: *hardening
+  image: ckbolt/fnn:v0.10.1
   restart: unless-stopped
   init: true
   healthcheck:
@@ -49,9 +70,12 @@ x-fnn: &fnn
 services:
   # Takes over the bitcoind that has been syncing on the VPS (same project, service and volume: no resync).
   bitcoind:
+    <<: *hardening
     build: ./bitcoind
     image: ckbolt/bitcoind-mutinynet:2fda7bfc027e
     restart: unless-stopped
+    # Only LND talks to bitcoind (RPC and ZMQ); it still reaches its Mutinynet peers on the internet.
+    networks: [bitcoin]
     # A clean stop writes the block index and chainstate; a large dbcache can take tens of seconds to flush.
     stop_grace_period: 2m
     configs:
@@ -126,6 +150,7 @@ services:
     volumes: ["fnn-demo:/fiber", "./fnn/demo.yml:/etc/fnn/config.yml:ro"]
 
   hub:
+    <<: *hardening
     build:
       context: ${HUB_BUILD_CONTEXT:-../..}
       dockerfile: deploy/testnet/hub/Dockerfile
@@ -149,8 +174,8 @@ services:
       - ./secrets/hub:/secrets:ro
     # Only the CKBolt web server (its /api/hub proxy, or the operator's SSH tunnel) calls the hub: never a public interface.
     ports: ["127.0.0.1:${HUB_HOST_PORT:-18787}:8787"]
-    # default: its nodes; edge: cloudflared reaches its API there (ckbolt-hub-api.<domain>).
-    networks: [default, edge]
+    # default: its Fiber nodes; bitcoin: its LND nodes; edge: cloudflared reaches its API there (ckbolt-hub-api.<domain>).
+    networks: [default, bitcoin, edge]
     depends_on:
       lnd-hub: { condition: service_healthy }
       fnn-hub: { condition: service_healthy }
@@ -163,11 +188,13 @@ services:
   # (8227, open to private addresses) is out of the tunnel's reach. Runs with the tunnel (profile `tunnel`) and
   # publishes no port.
   fiber-ws:
-    image: alpine/socat:${SOCAT_VERSION:-1.8.0.3}
+    <<: *hardening
+    image: alpine/socat:${SOCAT_VERSION:-1.8.0.3}@${SOCAT_DIGEST:-sha256:beb4a68d9e4fe6b0f21ea774a0fde6c31f580dde6368939ed70100c5385b015e}
     profiles: [tunnel]
     restart: unless-stopped
-    # The image's entrypoint is socat: listen on 8228 (a process per connection) and relay to fnn-hub's P2P port.
-    command: ["TCP-LISTEN:8228,fork,reuseaddr", "TCP:fnn-hub:8228"]
+    # The image's entrypoint is socat: listen on 8228 (a process per connection, at most FIBER_WS_MAX_CHILDREN at once,
+    # so a flood of connections cannot fork without end) and relay to fnn-hub's P2P port.
+    command: ["TCP-LISTEN:8228,fork,reuseaddr,max-children=${FIBER_WS_MAX_CHILDREN:-200}", "TCP:fnn-hub:8228"]
     networks: [default, edge]
     depends_on:
       fnn-hub: { condition: service_healthy }
@@ -181,7 +208,8 @@ services:
   #   anything else             -> http_status:404        the catch-all rule
   # deploy/README.md section 10 has the steps, and the FIBER_PUBLIC_WS_ADDRS that goes with them.
   cloudflared:
-    image: cloudflare/cloudflared:${CLOUDFLARED_VERSION:-2026.8.2}
+    <<: *hardening
+    image: cloudflare/cloudflared:${CLOUDFLARED_VERSION:-2026.8.2}@${CLOUDFLARED_DIGEST:-sha256:0aa26e284f05e6c77ae375b8c9c11d9eb6a448fb7bcd8d40f31cb6176189eb38}
     profiles: [tunnel]
     restart: unless-stopped
     # The image's entrypoint is `cloudflared --no-autoupdate`; `tunnel run` takes the tunnel from TUNNEL_TOKEN.
@@ -243,12 +271,14 @@ configs:
       bitcoind.zmqpubrawtx=tcp://bitcoind:28333
       [invoices]
       ; LND cancels an accepted hold invoice this many blocks before its earliest HTLC expires. The hub sizes every
-      ; ln_to_fiber payout to end before that point and gets the same variable (LND_HOLD_EXPIRY_DELTA_BLOCKS, 18 or more).
+      ; ln_to_fiber payout to end before that point and gets the same variable (LND_HOLD_EXPIRY_DELTA_BLOCKS, 18 to 45 on mutinynet).
       invoices.holdexpirydelta=${LND_HOLD_EXPIRY_DELTA_BLOCKS:-18}
 
 networks:
-  # Every service but cloudflared: the nodes' RPCs (fnn-hub's JSON-RPC, LND's gRPC, bitcoind's) answer here.
+  # The Fiber side: fnn-hub, fnn-demo, the hub and fiber-ws. fnn-hub's JSON-RPC answers here without a credential.
   default:
+  # bitcoind, lnd-hub, lnd-demo and the hub only: LND's gRPC (macaroons) and bitcoind's RPC (password) answer here.
+  bitcoin:
   # cloudflared, the hub and fiber-ws only: what the tunnel may reach.
   edge:
 

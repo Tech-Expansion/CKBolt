@@ -604,7 +604,7 @@ test.describe("hub proxy", () => {
     expect(await res.json()).toEqual(body);
   });
 
-  test("passes back only content-type and retry-after, and is never cached", async () => {
+  test("passes back only retry-after, answers with its own JSON content type, and is never cached", async () => {
     const upstream = new Response("{}", {
       status: 429,
       headers: {
@@ -619,7 +619,8 @@ test.describe("hub proxy", () => {
     const { fetch } = recordingFetch(() => upstream);
     const proxy = new HubProxy(proxyConfig(), { fetch, rateLimiter: ALLOW_ALL });
     const res = await proxy.handle(proxyRequest("v1/assets"), ["v1", "assets"]);
-    expect(res.headers.get("content-type")).toBe("application/json; charset=utf-8");
+    // The proxy's own content type, not the hub's (security review W8).
+    expect(res.headers.get("content-type")).toBe("application/json");
     expect(res.headers.get("retry-after")).toBe("30");
     expect(res.headers.get("cache-control")).toBe("no-store");
     for (const dropped of ["set-cookie", "x-powered-by", "access-control-allow-origin"]) expect(res.headers.get(dropped), dropped).toBeNull();
@@ -817,6 +818,147 @@ test.describe("hub proxy", () => {
     const req = new Request("http://x/", { method: "POST", body: stream, duplex: "half" } as RequestInit);
     expect(await readBodyWithin(req, 64)).toBe('{"a":"é€"}');
     expect(await readBodyWithin(new Request("http://x/"), 64)).toBe("");
+  });
+});
+
+/* ------------------------------------------------------------- every answer is inert JSON (security review W8) */
+
+test.describe("hub proxy: every answer is JSON that cannot run as a page; no redirect, Location only on 201", () => {
+  const SANDBOX_CSP = "default-src 'none'; sandbox";
+  /** The headers every answer of the proxy carries, its own errors and the hub's answers alike. */
+  const expectInert = (res: Response, what: string) => {
+    expect(res.headers.get("content-type"), what).toBe("application/json");
+    expect(res.headers.get("content-security-policy"), what).toBe(SANDBOX_CSP);
+    expect(res.headers.get("x-content-type-options"), what).toBe("nosniff");
+    expect(res.headers.get("cache-control"), what).toBe("no-store");
+  };
+  const answering = (respond: () => Response) =>
+    new HubProxy(proxyConfig({ maxBodyBytes: 16_384 }), { fetch: recordingFetch(respond).fetch, rateLimiter: ALLOW_ALL });
+
+  test("the hub's own Content-Type and other headers never reach the browser: an HTML page from the hub is served as JSON", async () => {
+    const page = "<!doctype html><script>alert(document.cookie)</script>";
+    const proxy = answering(
+      () =>
+        new Response(page, {
+          status: 200,
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+            "content-security-policy": "script-src *",
+            "x-content-type-options": "",
+            "access-control-allow-origin": "*",
+            "set-cookie": "session=1",
+            "cache-control": "public, max-age=3600",
+            refresh: "0; url=https://evil.example",
+          },
+        }),
+    );
+    const res = await proxy.handle(proxyRequest("v1/assets"), ["v1", "assets"]);
+    expect(res.status).toBe(200);
+    expectInert(res, "html from the hub");
+    // The body is passed as it came, but labelled JSON in a sandbox: a browser that opens it runs nothing.
+    expect(await res.text()).toBe(page);
+    for (const name of ["access-control-allow-origin", "set-cookie", "refresh", "location"]) expect(res.headers.get(name), name).toBeNull();
+  });
+
+  test("the hub's JSON answers and errors keep their status, with the proxy's headers; Retry-After is passed on", async () => {
+    for (const [status, extra] of [
+      [200, {}],
+      [202, {}],
+      [404, {}],
+      [409, {}],
+      [422, {}],
+      [429, { "retry-after": "17" }],
+      [500, {}],
+      [503, { "retry-after": "30" }],
+    ] as const) {
+      const proxy = answering(() => json({ error: { code: "x", message: "y" } }, status, extra));
+      const res = await proxy.handle(proxyRequest("v1/health"), ["v1", "health"]);
+      expect(res.status, String(status)).toBe(status);
+      expectInert(res, String(status));
+      expect(res.headers.get("retry-after"), String(status)).toBe((extra as Record<string, string>)["retry-after"] ?? null);
+    }
+  });
+
+  test("the proxy's own errors carry the same headers: 404, 405, 413, 429, 503 without a hub, 503 unreachable, 504", async () => {
+    const ok = recordingFetch(() => json(HEALTH)).fetch;
+    const cases: [string, () => Promise<Response>, number][] = [
+      ["unknown path", () => new HubProxy(proxyConfig(), { fetch: ok, rateLimiter: ALLOW_ALL }).handle(proxyRequest("v1/admin"), ["v1", "admin"]), 404],
+      ["method", () => new HubProxy(proxyConfig(), { fetch: ok, rateLimiter: ALLOW_ALL }).handle(proxyRequest("v1/health", { method: "POST", body: "{}" }), ["v1", "health"]), 405],
+      [
+        "body too large",
+        () => new HubProxy(proxyConfig({ maxBodyBytes: 4 }), { fetch: ok, rateLimiter: ALLOW_ALL }).handle(proxyRequest("v1/quotes", { method: "POST", body: '{"a":"long"}' }), ["v1", "quotes"]),
+        413,
+      ],
+      [
+        "rate limited",
+        () => new HubProxy(proxyConfig(), { fetch: ok, rateLimiter: { take: () => ({ allowed: false, retryAfterMs: 2_000 }) } }).handle(proxyRequest("v1/health"), ["v1", "health"]),
+        429,
+      ],
+      ["no hub", () => new HubProxy(proxyConfig({ hubUrl: null }), { fetch: ok, rateLimiter: ALLOW_ALL }).handle(proxyRequest("v1/health"), ["v1", "health"]), 503],
+      [
+        "unreachable",
+        () =>
+          new HubProxy(proxyConfig(), {
+            fetch: async () => {
+              throw new TypeError("fetch failed");
+            },
+            rateLimiter: ALLOW_ALL,
+          }).handle(proxyRequest("v1/health"), ["v1", "health"]),
+        503,
+      ],
+      [
+        "timeout",
+        () =>
+          new HubProxy(proxyConfig(), {
+            fetch: async () => {
+              throw new DOMException("The operation timed out.", "TimeoutError");
+            },
+            rateLimiter: ALLOW_ALL,
+          }).handle(proxyRequest("v1/health"), ["v1", "health"]),
+        504,
+      ],
+    ];
+    for (const [name, run, status] of cases) {
+      const res = await run();
+      expect(res.status, name).toBe(status);
+      expectInert(res, name);
+    }
+    // errorResponse itself: extra headers are added, the four stay.
+    const res = errorResponse(429, API_ERROR_CODE.RATE_LIMITED, "Slow down.", { "retry-after": "3" });
+    expectInert(res, "errorResponse");
+    expect(res.headers.get("retry-after")).toBe("3");
+  });
+
+  test("any 3xx from the hub is a 503 hub error: never passed on, its Location dropped, and fetch does not follow it", async () => {
+    for (const status of [300, 301, 302, 303, 304, 305, 307, 308, 399]) {
+      const { fetch, calls } = recordingFetch(() => new Response(null, { status, headers: { location: "https://evil.example/steal" } }));
+      const res = await new HubProxy(proxyConfig(), { fetch, rateLimiter: ALLOW_ALL }).handle(proxyRequest("v1/assets"), ["v1", "assets"]);
+      expect(res.status, String(status)).toBe(503);
+      expect(await res.json(), String(status)).toEqual({ error: { code: HUB_PROXY_ERROR_CODE.HUB_UNAVAILABLE, message: HUB_MESSAGE.UNREADABLE } });
+      expect(res.headers.get("location"), String(status)).toBeNull();
+      expectInert(res, String(status));
+      expect(calls[0].init.redirect, String(status)).toBe("manual");
+    }
+    // Next to the range: 200 and 400 are the hub's to answer.
+    for (const status of [200, 400]) {
+      const res = await answering(() => json({}, status)).handle(proxyRequest("v1/assets"), ["v1", "assets"]);
+      expect(res.status, String(status)).toBe(status);
+    }
+  });
+
+  test("Location goes back only with a 201, pointing at the proxy; any other status drops it", async () => {
+    const created = await answering(() => json(swap("pending"), 201, { location: `/v1/swaps/${ID}` })).handle(
+      proxyRequest("v1/swaps", { method: "POST", body: JSON.stringify({ quoteId: OTHER_ID, payoutInvoice: "lntbs1" }) }),
+      ["v1", "swaps"],
+    );
+    expect(created.status).toBe(201);
+    expect(created.headers.get("location")).toBe(`/api/hub/v1/swaps/${ID}`);
+    expectInert(created, "201");
+    for (const status of [200, 202, 400, 404, 409, 500]) {
+      const res = await answering(() => json({}, status, { location: `/v1/swaps/${ID}` })).handle(proxyRequest(`v1/swaps/${ID}`), ["v1", "swaps", ID]);
+      expect(res.status, String(status)).toBe(status);
+      expect(res.headers.get("location"), String(status)).toBeNull();
+    }
   });
 });
 
@@ -1137,6 +1279,35 @@ test.describe("hub proxy over HTTP", () => {
     const res = await proxy.handle(proxyRequest("v1/assets"), ["v1", "assets"]);
     expect(seen.length).toBe(count + 1);
     expect(res.status).not.toBe(200);
+  });
+
+  test("a redirect over the wire is a 503 hub error with no Location; a status other than 201 loses its Location", async () => {
+    // Room for every request of this test under the real rate limiter.
+    const proxy = createHubProxy(proxyConfig({ hubUrl: base, maxBodyBytes: 16_384, rateLimit: { ...POLICY, maxPerClient: 100 } }));
+    for (const status of [301, 302, 303, 307, 308]) {
+      handler = (_req, res) => {
+        res.writeHead(status, { location: `${base}/v1/health`, "content-type": "text/html" });
+        res.end("<a href=x>moved</a>");
+      };
+      const count = seen.length;
+      const res = await proxy.handle(proxyRequest("v1/assets"), ["v1", "assets"]);
+      // Asked once: the redirect was not followed, on the server or by the browser.
+      expect(seen.length, String(status)).toBe(count + 1);
+      expect(res.status, String(status)).toBe(503);
+      expect(res.headers.get("location"), String(status)).toBeNull();
+      expect(res.headers.get("content-type"), String(status)).toBe("application/json");
+      expect(res.headers.get("content-security-policy"), String(status)).toBe("default-src 'none'; sandbox");
+      expect(res.headers.get("x-content-type-options"), String(status)).toBe("nosniff");
+      expect((await res.json()).error.code).toBe(HUB_PROXY_ERROR_CODE.HUB_UNAVAILABLE);
+    }
+    handler = (_req, res) => {
+      res.writeHead(200, { "content-type": "text/html", location: `/v1/swaps/${ID}` });
+      res.end(JSON.stringify(swap("pending")));
+    };
+    const ok = await proxy.handle(proxyRequest(`v1/swaps/${ID}`), ["v1", "swaps", ID]);
+    expect(ok.status).toBe(200);
+    expect(ok.headers.get("location")).toBeNull();
+    expect(ok.headers.get("content-type")).toBe("application/json");
   });
 
   test("a closed port is a 503 hub_unavailable", async () => {

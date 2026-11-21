@@ -109,6 +109,9 @@ export const HTTP_STATUS = {
   OK: 200,
   CREATED: 201,
   ACCEPTED: 202,
+  /** The 3xx range: redirects. */
+  REDIRECT_FIRST: 300,
+  REDIRECT_LAST: 399,
   FORBIDDEN: 403,
   NOT_FOUND: 404,
   METHOD_NOT_ALLOWED: 405,
@@ -123,7 +126,9 @@ export const HTTP_HEADER = {
   ALLOW: "allow",
   CACHE_CONTROL: "cache-control",
   CONTENT_LENGTH: "content-length",
+  CONTENT_SECURITY_POLICY: "content-security-policy",
   CONTENT_TYPE: "content-type",
+  CONTENT_TYPE_OPTIONS: "x-content-type-options",
   FORWARDED_FOR: "x-forwarded-for",
   FORWARDED_HOST: "x-forwarded-host",
   HOST: "host",
@@ -135,6 +140,9 @@ export const HTTP_HEADER = {
 
 export const JSON_CONTENT_TYPE = "application/json";
 export const NO_STORE = "no-store";
+export const NO_SNIFF = "nosniff";
+/** The proxy's answers are data: a browser that opened one as a page could run nothing in it. */
+export const API_CONTENT_SECURITY_POLICY = "default-src 'none'; sandbox";
 
 export type HttpMethod = "GET" | "POST";
 

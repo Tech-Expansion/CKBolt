@@ -1,6 +1,6 @@
 import type { IncomingHttpHeaders } from "node:http";
 import { FORWARDED_FOR_SEPARATOR, HTTP_HEADER, PROXIED_CLIENT_KEY_PATTERN, UNKNOWN_CLIENT_KEY } from "../../../common/constants/http.constants";
-import { isLocalNetworkAddress } from "../../../common/utils/network.util";
+import { clientNetworkKey, isLocalNetworkAddress } from "../../../common/utils/network.util";
 import { secretsMatch } from "../../../common/utils/secret.util";
 import type { HubConfig } from "../../../config/hub.config";
 
@@ -34,13 +34,15 @@ function lastForwardedFor(header: string | string[] | undefined): string | null 
  * The key a client is counted by, for the rate limits and the cap on unpaid swaps: the last X-Forwarded-For entry when
  * the hub sits behind a trusted proxy (HubConfig.server.trustProxy) and the request comes from a loopback or private
  * address (where that proxy runs), otherwise the socket address. A client on the internet that reaches the hub
- * directly cannot choose its key with the header, even when the proxy is trusted.
+ * directly cannot choose its key with the header, even when the proxy is trusted. An IPv6 address counts as its /64
+ * (clientNetworkKey), so one client cannot get a fresh budget from each address it owns.
  */
 export function clientKeyOf(request: ClientRequest, trustProxy: boolean): string {
   const { remoteAddress } = request.socket;
   const fromTrustedProxy = trustProxy && isLocalNetworkAddress(remoteAddress);
   const forwarded = fromTrustedProxy ? lastForwardedFor(request.headers[HTTP_HEADER.FORWARDED_FOR]) : null;
-  return forwarded ?? remoteAddress ?? UNKNOWN_CLIENT_KEY;
+  const address = forwarded ?? remoteAddress;
+  return address === undefined ? UNKNOWN_CLIENT_KEY : clientNetworkKey(address);
 }
 
 /** Whether the request carries `secret` in X-CKBolt-Proxy-Secret, compared in constant time. */

@@ -1,14 +1,15 @@
 # syntax=docker/dockerfile:1
 # Small runtime image for the release (not debug) fnn binary, so devnet timings match testnet and mainnet.
-ARG BASE_IMAGE=debian:bookworm-slim
+# Pinned by tag and digest (the digest decides what is pulled); deploy/README.md "Image digests" says how to move it.
+ARG BASE_IMAGE=debian:bookworm-20261104-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 FROM ${BASE_IMAGE} AS download
 ARG TARGETARCH
-ARG FNN_VERSION=v0.9.1
+ARG FNN_VERSION=v0.10.1
 ARG FNN_RELEASE_URL=https://github.com/nervosnetwork/fiber/releases/download
 # SHA-256 of fnn_<version>-<arch>-linux-portable.tar.gz, checked before unpacking.
-ARG FNN_SHA256_AMD64=6425bc90ce971a5b8f10bd93667227cc932ee2e50a70f584e2c07590ce446d0d
-ARG FNN_SHA256_ARM64=c52c99b06bd954244b3fb91634d5b5031c23170208e46c7738ee308cb0bd3f0c
+ARG FNN_SHA256_AMD64=a60206ba5f7056ba939cb889c9468f9892f9279c4e735ff3cdd555a692586bd7
+ARG FNN_SHA256_ARM64=015241859f52abfd3d3c3debb4081f879b97fca73700ec007488c1468e34e06b
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*

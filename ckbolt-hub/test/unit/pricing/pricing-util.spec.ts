@@ -1,4 +1,4 @@
-import { baseUnitsPerWhole, formatBaseUnits, median, roundToDecimals, toScaledInteger } from "../../../src/common/utils/pricing.util";
+import { baseUnitsPerWhole, distinctPriceSourceNames, formatBaseUnits, median, roundToDecimals, toScaledInteger } from "../../../src/common/utils/pricing.util";
 
 describe("pricing utils", () => {
   describe("median", () => {
@@ -68,6 +68,28 @@ describe("pricing utils", () => {
       [123_456_789_012n, 8, "1234.56789012"],
     ])("%s base units with %d decimals reads %s", (amount, decimals, expected) => {
       expect(formatBaseUnits(amount, decimals)).toBe(expected);
+    });
+  });
+
+  describe("distinctPriceSourceNames (PRICE_SOURCES as the hub uses them)", () => {
+    it("keeps distinct names in config order", () => {
+      expect(distinctPriceSourceNames(["kucoin", "coingecko", "binance"])).toEqual(["kucoin", "coingecko", "binance"]);
+    });
+
+    it("trims and lower-cases each name", () => {
+      expect(distinctPriceSourceNames([" CoinGecko ", "BINANCE"])).toEqual(["coingecko", "binance"]);
+    });
+
+    it("names a source once, where it first appears, however it is spelled", () => {
+      expect(distinctPriceSourceNames(["binance", "coingecko", "Binance", " binance", "coingecko"])).toEqual(["binance", "coingecko"]);
+    });
+
+    it("drops blank names", () => {
+      expect(distinctPriceSourceNames(["", "  ", "kucoin", "\t"])).toEqual(["kucoin"]);
+    });
+
+    it("gives an empty list for none", () => {
+      expect(distinctPriceSourceNames([])).toEqual([]);
     });
   });
 });

@@ -3,7 +3,8 @@
 #   docker build -f deploy/testnet/hub/Dockerfile -t ckbolt/hub:local .
 # Dockerfile.dockerignore next to this file limits the context to what the build needs (no .env, data or devnet).
 # Settings come from the environment (hub.env); the image holds no .env file. SQLite lives in the /data volume.
-ARG NODE_IMAGE=node:22-bookworm-slim
+# Pinned by tag and digest (the digest decides what is pulled); deploy/README.md "Image digests" says how to move it.
+ARG NODE_IMAGE=node:22.23.5-bookworm-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee
 
 FROM ${NODE_IMAGE} AS build
 WORKDIR /app

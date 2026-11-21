@@ -10,10 +10,12 @@ import {
   bolt11Prefix,
   checkHoldInvoice,
   checkPayoutInvoice,
+  checkSwapHoldInvoice,
   lightningUri,
   normalizeInvoice,
   outlivesQuote,
   satsToMsat,
+  type SwapHoldExpectation,
 } from "../../lib/wallets/lightning/invoice-check";
 import { LN_WALLET_MESSAGE } from "../../lib/wallets/lightning/messages";
 import { hubNetworkLabel, toNetworkFamily } from "../../lib/wallets/lightning/network";
@@ -184,7 +186,7 @@ test.describe("checkPayoutInvoice: the visitor's own invoice (CKB or RUSD to BTC
 
 test.describe("checkHoldInvoice: the hub's hold invoice must match the swap before the page shows or pays it", () => {
   const hash = randomBytes(32);
-  const swap = { amountSats: "50000", paymentHash: hash.toString("hex"), hubNetwork: "signet" };
+  const swap = { amountSats: "50000", paymentHash: hash.toString("hex"), hubNetwork: "signet", nowMs: Date.now() };
 
   test("the swap's own invoice passes, whatever the case of the hash", () => {
     const hold = invoice({ sats: 50_000, hash });
@@ -212,6 +214,118 @@ test.describe("checkHoldInvoice: the hub's hold invoice must match the swap befo
     expect(satsToMsat("19800")).toBe(BigInt(19_800_000));
     expect(satsToMsat("2100000000000000")).toBe(BigInt("2100000000000000000"));
     expect(lightningUri(text)).toBe(`lightning:${text}`);
+  });
+});
+
+test.describe("checkSwapHoldInvoice: the hub's hold invoice must be the swap the visitor accepted (BTC to CKB or a token)", () => {
+  const hash = randomBytes(32);
+  const hashHex = hash.toString("hex");
+  /** The payout invoice the page sent the hub: the browser node's, for the quote's 792 CKB. */
+  const payout = demoFiberInvoice("testnet", BigInt(79_200_000_000));
+  const hold = invoice({ sats: 2_000, hash });
+  const expected = (o: Partial<Omit<SwapHoldExpectation, "swap">> & { swap?: Partial<SwapHoldExpectation["swap"]> } = {}): SwapHoldExpectation => {
+    const { swap, ...rest } = o;
+    return {
+      acceptedSats: "2000",
+      payoutInvoice: payout,
+      payoutHash: `0x${hashHex}`,
+      hubNetwork: "signet",
+      nowMs: Date.now(),
+      ...rest,
+      swap: { amountSats: "2000", paymentHash: hashHex, payoutInvoice: payout, ...swap },
+    };
+  };
+  const ok = { ok: true, invoice: hold };
+  const mismatch = { ok: false, error: LN_WALLET_MESSAGE.HOLD_INVOICE_MISMATCH };
+
+  test("accepts the swap's own invoice: the sats accepted, the payout invoice the page sent, and that invoice's hash", () => {
+    expect(checkSwapHoldInvoice(hold, expected())).toEqual(ok);
+    expect(checkSwapHoldInvoice(` lightning:${hold} `, expected())).toEqual(ok);
+    // The node's hash in any case, with or without 0x; the payout invoice with spaces around it.
+    expect(checkSwapHoldInvoice(hold, expected({ payoutHash: hashHex.toUpperCase() }))).toEqual(ok);
+    expect(checkSwapHoldInvoice(hold, expected({ payoutInvoice: ` ${payout} ` }))).toEqual(ok);
+    // A pasted payout invoice (the visitor's own node): the browser cannot read its hash, so the rest is checked.
+    expect(checkSwapHoldInvoice(hold, expected({ payoutHash: null }))).toEqual(ok);
+  });
+
+  test("refuses another amount than the visitor accepted, even when the hub's swap and its invoice agree on it", () => {
+    // The hub's swap and invoice both say 2,001 sats; the visitor accepted 2,000.
+    expect(checkSwapHoldInvoice(invoice({ sats: 2_001, hash }), expected({ swap: { amountSats: "2001" } }))).toEqual(mismatch);
+    expect(checkSwapHoldInvoice(invoice({ sats: 1_999, hash }), expected({ swap: { amountSats: "1999" } }))).toEqual(mismatch);
+    // The swap says what was accepted, the invoice does not.
+    expect(checkSwapHoldInvoice(invoice({ sats: 2_001, hash }), expected())).toEqual(mismatch);
+    // The invoice says what was accepted, the swap does not.
+    expect(checkSwapHoldInvoice(hold, expected({ swap: { amountSats: "1999" } }))).toEqual(mismatch);
+  });
+
+  test("refuses a swap for another payout invoice than the one the page sent, with or without the node's hash", () => {
+    const other = demoFiberInvoice("testnet", BigInt(79_200_000_000));
+    expect(checkSwapHoldInvoice(hold, expected({ swap: { payoutInvoice: other } }))).toEqual(mismatch);
+    expect(checkSwapHoldInvoice(hold, expected({ payoutHash: null, swap: { payoutInvoice: other } }))).toEqual(mismatch);
+    expect(checkSwapHoldInvoice(hold, expected({ payoutInvoice: other }))).toEqual(mismatch);
+  });
+
+  test("refuses a hash that is not the payout invoice's, even when the hub's swap and its invoice agree on it", () => {
+    const otherHash = randomBytes(32);
+    const otherHold = invoice({ sats: 2_000, hash: otherHash });
+    // A hub whose hold invoice had another hash could settle the visitor's payment without paying out.
+    expect(checkSwapHoldInvoice(otherHold, expected({ swap: { paymentHash: otherHash.toString("hex") } }))).toEqual(mismatch);
+    // The invoice's hash is not the swap's.
+    expect(checkSwapHoldInvoice(otherHold, expected())).toEqual(mismatch);
+    // Without the node's hash, the invoice must still carry the swap's.
+    expect(checkSwapHoldInvoice(otherHold, expected({ payoutHash: null }))).toEqual(mismatch);
+    // No hash at all.
+    expect(checkSwapHoldInvoice(rawInvoice({ hrp: "lntbs20u", hash: null }), expected())).toEqual(mismatch);
+  });
+
+  test("refuses an expired hold invoice", () => {
+    // Made two hours ago, payable for ten minutes: no wallet can pay it, so the page does not show it.
+    const expired = invoice({ sats: 2_000, hash, timestamp: nowSeconds() - 7_200, expirySeconds: 600 });
+    expect(checkSwapHoldInvoice(expired, expected())).toEqual({ ok: false, error: LN_WALLET_MESSAGE.HOLD_INVOICE_EXPIRED });
+    expect(LN_WALLET_MESSAGE.HOLD_INVOICE_EXPIRED).toBe("The hub's invoice has expired, so CKBolt does not show it.");
+  });
+
+  test("the expiry boundary: payable until timestamp + expiry; at exactly that instant it has expired", () => {
+    const timestamp = nowSeconds() - 60;
+    const hold150 = invoice({ sats: 2_000, hash, timestamp, expirySeconds: 150 });
+    const expiresAtMs = (timestamp + 150) * 1_000;
+    const expiredLine = { ok: false, error: LN_WALLET_MESSAGE.HOLD_INVOICE_EXPIRED };
+    expect(checkSwapHoldInvoice(hold150, expected({ nowMs: expiresAtMs - 1 }))).toEqual({ ok: true, invoice: hold150 });
+    expect(checkSwapHoldInvoice(hold150, expected({ nowMs: expiresAtMs }))).toEqual(expiredLine);
+    expect(checkSwapHoldInvoice(hold150, expected({ nowMs: expiresAtMs + 1 }))).toEqual(expiredLine);
+    // checkHoldInvoice alone, the same.
+    const swap = { amountSats: "2000", paymentHash: hashHex, hubNetwork: "signet" };
+    expect(checkHoldInvoice(hold150, { ...swap, nowMs: expiresAtMs - 1 })).toEqual({ ok: true, invoice: hold150 });
+    expect(checkHoldInvoice(hold150, { ...swap, nowMs: expiresAtMs })).toEqual(expiredLine);
+  });
+
+  test("a mismatch is checked first: an expired invoice that is not the swap's says it does not match", () => {
+    const longAgo = nowSeconds() - 7_200;
+    const expiredOther = (o: { sats?: number; hash?: Buffer; network?: Network }) =>
+      invoice({ sats: o.sats ?? 2_000, hash: o.hash ?? hash, network: o.network, timestamp: longAgo, expirySeconds: 600 });
+    // The invoice itself: another amount, hash or network.
+    expect(checkSwapHoldInvoice(expiredOther({ sats: 2_001 }), expected())).toEqual(mismatch);
+    expect(checkSwapHoldInvoice(expiredOther({ hash: randomBytes(32) }), expected())).toEqual(mismatch);
+    expect(checkSwapHoldInvoice(expiredOther({ network: "regtest" }), expected())).toEqual(mismatch);
+    // The swap: not what the visitor accepted.
+    expect(checkSwapHoldInvoice(expiredOther({}), expected({ swap: { amountSats: "2001" } }))).toEqual(mismatch);
+    expect(checkSwapHoldInvoice(expiredOther({}), expected({ payoutHash: hex32() }))).toEqual(mismatch);
+    // checkHoldInvoice alone, the same order.
+    const swap = { amountSats: "2000", paymentHash: hashHex, hubNetwork: "signet", nowMs: Date.now() };
+    expect(checkHoldInvoice(expiredOther({ sats: 2_001 }), swap)).toEqual(mismatch);
+    expect(checkHoldInvoice(expiredOther({}), swap)).toEqual({ ok: false, error: LN_WALLET_MESSAGE.HOLD_INVOICE_EXPIRED });
+  });
+
+  test("refuses an invoice of another network than the hub's, and anything that is not a Lightning invoice", () => {
+    expect(checkSwapHoldInvoice(invoice({ sats: 2_000, hash, network: "regtest" }), expected())).toEqual(mismatch);
+    expect(checkSwapHoldInvoice(invoice({ sats: 2_000, hash, network: "mainnet" }), expected())).toEqual(mismatch);
+    expect(checkSwapHoldInvoice(invoice({ sats: 2_000, hash, network: "mainnet" }), expected({ hubNetwork: null }))).toEqual(mismatch);
+    const testnet = invoice({ sats: 2_000, hash, network: "testnet" });
+    expect(checkSwapHoldInvoice(testnet, expected())).toEqual(mismatch);
+    // The same invoice on the hub's own network passes.
+    expect(checkSwapHoldInvoice(testnet, expected({ hubNetwork: "testnet" }))).toEqual({ ok: true, invoice: testnet });
+    expect(checkSwapHoldInvoice(payout, expected())).toEqual(mismatch);
+    expect(checkSwapHoldInvoice("", expected())).toEqual(mismatch);
   });
 });
 

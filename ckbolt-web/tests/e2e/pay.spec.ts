@@ -216,10 +216,16 @@ test.describe("Pay a Lightning invoice: a CKB to BTC swap, exact out", () => {
     await expect(p.result.getByTestId("swap-step-1")).toHaveAttribute("data-status", "done", { timeout: STEP_TIMEOUT_MS });
     await expect(p.result.getByTestId("swap-step-1")).toContainText("Your pasted invoice");
     expect(hub.swapBodies).toEqual([expect.objectContaining({ quoteId: hub.lastQuote.id, payoutInvoice: invoice.toLowerCase() })]);
+    // The node reads the hub's hold invoice itself, then waits for the visitor's Confirm in the node, as for any payment
+    // (security review W1, W2): nothing is sent before it.
+    const request = node.getByTestId("fiber-node-confirm").getByTestId("fiber-wallet-confirm-request");
+    await expect(request).toHaveAttribute("data-kind", "swap-payment", { timeout: PAY_TIMEOUT_MS });
+    expect(await nodeCalls(node, "parse_invoice")).toEqual([{ invoice: hub.current.pay.invoice }]);
+    expect(await nodeSends(node)).toEqual([]);
+    await answerInNode({ ui: node, scope: node }, "accept");
     await expect(p.result.getByTestId("swap-step-3")).toContainText("Sent; waiting for the hub", { timeout: STEP_TIMEOUT_MS });
-    expect(await nodeCalls(node, "send_payment")).toEqual([expect.objectContaining({ invoice: hub.current.pay.invoice })]);
-    // Paying a swap's hold invoice is the swap rule's (the hub confirms it): no Confirm in the node for it.
-    expect(await nodeCalls(node, "parse_invoice")).toEqual([]);
+    // 0.5 % of 10,000 CKB at most in fees.
+    expect(await nodeSends(node)).toEqual([{ invoice: hub.current.pay.invoice, max_fee_amount: "0x12a05f200" }]);
     await expect(p.input).toHaveAttribute("readonly", "");
 
     hub.holdPayment();

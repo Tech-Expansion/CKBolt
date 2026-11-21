@@ -6,7 +6,7 @@ import { ccc } from "@ckb-ccc/core";
 import { scrypt } from "@noble/hashes/scrypt.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
-import { decodeBech32, fromWords } from "../../lib/bech32";
+import { decodeBech32, encodeBech32, fromWords, toWords } from "../../lib/bech32";
 import { HubApiError, HubClient } from "../../lib/hub/client";
 import type { HubProxyConfig } from "../../lib/hub/config";
 import { API_ERROR_CODE, API_ROUTES, type FiberNodeDto, type Script, type SwapDto, type SwapState } from "../../lib/hub/contract";
@@ -43,6 +43,7 @@ import {
   requestId,
   type MakeInvoiceParams,
   type NodePresence,
+  type PayInvoiceParams,
 } from "../../lib/wallets/fiber-browser/bridge-protocol";
 import { startBridgeServer, type BridgeHandlers } from "../../lib/wallets/fiber-browser/bridge-server";
 import { assetScript, channelAsset, channelStateLabel, ckbToShannons, hubChannels, liquidityOf } from "../../lib/wallets/fiber-browser/channels";
@@ -92,10 +93,12 @@ import {
   browserKeystoreDeps,
   decryptKeys,
   encryptKeys,
+  isWeakerKdf,
   parseKeystore,
   passwordProblem,
   scryptDerive,
   serializeKeystore,
+  strengthenKeystore,
   WrongPasswordError,
   type KdfParams,
   type KeystoreDeps,
@@ -105,10 +108,22 @@ import { fundNodeHref, readFundAddress, fiberNodePageHref, urlHost } from "../..
 import { browserNodeConfig, dialableAddresses, needsTlsPeers } from "../../lib/wallets/fiber-browser/node-config";
 import { BrowserNodeController, nodeLockName, type NodeState } from "../../lib/wallets/fiber-browser/node-controller";
 import { acquireNodeLock, isNodeLockHeld, type LockManagerLike, type NodeLockHandle } from "../../lib/wallets/fiber-browser/node-lock";
-import type { BrowserFiberNode, NewInvoiceArgs, NodeChannel, NodePayment, SendPaymentOptions } from "../../lib/wallets/fiber-browser/node-port";
+import type { BrowserFiberNode, NewInvoiceArgs, NodeChannel, NodePayment, ParsedInvoice, SendPaymentOptions } from "../../lib/wallets/fiber-browser/node-port";
 import { peerIdOf, withPeerId } from "../../lib/wallets/fiber-browser/peer-id";
 import { databasePrefix, KeystoreRepository, storageKey, webStore, type KeyValueStore } from "../../lib/wallets/fiber-browser/storage";
-import { makePayoutInvoice, payHoldInvoice, SwapRequestError, type SwapRequestDeps } from "../../lib/wallets/fiber-browser/swap-requests";
+import {
+  makePayoutInvoice,
+  prepareSwapPayment,
+  sendSwapPayment,
+  SWAP_PAYMENT_MESSAGE,
+  swapPaymentConfirmView,
+  SwapRequestError,
+  type PreparedSwapPayment,
+  type SwapRequestDeps,
+} from "../../lib/wallets/fiber-browser/swap-requests";
+import { maxFeeOf } from "../../lib/wallets/fiber-browser/payments";
+import { encodeUnsignedBolt11 } from "../../lib/bolt11";
+import { rawLightningInvoice } from "../e2e/fakes/hub";
 
 /*
  * The visitor's Fiber node in the browser (lib/wallets/fiber-browser): keys and keystore, the node config and the
@@ -258,8 +273,13 @@ class FakeNode implements BrowserFiberNode {
   async cancelInvoice() {
     return "Cancelled" as const;
   }
-  async parseInvoice(): Promise<never> {
-    throw new Error("parse_invoice is not used by swaps");
+  /** What parse_invoice reads (a swap's hold invoice), or the error it throws. */
+  parsed: ParsedInvoice | Error | string = new Error("parse_invoice is not set up in this test");
+  readonly parsedInvoices: string[] = [];
+  async parseInvoice(invoice: string): Promise<ParsedInvoice> {
+    this.parsedInvoices.push(invoice);
+    if (this.parsed instanceof Error || typeof this.parsed === "string") throw this.parsed;
+    return { ...this.parsed };
   }
   async sendPayment(invoice: string, options?: SendPaymentOptions): Promise<NodePayment> {
     this.paid.push(invoice);
@@ -319,7 +339,7 @@ test.describe("fiber-js package", () => {
     expect(pkg.dependencies["@nervosnetwork/fiber-js"]).toBe(FIBER_JS_VERSION);
     const installed = JSON.parse(readFileSync(path.join(process.cwd(), "node_modules/@nervosnetwork/fiber-js/package.json"), "utf8"));
     expect(installed.version).toBe(FIBER_JS_VERSION);
-    expect(FIBER_JS_VERSION).toBe("0.9.1");
+    expect(FIBER_JS_VERSION).toBe("0.10.1");
   });
 
   test("the browser node runs on CKB testnet only; no environment value can move it to mainnet", () => {
@@ -441,7 +461,7 @@ test.describe("keystore: keys encrypted with a password-derived key", () => {
     expect(a.ciphertext).not.toBe(b.ciphertext);
     expect(seen.map((s) => s.salt)).toEqual([a.kdf.salt, b.kdf.salt]);
     expect(seen[0]).toMatchObject({ password: PASSWORD, params: KDF_PARAMS });
-    expect(a).toMatchObject({ version: 1, network: "testnet", nodeId: null, createdAt: iso(NOW) });
+    expect(a).toMatchObject({ version: 1, network: "testnet", nodeId: null, address: null, createdAt: iso(NOW) });
   });
 
   test("round-trips the keys, and the stored record holds neither the keys nor the password", async () => {
@@ -496,12 +516,159 @@ test.describe("keystore: keys encrypted with a password-derived key", () => {
     for (const key of derivedKeys) expect(key.every((b) => b === 0)).toBe(true);
   });
 
-  test("password rules: at least the named minimum, typed twice the same", () => {
-    expect(PASSWORD_MIN_LENGTH).toBe(8);
-    expect(passwordProblem("1234567", "1234567")).toBe("Use at least 8 characters.");
-    expect(passwordProblem("", "")).toBe("Use at least 8 characters.");
-    expect(passwordProblem("12345678", "12345679")).toBe("The two passwords differ.");
-    expect(passwordProblem("12345678", "12345678")).toBeNull();
+  test("password rules: at least the named minimum (12 since W6), typed twice the same", () => {
+    expect(PASSWORD_MIN_LENGTH).toBe(12);
+    expect(passwordProblem("12345678901", "12345678901")).toBe("Use at least 12 characters.");
+    // The old minimum is not enough for a new password any more.
+    expect(passwordProblem("12345678", "12345678")).toBe("Use at least 12 characters.");
+    expect(passwordProblem("", "")).toBe("Use at least 12 characters.");
+    expect(passwordProblem("123456789012", "123456789013")).toBe("The two passwords differ.");
+    expect(passwordProblem("123456789012", "123456789012")).toBeNull();
+    expect(passwordProblem("correct horse battery", "correct horse battery")).toBeNull();
+  });
+
+  test("unlocking never checks the length: a key kept under an 8-character password still opens", async () => {
+    const keys = generateNodeKeys();
+    const short = "eight ch";
+    expect(short).toHaveLength(8);
+    const record = await encryptKeys(keys, short, "testnet", fastDeps(), FAST_KDF);
+    const opened = await decryptKeys(parseKeystore(serializeKeystore(record), "testnet")!, short, fastDeps());
+    expect(bytesToHex(opened.fiberKey)).toBe(bytesToHex(keys.fiberKey));
+    expect(bytesToHex(opened.ckbKey)).toBe(bytesToHex(keys.ckbKey));
+  });
+
+  test("isWeakerKdf: less memory (N x r) or less work (N x r x p), and no more of the other", () => {
+    const current = KDF_PARAMS;
+    const cases: [KdfParams, boolean, string][] = [
+      [FAST_KDF, true, "the fast test parameters"],
+      [{ logN: 15, r: 8, p: 1 }, true, "half of N"],
+      [{ logN: 16, r: 4, p: 1 }, true, "half of r"],
+      [{ logN: 14, r: 8, p: 4 }, true, "less memory, the same work"],
+      [{ logN: 16, r: 4, p: 2 }, true, "less memory, the same work (r and p)"],
+      [{ logN: 16, r: 8, p: 1 }, false, "today's"],
+      [{ logN: 15, r: 16, p: 1 }, false, "the same memory and work, another shape"],
+      [{ logN: 17, r: 8, p: 1 }, false, "more of both"],
+      [{ logN: 16, r: 8, p: 2 }, false, "the same memory, more work"],
+      [{ logN: 16, r: 16, p: 1 }, false, "more memory"],
+      [{ logN: 15, r: 8, p: 4 }, false, "less memory but more work: stronger in one"],
+      [{ logN: 17, r: 2, p: 1 }, true, "less memory, less work although N is larger"],
+      [{ logN: 17, r: 4, p: 1 }, false, "the same memory and work as today's"],
+    ];
+    for (const [params, weaker, name] of cases) {
+      expect(isWeakerKdf(params), name).toBe(weaker);
+      expect(isWeakerKdf(params, current), name).toBe(weaker);
+    }
+    // Against another baseline.
+    expect(isWeakerKdf({ logN: 5, r: 8, p: 1 }, { logN: 6, r: 8, p: 1 })).toBe(true);
+    expect(isWeakerKdf({ logN: 6, r: 8, p: 1 }, { logN: 6, r: 8, p: 1 })).toBe(false);
+  });
+
+  test("strengthenKeystore: a weak record under an 8-character password is encrypted again with today's parameters, same password, same node", async () => {
+    const OLD = Date.parse("2026-01-02T03:04:05.000Z");
+    const keys = generateNodeKeys();
+    const short = "eight ch";
+    const address = scriptToAddress(secpLock(), "testnet");
+    const weak = {
+      ...(await encryptKeys(keys, short, "testnet", fastDeps({ now: () => new Date(OLD) }), FAST_KDF)),
+      nodeId: BOTTLE.nodeId,
+      address,
+    };
+    const opened = await decryptKeys(weak, short, fastDeps());
+    const derived: KdfParams[] = [];
+    const deps = fastDeps({
+      now: () => new Date(NOW),
+      derive: async (password, salt, params) => {
+        derived.push(params);
+        return scryptDerive(password, salt, params);
+      },
+    });
+    const stronger = await strengthenKeystore(weak, opened, short, deps);
+    expect(stronger).not.toBeNull();
+    // One scrypt run, with today's parameters (the real cost), under the same password.
+    expect(derived).toEqual([KDF_PARAMS]);
+    expect(stronger!.kdf).toMatchObject({ name: "scrypt", ...KDF_PARAMS });
+    // A fresh salt, IV and ciphertext; the node id, its address and the creation time stay.
+    expect(stronger!.kdf.salt).not.toBe(weak.kdf.salt);
+    expect(stronger!.cipher.iv).not.toBe(weak.cipher.iv);
+    expect(stronger!.ciphertext).not.toBe(weak.ciphertext);
+    expect(stronger).toMatchObject({ version: 1, network: "testnet", nodeId: BOTTLE.nodeId, address, createdAt: iso(OLD) });
+    // It stores and reads back as it is, and the same password opens the same keys; another does not.
+    const reread = parseKeystore(serializeKeystore(stronger!), "testnet");
+    expect(reread).toEqual(stronger);
+    const again = await decryptKeys(reread!, short, fastDeps());
+    expect(bytesToHex(again.fiberKey)).toBe(bytesToHex(keys.fiberKey));
+    expect(bytesToHex(again.ckbKey)).toBe(bytesToHex(keys.ckbKey));
+    expect(await rejection(decryptKeys(reread!, "eight cH", fastDeps()))).toBeInstanceOf(WrongPasswordError);
+    // The caller's keys are not wiped: the node still starts with them.
+    expect(bytesToHex(opened.fiberKey)).toBe(bytesToHex(keys.fiberKey));
+    // Once strong, it is not encrypted again.
+    expect(await strengthenKeystore(reread!, again, short, deps)).toBeNull();
+    expect(derived).toHaveLength(1);
+  });
+
+  test("strengthenKeystore: a record as strong as today's, or stronger in one of memory and work, is left as it is", async () => {
+    const keys = generateNodeKeys();
+    const record = await encryptKeys(keys, PASSWORD, "testnet", fastDeps(), FAST_KDF);
+    let derives = 0;
+    const deps = fastDeps({
+      derive: async (password, salt, params) => {
+        derives++;
+        return scryptDerive(password, salt, params);
+      },
+    });
+    const kept: [string, KdfParams][] = [
+      ["today's", KDF_PARAMS],
+      ["less memory, more work", { logN: 15, r: 8, p: 4 }],
+      ["more memory", { logN: 17, r: 8, p: 1 }],
+      ["the same memory, more work", { logN: 16, r: 8, p: 2 }],
+      ["the same cost, another shape", { logN: 15, r: 16, p: 1 }],
+    ];
+    for (const [name, params] of kept) {
+      // Only the parameters matter here: nothing is opened or derived for a record that is not weaker.
+      const variant: KeystoreRecord = { ...record, kdf: { ...record.kdf, ...params } };
+      expect(await strengthenKeystore(variant, keys, PASSWORD, deps), name).toBeNull();
+    }
+    // Against another baseline (the params argument), the same rule.
+    expect(await strengthenKeystore({ ...record, kdf: { ...record.kdf, logN: 3, r: 8, p: 4 } }, keys, PASSWORD, deps, FAST_KDF)).toBeNull();
+    expect(derives).toBe(0);
+    const moved = await strengthenKeystore({ ...record, kdf: { ...record.kdf, logN: 3 } }, keys, PASSWORD, deps, FAST_KDF);
+    expect(moved?.kdf).toMatchObject({ ...FAST_KDF });
+    expect(derives).toBe(1);
+  });
+
+  test("the keystore's public address: kept when it is a CKB address on the record's network, else dropped without making the keys unreadable", async () => {
+    const record = await encryptKeys(generateNodeKeys(), PASSWORD, "testnet", fastDeps(), FAST_KDF);
+    const good = JSON.parse(serializeKeystore({ ...record, nodeId: BOTTLE.nodeId }));
+    const full = scriptToAddress(secpLock(), "testnet");
+    const short = encodeBech32("ckt", toWords([0x01, 0x00, ...Array(20).fill(0xab)]), "bech32");
+    const mainnet = scriptToAddress(secpLock(), "mainnet");
+    const parse = (address: unknown, network = "testnet", base = good) => parseKeystore(JSON.stringify({ ...base, address }), network);
+    expect(parse(full)).toEqual({ ...record, nodeId: BOTTLE.nodeId, address: full });
+    expect(parse(short)?.address).toBe(short);
+    // An older record has none.
+    const { address: _none, ...older } = good;
+    expect(parseKeystore(JSON.stringify(older), "testnet")).toEqual({ ...record, nodeId: BOTTLE.nodeId, address: null });
+    const dropped: [string, unknown][] = [
+      ["mainnet address on a testnet record", mainnet],
+      ["not an address", "hello"],
+      ["a cut address", full.slice(0, -4)],
+      ["one character changed", `${full.slice(0, -1)}${full.endsWith("q") ? "p" : "q"}`],
+      ["a bitcoin address", "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"],
+      ["empty", ""],
+      ["a number", 42],
+      ["an object", { address: full }],
+      ["null", null],
+    ];
+    for (const [name, address] of dropped) {
+      const parsed = parse(address);
+      expect(parsed, name).not.toBeNull();
+      expect(parsed!.address, name).toBeNull();
+      expect(parsed!.ciphertext, name).toBe(record.ciphertext);
+    }
+    // A mainnet record keeps a mainnet address and drops a testnet one.
+    const mainnetRecord = { ...good, network: "mainnet" };
+    expect(parse(mainnet, "mainnet", mainnetRecord)?.address).toBe(mainnet);
+    expect(parse(full, "mainnet", mainnetRecord)?.address).toBeNull();
   });
 
   test("reads back only well-formed records of this version and network, and drops unknown fields", async () => {
@@ -654,7 +821,7 @@ test.describe("node config", () => {
     ]);
   });
 
-  test("replaces fiber-js 0.9.1's own TCP bootnodes with WebSocket ones and stops announcing, leaving the rest of its testnet config as it is", async () => {
+  test("replaces fiber-js 0.10.1's own TCP bootnodes with WebSocket ones and stops announcing, leaving the rest of its testnet config as it is", async () => {
     const { Fiber } = await import("@nervosnetwork/fiber-js");
     // The real bundled config, without starting a node (the constructor would create workers and shared buffers).
     const original = Fiber.prototype.getDefaultConfig.call(Object.create(Fiber.prototype), "testnet", "https://rpc.example.test/");
@@ -664,6 +831,9 @@ test.describe("node config", () => {
     const edited = browserNodeConfig(original, [hub, "/dns4/thrall.fiber.channel/tcp/443/wss/p2p/Qmes1"]);
     expect(edited).toContain(`  bootnode_addrs:\n    - "${hub}"\n    - "/dns4/thrall.fiber.channel/tcp/443/wss/p2p/Qmes1"\n`);
     expect(edited).not.toContain("/tcp/8228/p2p/Qmes1EBD4yNo9Ywkfe6eRw9tG1nVNGLDmMud1xJMsoYFKy");
+    // fiber-js 0.10.1 bundles two TCP bootnodes: neither is left.
+    expect(original.match(/\/tcp\/8228\/p2p\//g)?.length).toBeGreaterThanOrEqual(2);
+    expect(edited).not.toMatch(/\/tcp\/8228\/p2p\//);
     expect(edited).toMatch(/^ {2}announce_listening_addr: false$/m);
     expect(edited).not.toMatch(/announce_listening_addr: true/);
     expect(edited).toContain("chain: testnet");
@@ -695,7 +865,7 @@ test.describe("node config", () => {
     expect(edited).toContain("  chain: testnet");
   });
 
-  test("turns fnn's automatic accept of CKB channels off in the fiber section of fiber-js 0.9.1's real testnet config, once", async () => {
+  test("turns fnn's automatic accept of CKB channels off in the fiber section of fiber-js 0.10.1's real testnet config, once", async () => {
     const { Fiber } = await import("@nervosnetwork/fiber-js");
     const original = Fiber.prototype.getDefaultConfig.call(Object.create(Fiber.prototype), "testnet", "https://rpc.example.test/");
     // fiber-js leaves it to fnn's default, the 99 CKB reserve: fnn would accept the hub's CKB channel by itself.
@@ -1509,70 +1679,285 @@ test.describe("ln_to_fiber: the node makes the payout invoice", () => {
   });
 });
 
-test.describe("fiber_to_ln: the node pays the hub's hold invoice only when the hub says so", () => {
-  const outbound = (local: bigint) => channel({ localBalance: local, remoteBalance: BigInt(0) });
-  const HOLD = swap().pay.invoice;
+/* ------------------------------------------------------------------- fiber_to_ln: the hub's hold invoice */
 
-  test("pays exactly the hub's invoice, once, after the hub confirms the swap waits for it", async () => {
+/** The visitor's own Lightning invoice the fiber_to_ln swap pays out to: the hub's hold invoice must carry its hash. */
+const PAYOUT_HASH = "aa".repeat(32);
+const OTHER_HASH = "cc".repeat(32);
+const lnInvoiceOf = (hashHex: string, sats = 19_800) =>
+  encodeUnsignedBolt11({
+    network: "signet",
+    amountSats: sats,
+    paymentHash: hexToBytes(hashHex),
+    description: "Alby Hub",
+    expirySeconds: 3_600,
+    timestamp: Math.floor(NOW / 1000),
+  });
+const PAYOUT = lnInvoiceOf(PAYOUT_HASH);
+const HOLD = swap().pay.invoice;
+const HOLD_AMOUNT = BigInt("800000000000");
+/** 0.5 % of 8,000 CKB (maxFeeOf). */
+const HOLD_MAX_FEE = BigInt(4_000_000_000);
+
+/** The swap as the hub reports it: its payout invoice is the visitor's, and its hash (aa...) that invoice's. */
+const fiberSwap = (overrides: Partial<SwapDto> = {}): SwapDto => swap({ receive: { ...swap().receive, invoice: PAYOUT }, ...overrides });
+
+/** What the swap card sends with pay-invoice: the hub's hold invoice and what the visitor accepted. */
+const payParams = (overrides: Partial<PayInvoiceParams> = {}): PayInvoiceParams => ({
+  swapId: SWAP_ID,
+  invoice: HOLD,
+  payoutInvoice: PAYOUT,
+  asset: "CKB",
+  amount: HOLD_AMOUNT.toString(),
+  ...overrides,
+});
+
+/** The hub's hold invoice as the node reads it (parse_invoice): the payout's hash, the quoted amount, the hub as payee. */
+const holdParsed = (overrides: Partial<ParsedInvoice> = {}): ParsedInvoice => ({
+  network: "testnet",
+  paymentHash: `0x${PAYOUT_HASH}`,
+  amount: HOLD_AMOUNT,
+  udtTypeScript: null,
+  createdAtMs: NOW,
+  expiresAtMs: NOW + 150_000,
+  payee: HUB_NODE.nodeId,
+  description: "CKBolt swap",
+  hashAlgorithm: "sha256",
+  ...overrides,
+});
+
+test.describe("fiber_to_ln: the node checks the hub's hold invoice against what the visitor accepted before it pays", () => {
+  const outbound = (local: bigint, udt: Script | null = null) => channel({ localBalance: local, remoteBalance: BigInt(0), udtTypeScript: udt });
+  /** A node with enough outbound CKB to the hub that reads `parsed` in the hold invoice. */
+  const holdNode = (parsed: ParsedInvoice | string = holdParsed(), channels: NodeChannel[] = [outbound(ckb(100_000))]) => {
     const node = new FakeNode();
-    node.channels = [outbound(ckb(8_000))];
-    const { deps, asked } = swapDeps(node);
-    const sent = await payHoldInvoice(deps, { swapId: SWAP_ID, invoice: HOLD });
+    node.channels = channels;
+    node.parsed = parsed;
+    return node;
+  };
+  /** Checked, then sent: what the node does once the visitor confirmed it. */
+  const payConfirmed = async (deps: SwapRequestDeps, params: PayInvoiceParams) => sendSwapPayment(deps, await prepareSwapPayment(deps, params));
+  /** prepareSwapPayment's refusal, after which nothing was paid. */
+  const refusal = async (node: FakeNode, params: PayInvoiceParams, answer: SwapDto | Error = fiberSwap(), overrides: Partial<SwapRequestDeps> = {}) => {
+    const error = await rejection(prepareSwapPayment(swapDeps(node, { swap: answer, ...overrides }).deps, params));
+    expect(node.paid).toEqual([]);
+    return error;
+  };
+  const refusedWith = (message: string) => ({ code: BRIDGE_ERROR.REFUSED, message });
+
+  test("checks the swap and reads the invoice before anything is paid; once confirmed, pays exactly that invoice with the max fee", async () => {
+    const node = holdNode();
+    const { deps, asked } = swapDeps(node, { swap: fiberSwap() });
+    const prepared = await prepareSwapPayment(deps, payParams());
     expect(asked).toEqual([SWAP_ID]);
+    expect(node.parsedInvoices).toEqual([HOLD]);
+    // Nothing is sent until the visitor confirms it in the node.
+    expect(node.paid).toEqual([]);
+    const expected: PreparedSwapPayment = {
+      swapId: SWAP_ID,
+      invoice: HOLD,
+      paymentHash: `0x${PAYOUT_HASH}`,
+      asset: "CKB",
+      amount: HOLD_AMOUNT,
+      maxFee: HOLD_MAX_FEE,
+      receiveSats: "19800",
+      expiresAtMs: NOW + 150_000,
+    };
+    expect(prepared).toEqual(expected);
+
+    const sent = await sendSwapPayment(deps, prepared);
     expect(node.paid).toEqual([HOLD]);
-    // The hub's own hold invoice: paid on the node's channel with the hub, no trampoline, no dry run, as before Pay's routes.
-    expect(node.payOptions).toEqual([undefined]);
-    expect(sent).toEqual({ paymentHash: `0x${"bb".repeat(32)}`, status: "Inflight", asset: "CKB", amount: "800000000000", lightningSats: swap().receive.amount });
+    // send_payment gets the max fee the visitor saw, and nothing else: no trampoline, no dry run.
+    expect(node.payOptions).toEqual([{ maxFeeAmount: HOLD_MAX_FEE }]);
+    expect(sent).toEqual({ paymentHash: `0x${"bb".repeat(32)}`, status: "Inflight", asset: "CKB", amount: "800000000000", lightningSats: "19800" });
+  });
+
+  test("the max fee is maxFeeOf the quoted amount: 0.5 %, rounded down, in the token's base units", async () => {
+    for (const [amount, fee, asset] of [
+      [HOLD_AMOUNT, HOLD_MAX_FEE, "CKB"],
+      [BigInt(1_999), BigInt(9), "CKB"],
+      [BigInt(199), BigInt(0), "CKB"],
+      [BigInt(3_960_000_000), BigInt(19_800_000), "RUSD"],
+    ] as const) {
+      const udt = asset === "RUSD" ? RUSD_SCRIPT : null;
+      const node = holdNode(holdParsed({ amount, udtTypeScript: udt }), [outbound(amount, udt)]);
+      const answer = fiberSwap({ asset, pay: { ...swap().pay, asset, amount: amount.toString() } });
+      const { deps } = swapDeps(node, { swap: answer });
+      const prepared = await prepareSwapPayment(deps, payParams({ asset, amount: amount.toString() }));
+      expect(prepared.maxFee, `${amount} ${asset}`).toBe(fee);
+      expect(prepared.maxFee).toBe(maxFeeOf(amount));
+      await sendSwapPayment(deps, prepared);
+      expect(node.payOptions).toEqual([{ maxFeeAmount: fee }]);
+    }
   });
 
   test("refuses an invoice the hub does not list for the swap, the wrong direction, or a Lightning pay leg", async () => {
     for (const [name, answer, invoice] of [
-      ["other invoice", swap(), "fibt800000000000attacker"],
-      ["ln_to_fiber swap", swap({ direction: "ln_to_fiber" }), HOLD],
-      ["lightning pay leg", swap({ pay: { ...swap().pay, network: "lightning" } }), HOLD],
+      ["other invoice", fiberSwap(), "fibt800000000000attacker"],
+      ["ln_to_fiber swap", fiberSwap({ direction: "ln_to_fiber" }), HOLD],
+      ["lightning pay leg", fiberSwap({ pay: { ...swap().pay, network: "lightning" } }), HOLD],
     ] as const) {
-      const node = new FakeNode();
-      node.channels = [outbound(ckb(100_000))];
-      const error = await rejection(payHoldInvoice(swapDeps(node, { swap: answer }).deps, { swapId: SWAP_ID, invoice }));
-      expect(error, name).toMatchObject({ code: BRIDGE_ERROR.REFUSED, message: "This is not the hub's Fiber invoice for that swap, so your node did not pay it." });
-      expect(node.paid, name).toEqual([]);
+      const node = holdNode();
+      const error = await refusal(node, payParams({ invoice }), answer);
+      expect(error, name).toMatchObject(refusedWith(SWAP_PAYMENT_MESSAGE.NOT_THE_SWAPS));
+      expect(node.parsedInvoices, name).toEqual([]);
     }
   });
 
   test("refuses once the swap no longer waits for a payment, whatever the state", async () => {
     const states: SwapState[] = ["incoming_accepted", "outgoing_in_flight", "outgoing_succeeded", "succeeded", "failed"];
     for (const state of states) {
-      const node = new FakeNode();
-      node.channels = [outbound(ckb(100_000))];
-      const error = await rejection(payHoldInvoice(swapDeps(node, { swap: swap({ state }) }).deps, { swapId: SWAP_ID, invoice: HOLD }));
-      expect(error, state).toMatchObject({ code: BRIDGE_ERROR.REFUSED, message: "This swap no longer waits for a payment, so your node did not pay." });
-      expect(node.paid).toEqual([]);
+      const node = holdNode();
+      expect(await refusal(node, payParams(), fiberSwap({ state })), state).toMatchObject(refusedWith(SWAP_PAYMENT_MESSAGE.NOT_PENDING));
     }
   });
 
-  test("a hub that cannot be asked means no payment", async () => {
-    const node = new FakeNode();
-    node.channels = [outbound(ckb(100_000))];
-    const error = await rejection(payHoldInvoice(swapDeps(node, { swap: new HubApiError(503, "hub_unavailable", "The CKBolt hub cannot be reached.") }).deps, { swapId: SWAP_ID, invoice: HOLD }));
-    expect(error).toMatchObject({ code: BRIDGE_ERROR.HUB_ERROR, message: expect.stringContaining("The CKBolt hub cannot be reached.") });
+  test("refuses a swap that is not the quote the visitor accepted: another token, another amount, another payout invoice", async () => {
+    const cases: [string, PayInvoiceParams, SwapDto][] = [
+      ["another token", payParams({ asset: "RUSD" }), fiberSwap()],
+      ["one shannon less", payParams({ amount: "799999999999" }), fiberSwap()],
+      ["one shannon more", payParams({ amount: "800000000001" }), fiberSwap()],
+      ["another payout invoice sent", payParams({ payoutInvoice: lnInvoiceOf(OTHER_HASH) }), fiberSwap()],
+      ["the hub pays out to another invoice", payParams(), fiberSwap({ receive: { ...swap().receive, invoice: lnInvoiceOf(OTHER_HASH) } })],
+    ];
+    for (const [name, params, answer] of cases) {
+      const node = holdNode();
+      expect(await refusal(node, params, answer), name).toMatchObject(refusedWith(SWAP_PAYMENT_MESSAGE.NOT_ACCEPTED));
+      expect(node.parsedInvoices, name).toEqual([]);
+    }
+    // The same payout invoice with spaces around it is the same invoice.
+    const node = holdNode();
+    await payConfirmed(swapDeps(node, { swap: fiberSwap() }).deps, payParams({ payoutInvoice: ` ${PAYOUT} ` }));
+    expect(node.paid).toEqual([HOLD]);
+  });
+
+  test("an invoice the node cannot read is refused with the node's reason", async () => {
+    const node = holdNode('ErrorObject { code: ServerError(-32000), message: "Invalid invoice" }');
+    const error = await refusal(node, payParams());
+    expect(error).toBeInstanceOf(SwapRequestError);
+    expect(error).toMatchObject(refusedWith(SWAP_PAYMENT_MESSAGE.UNREADABLE("Invalid invoice")));
+    expect((error as Error).message).toBe("Your node could not read the hub's invoice (Invalid invoice), so it did not pay.");
+  });
+
+  test("a payout invoice whose payment hash cannot be read is refused", async () => {
+    for (const payout of ["lntbs198u1visitor", rawLightningInvoice({ hrp: "lntbs198u", hash: null })]) {
+      const node = holdNode();
+      const answer = fiberSwap({ receive: { ...swap().receive, invoice: payout } });
+      expect(await refusal(node, payParams({ payoutInvoice: payout }), answer), payout).toMatchObject(refusedWith(SWAP_PAYMENT_MESSAGE.PAYOUT_UNREADABLE));
+    }
+  });
+
+  test("the hold invoice must carry the hash of the visitor's own Lightning invoice, and the swap's", async () => {
+    const otherPayout = lnInvoiceOf(OTHER_HASH);
+    const cases: [string, ParsedInvoice, PayInvoiceParams, SwapDto][] = [
+      // The hub's invoice is locked to another hash: it could settle without paying the visitor out.
+      ["invoice of another hash", holdParsed({ paymentHash: `0x${OTHER_HASH}` }), payParams(), fiberSwap()],
+      // The hub's swap and invoice agree, but neither is the visitor's invoice's hash.
+      [
+        "swap and invoice of another hash than the payout",
+        holdParsed(),
+        payParams({ payoutInvoice: otherPayout }),
+        fiberSwap({ receive: { ...swap().receive, invoice: otherPayout } }),
+      ],
+      // The invoice is the payout's, but the hub reports another hash for the swap.
+      ["swap of another hash", holdParsed(), payParams(), fiberSwap({ paymentHash: OTHER_HASH })],
+    ];
+    for (const [name, parsed, params, answer] of cases) {
+      const node = holdNode(parsed);
+      expect(await refusal(node, params, answer), name).toMatchObject(refusedWith(SWAP_PAYMENT_MESSAGE.WRONG_HASH));
+    }
+    // Case and 0x do not matter.
+    const node = holdNode(holdParsed({ paymentHash: `0x${PAYOUT_HASH.toUpperCase()}` }));
+    const { deps } = swapDeps(node, { swap: fiberSwap({ paymentHash: `0x${PAYOUT_HASH}` }) });
+    expect((await prepareSwapPayment(deps, payParams())).paymentHash).toBe(`0x${PAYOUT_HASH}`);
+  });
+
+  test("the hold invoice must ask for exactly the quoted amount, in the quoted token's type script", async () => {
+    const otherArgs: Script = { ...RUSD_SCRIPT, args: `0x${"01".repeat(32)}` };
+    const ckbCases: [string, ParsedInvoice][] = [
+      ["one shannon more", holdParsed({ amount: HOLD_AMOUNT + BigInt(1) })],
+      ["one shannon less", holdParsed({ amount: HOLD_AMOUNT - BigInt(1) })],
+      ["no amount", holdParsed({ amount: null })],
+      ["RUSD for a CKB swap", holdParsed({ udtTypeScript: RUSD_SCRIPT })],
+    ];
+    for (const [name, parsed] of ckbCases) {
+      expect(await refusal(holdNode(parsed), payParams()), name).toMatchObject(refusedWith(SWAP_PAYMENT_MESSAGE.WRONG_AMOUNT));
+    }
+
+    const rusdAmount = BigInt(3_960_000_000);
+    const rusdSwap = fiberSwap({ asset: "RUSD", pay: { ...swap().pay, asset: "RUSD", amount: rusdAmount.toString() } });
+    const rusdParams = payParams({ asset: "RUSD", amount: rusdAmount.toString() });
+    const rusdNode = (udt: Script | null) => holdNode(holdParsed({ amount: rusdAmount, udtTypeScript: udt }), [outbound(rusdAmount, RUSD_SCRIPT)]);
+    const rusdCases: [string, Script | null][] = [
+      ["CKB for a RUSD swap", null],
+      ["another token's args", otherArgs],
+      ["another hash type", { ...RUSD_SCRIPT, hashType: "data1" }],
+      ["another code hash", { ...RUSD_SCRIPT, codeHash: SECP_CODE_HASH }],
+    ];
+    for (const [name, udt] of rusdCases) {
+      expect(await refusal(rusdNode(udt), rusdParams, rusdSwap), name).toMatchObject(refusedWith(SWAP_PAYMENT_MESSAGE.WRONG_AMOUNT));
+    }
+    // A token the hub does not list has no script to compare with.
+    const cwbtcSwap = fiberSwap({ asset: "CWBTC", pay: { ...swap().pay, asset: "CWBTC", amount: rusdAmount.toString() } });
+    expect(await refusal(rusdNode(RUSD_SCRIPT), payParams({ asset: "CWBTC", amount: rusdAmount.toString() }), cwbtcSwap)).toMatchObject(
+      refusedWith(SWAP_PAYMENT_MESSAGE.WRONG_AMOUNT),
+    );
+    // The hub's RUSD script, whatever the case of its hex, is RUSD.
+    const node = rusdNode({ ...RUSD_SCRIPT, codeHash: RUSD_SCRIPT.codeHash.toUpperCase().replace(/^0X/, "0x"), args: RUSD_SCRIPT.args.toUpperCase().replace(/^0X/, "0x") });
+    await payConfirmed(swapDeps(node, { swap: rusdSwap }).deps, rusdParams);
+    expect(node.paid).toEqual([HOLD]);
+  });
+
+  test("the hold invoice must pay the hub's own Fiber node", async () => {
+    for (const [name, payee] of [
+      ["no payee", null],
+      ["another node", BRACER.nodeId],
+    ] as const) {
+      expect(await refusal(holdNode(holdParsed({ payee })), payParams()), name).toMatchObject(refusedWith(SWAP_PAYMENT_MESSAGE.WRONG_PAYEE));
+    }
+    // The hub's id written with 0x or in upper case is the hub's.
+    const node = holdNode(holdParsed({ payee: `0x${HUB_NODE.nodeId.toUpperCase()}` }));
+    await payConfirmed(swapDeps(node, { swap: fiberSwap() }).deps, payParams());
+    expect(node.paid).toEqual([HOLD]);
+  });
+
+  test("an expired hold invoice is refused, before the visitor is asked and again when they confirm", async () => {
+    for (const expiresAtMs of [NOW, NOW - 1]) {
+      expect(await refusal(holdNode(holdParsed({ expiresAtMs })), payParams()), String(expiresAtMs)).toMatchObject(refusedWith(SWAP_PAYMENT_MESSAGE.EXPIRED));
+    }
+    for (const expiresAtMs of [NOW + 1, null]) {
+      const node = holdNode(holdParsed({ expiresAtMs }));
+      const prepared = await prepareSwapPayment(swapDeps(node, { swap: fiberSwap() }).deps, payParams());
+      expect(prepared.expiresAtMs).toBe(expiresAtMs);
+    }
+    // Confirmed after the invoice stopped being payable: nothing is sent.
+    const node = holdNode(holdParsed({ expiresAtMs: NOW + 60_000 }));
+    const prepared = await prepareSwapPayment(swapDeps(node, { swap: fiberSwap() }).deps, payParams());
+    const late = swapDeps(node, { swap: fiberSwap(), now: () => NOW + 60_000 }).deps;
+    expect(await rejection(sendSwapPayment(late, prepared))).toMatchObject(refusedWith(SWAP_PAYMENT_MESSAGE.EXPIRED));
     expect(node.paid).toEqual([]);
   });
 
+  test("a hub that cannot be asked means no payment", async () => {
+    const node = holdNode();
+    const error = await refusal(node, payParams(), new HubApiError(503, "hub_unavailable", "The CKBolt hub cannot be reached."));
+    expect(error).toMatchObject({ code: BRIDGE_ERROR.HUB_ERROR, message: expect.stringContaining("The CKBolt hub cannot be reached.") });
+  });
+
   test("a hub whose Fiber node the page could not read is refused before the hub or the node is asked", async () => {
-    const node = new FakeNode();
-    node.channels = [outbound(ckb(100_000))];
-    const { deps, asked } = swapDeps(node, { hubNode: null });
-    expect(await rejection(payHoldInvoice(deps, { swapId: SWAP_ID, invoice: HOLD }))).toMatchObject({ code: BRIDGE_ERROR.HUB_ERROR });
+    const node = holdNode();
+    const { deps, asked } = swapDeps(node, { swap: fiberSwap(), hubNode: null });
+    expect(await rejection(prepareSwapPayment(deps, payParams()))).toMatchObject({ code: BRIDGE_ERROR.HUB_ERROR });
     expect(asked).toEqual([]);
+    expect(node.parsedInvoices).toEqual([]);
     expect(node.paid).toEqual([]);
   });
 
   test("a hold invoice of another network is never paid, even when the hub lists it for the swap", async () => {
     for (const invoice of ["fibb800000000000hubholdinvoice", "fibd800000000000hubholdinvoice", "lntbs198u1visitor"]) {
-      const node = new FakeNode();
-      node.channels = [outbound(ckb(100_000))];
-      const { deps, asked } = swapDeps(node, { swap: swap({ pay: { ...swap().pay, invoice } }) });
-      expect(await rejection(payHoldInvoice(deps, { swapId: SWAP_ID, invoice })), invoice).toMatchObject({
+      const node = holdNode();
+      const { deps, asked } = swapDeps(node, { swap: fiberSwap({ pay: { ...swap().pay, invoice } }) });
+      expect(await rejection(prepareSwapPayment(deps, payParams({ invoice }))), invoice).toMatchObject({
         code: BRIDGE_ERROR.WRONG_NETWORK,
         message: "This is not a Fiber invoice of CKB testnet, so your node did not pay it.",
       });
@@ -1582,36 +1967,46 @@ test.describe("fiber_to_ln: the node pays the hub's hold invoice only when the h
   });
 
   test("a hub on another network is refused before the hub or the node is asked", async () => {
-    const node = new FakeNode();
-    node.channels = [outbound(ckb(100_000))];
-    const { deps, asked } = swapDeps(node, { hubNode: { ...HUB_NODE, network: "mainnet" } });
-    expect(await rejection(payHoldInvoice(deps, { swapId: SWAP_ID, invoice: HOLD }))).toMatchObject({ code: BRIDGE_ERROR.WRONG_NETWORK });
+    const node = holdNode();
+    const { deps, asked } = swapDeps(node, { swap: fiberSwap(), hubNode: { ...HUB_NODE, network: "mainnet" } });
+    expect(await rejection(prepareSwapPayment(deps, payParams()))).toMatchObject({ code: BRIDGE_ERROR.WRONG_NETWORK });
     expect(asked).toEqual([]);
     expect(node.paid).toEqual([]);
   });
 
-  test("outbound equal to the hub's amount pays; one shannon short is refused without paying", async () => {
-    const node = new FakeNode();
-    node.channels = [outbound(BigInt("799999999999"))];
-    expect(await rejection(payHoldInvoice(swapDeps(node).deps, { swapId: SWAP_ID, invoice: HOLD }))).toMatchObject({
+  test("outbound equal to the quoted amount pays; one shannon short is refused without paying", async () => {
+    const node = holdNode(holdParsed(), [outbound(HOLD_AMOUNT - BigInt(1))]);
+    expect(await refusal(node, payParams())).toMatchObject({
       code: BRIDGE_ERROR.NO_OUTBOUND,
       message: expect.stringContaining("Receive it first: ask the hub for a channel on the node page"),
     });
-    expect(node.paid).toEqual([]);
-    node.channels = [outbound(BigInt("800000000000"))];
-    await payHoldInvoice(swapDeps(node).deps, { swapId: SWAP_ID, invoice: HOLD });
+    node.channels = [outbound(HOLD_AMOUNT)];
+    await payConfirmed(swapDeps(node, { swap: fiberSwap() }).deps, payParams());
     expect(node.paid).toEqual([HOLD]);
   });
 
   test("a payment the node reports Failed, or that throws, is a node error", async () => {
-    const node = new FakeNode();
-    node.channels = [outbound(ckb(100_000))];
+    const node = holdNode();
+    const deps = () => swapDeps(node, { swap: fiberSwap() }).deps;
     node.payment = { status: "Failed", failedError: "Failed to build route" };
-    expect(await rejection(payHoldInvoice(swapDeps(node).deps, { swapId: SWAP_ID, invoice: HOLD }))).toMatchObject({ code: BRIDGE_ERROR.NODE_ERROR, message: "Failed to build route" });
+    expect(await rejection(payConfirmed(deps(), payParams()))).toMatchObject({ code: BRIDGE_ERROR.NODE_ERROR, message: "Failed to build route" });
     node.payment = { status: "Failed", failedError: null };
-    expect(await rejection(payHoldInvoice(swapDeps(node).deps, { swapId: SWAP_ID, invoice: HOLD }))).toMatchObject({ message: "Your node could not send the payment." });
+    expect(await rejection(payConfirmed(deps(), payParams()))).toMatchObject({ message: "Your node could not send the payment." });
     node.payment = 'ErrorObject { code: ServerError(-32000), message: "Peer not connected" }';
-    expect(await rejection(payHoldInvoice(swapDeps(node).deps, { swapId: SWAP_ID, invoice: HOLD }))).toMatchObject({ code: BRIDGE_ERROR.NODE_ERROR, message: "Peer not connected" });
+    expect(await rejection(payConfirmed(deps(), payParams()))).toMatchObject({ code: BRIDGE_ERROR.NODE_ERROR, message: "Peer not connected" });
+  });
+
+  test("the Confirm page's view: the amount and token, what the visitor gets in sats, the max fee and the expiry; nothing secret", async () => {
+    const node = holdNode();
+    const prepared = await prepareSwapPayment(swapDeps(node, { swap: fiberSwap() }).deps, payParams());
+    const view = swapPaymentConfirmView(prepared);
+    expect(view).toEqual({ kind: "swap-payment", asset: "CKB", amount: "800000000000", maxFee: "4000000000", receiveSats: "19800", expiresAt: NOW + 150_000 });
+    // No invoice, hash or payee: the page shows the hub by name.
+    expect(JSON.stringify(view)).not.toContain(HOLD);
+    expect(JSON.stringify(view)).not.toContain(PAYOUT_HASH);
+
+    const rusd = swapPaymentConfirmView({ ...prepared, asset: "RUSD", amount: BigInt(3_960_000_000), maxFee: BigInt(19_800_000), receiveSats: "9801", expiresAtMs: null });
+    expect(rusd).toEqual({ kind: "swap-payment", asset: "RUSD", amount: "3960000000", maxFee: "19800000", receiveSats: "9801", expiresAt: null });
   });
 });
 
@@ -1705,7 +2100,7 @@ test.describe("bridge protocol", () => {
     const good = request("id1", { method: BRIDGE_METHOD.MAKE_INVOICE, params: invoiceParams() });
     expect(parseRequest(good)).toEqual(good);
     expect(parseRequest(request("s", { method: BRIDGE_METHOD.STATUS }))).toEqual({ v: 1, kind: "request", id: "s", method: "status" });
-    expect(parseRequest(request("p", { method: BRIDGE_METHOD.PAY_INVOICE, params: { swapId: SWAP_ID, invoice: "fibt1" } }))?.method).toBe("pay-invoice");
+    expect(parseRequest(request("p", { method: BRIDGE_METHOD.PAY_INVOICE, params: payParams() }))?.method).toBe("pay-invoice");
     const bad: unknown[] = [
       null,
       "x",
@@ -1723,8 +2118,8 @@ test.describe("bridge protocol", () => {
       { ...good, params: { ...invoiceParams(), amount: 5 } },
       { ...good, params: { ...invoiceParams(), network: 1 } },
       { ...good, params: undefined },
-      { v: 1, kind: "request", id: "p", method: "pay-invoice", params: { swapId: "", invoice: "fibt1" } },
-      { v: 1, kind: "request", id: "p", method: "pay-invoice", params: { swapId: SWAP_ID } },
+      { v: 1, kind: "request", id: "p", method: "pay-invoice", params: { ...payParams(), swapId: "" } },
+      { v: 1, kind: "request", id: "p", method: "pay-invoice", params: { ...payParams(), invoice: undefined } },
     ];
     for (const value of bad) expect(parseRequest(value), JSON.stringify(value)).toBeNull();
     // Any well-formed id passes the bridge: the hub's list says which it serves (a new token needs no web change), and
@@ -1735,6 +2130,40 @@ test.describe("bridge protocol", () => {
     }
     expect(requestId({ ...good, params: undefined })).toBe("id1");
     expect(requestId({ ...good, v: 2 })).toBeNull();
+  });
+
+  test("pay-invoice carries what the visitor accepted: the payout invoice, a token id and a positive amount, or it is not read", () => {
+    const pay = (params: unknown) => ({ v: 1, kind: "request", id: "p", method: BRIDGE_METHOD.PAY_INVOICE, params });
+    const good = pay(payParams());
+    expect(parseRequest(good)).toEqual(good);
+    for (const amount of ["1", "9".repeat(30), "800000000000"]) {
+      expect(parseRequest(pay(payParams({ amount }))), amount).toEqual(pay(payParams({ amount })));
+    }
+    for (const asset of ["CKB", "RUSD", "CWBTC"]) expect(parseRequest(pay(payParams({ asset }))), asset).not.toBeNull();
+    const { payoutInvoice: _p, ...noPayout } = payParams();
+    const { asset: _a, ...noAsset } = payParams();
+    const { amount: _m, ...noAmount } = payParams();
+    const bad: [string, unknown][] = [
+      // The old shape, without what the visitor accepted.
+      ["old shape", { swapId: SWAP_ID, invoice: HOLD }],
+      ["no payout invoice", noPayout],
+      ["empty payout invoice", { ...payParams(), payoutInvoice: "" }],
+      ["payout invoice not text", { ...payParams(), payoutInvoice: 7 }],
+      ["no asset", noAsset],
+      ["lower-case asset", { ...payParams(), asset: "ckb" }],
+      ["asset not an id", { ...payParams(), asset: "C-KB" }],
+      ["no amount", noAmount],
+      ["zero", { ...payParams(), amount: "0" }],
+      ["leading zero", { ...payParams(), amount: "0800" }],
+      ["negative", { ...payParams(), amount: "-1" }],
+      ["decimal", { ...payParams(), amount: "1.5" }],
+      ["exponent", { ...payParams(), amount: "1e9" }],
+      ["spaces", { ...payParams(), amount: " 800 " }],
+      ["31 digits", { ...payParams(), amount: "1".repeat(31) }],
+      ["a number", { ...payParams(), amount: 800 }],
+      ["no params", undefined],
+    ];
+    for (const [name, params] of bad) expect(parseRequest(pay(params)), name).toBeNull();
   });
 
   test("accepts only responses with a known error code", () => {
@@ -1812,10 +2241,42 @@ test.describe("bridge between the swap form and the node tab", () => {
     expect(bus.openCount).toBe(0);
   });
 
+  test("pay-invoice waits for the visitor's Confirm in the node and then the send: confirmTimeoutMs + paymentTimeoutMs", async () => {
+    const timing = { ...FAST_BRIDGE, paymentTimeoutMs: 150, confirmTimeoutMs: 400 };
+    const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    // A node that answers after the payment's own timeout, but within confirm + payment: the answer is taken.
+    const bus = new FakeBus();
+    const asked: PayInvoiceParams[] = [];
+    const stop = startBridgeServer(
+      handlers({
+        payInvoice: async (params) => {
+          asked.push(params);
+          await wait(350);
+          return { paymentHash: "0xpaid", status: "Inflight" };
+        },
+      }),
+      bus.factory,
+    );
+    expect(await new BridgeClient(bus.factory, timing).payInvoice(payParams())).toEqual({ paymentHash: "0xpaid", status: "Inflight" });
+    // The params arrive intact, with what the visitor accepted.
+    expect(asked).toEqual([payParams()]);
+    stop();
+
+    // No answer at all: a timeout, only after both have passed.
+    const silent = new FakeBus();
+    const started = Date.now();
+    const error = await rejection(new BridgeClient(silent.factory, timing).payInvoice(payParams()));
+    const waited = Date.now() - started;
+    expect(error).toMatchObject({ code: BRIDGE_ERROR.TIMEOUT });
+    expect(waited).toBeGreaterThanOrEqual(timing.confirmTimeoutMs + timing.paymentTimeoutMs - 20);
+    expect(waited).toBeLessThan(timing.confirmTimeoutMs + timing.paymentTimeoutMs + 1_000);
+    expect(silent.openCount).toBe(0);
+  });
+
   test("without BroadcastChannel the swap form finds no node", async () => {
     const client = new BridgeClient(() => null, FAST_BRIDGE);
     expect(await client.status()).toBeNull();
-    expect(await rejection(client.payInvoice({ swapId: SWAP_ID, invoice: "fibt1" }))).toMatchObject({ code: BRIDGE_ERROR.NO_NODE });
+    expect(await rejection(client.payInvoice(payParams()))).toMatchObject({ code: BRIDGE_ERROR.NO_NODE });
     expect(startBridgeServer(handlers(), () => null)).toBeInstanceOf(Function);
   });
 
@@ -1869,7 +2330,7 @@ test.describe("bridge between the swap form and the node tab", () => {
     expect(await rejection(client.makeInvoice(invoiceParams()))).toMatchObject({ code: "node_error", message: "boom" });
     mode = "garbage";
     expect(await rejection(client.makeInvoice(invoiceParams()))).toMatchObject({ code: "node_error", message: "Your Fiber node sent an answer CKBolt could not read." });
-    expect(await rejection(client.payInvoice({ swapId: SWAP_ID, invoice: "fibt1" }))).toMatchObject({ code: "refused", message: "not the hub's invoice" });
+    expect(await rejection(client.payInvoice(payParams()))).toMatchObject({ code: "refused", message: "not the hub's invoice" });
     stop();
   });
 

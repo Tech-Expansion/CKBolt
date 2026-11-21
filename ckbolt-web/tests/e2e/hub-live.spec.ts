@@ -18,6 +18,8 @@ const tab = (page: Page, name: RegExp) => page.getByRole("tab", { name });
 const TAB = { receive: /Get paid/, pay: /^Pay/, swap: /^Swap/ } as const;
 const HUB_UNAVAILABLE = "The CKBolt testnet hub is not available right now. Try again later.";
 const HUB_DEGRADED = "The CKBolt testnet hub is reachable but not taking swaps right now.";
+/** A light page of the site that runs scripts, for requests made from a page of one site or another. */
+const LIGHT_PAGE = "/app/guide";
 
 async function routeRate(page: Page) {
   await page.route("**/api/rate", (route) => route.fulfill({ json: RATE }));
@@ -265,7 +267,8 @@ test.describe("hub proxy on the server under test (no HUB_URL)", () => {
     // Another site: this same server under another host name, which the browser counts as a different site.
     const otherSite = baseURL!.replace("localhost", "127.0.0.1");
     expect(otherSite).not.toBe(baseURL);
-    await page.goto(`${otherSite}/api/hub/v1/admin`);
+    // A page of each site that runs scripts: a proxy answer no longer can (its sandbox CSP, security review W8).
+    await page.goto(`${otherSite}${LIGHT_PAGE}`);
     const forged = page.waitForResponse(quotes);
     await page.evaluate(
       ({ url, body }) => {
@@ -281,7 +284,7 @@ test.describe("hub proxy on the server under test (no HUB_URL)", () => {
     expect(res.status()).toBe(403);
 
     // The app's own page: same origin, JSON. It passes the guard and meets the missing hub.
-    await page.goto(`${baseURL}/api/hub/v1/admin`);
+    await page.goto(`${baseURL}${LIGHT_PAGE}`);
     const own = await page.evaluate(
       async ({ url, body }) => {
         const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body });

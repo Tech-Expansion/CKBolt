@@ -12,6 +12,18 @@ export const SWAP_CARD = {
   longAmountChars: 12,
   /** Characters kept at each end of a shortened hash or id. */
   shortHashChars: 10,
+  /**
+   * BTC to CKB or a token: how long after the swap the hold invoice may wait unpaid before the run says why that can be.
+   * On testnet, a payment that never reaches the hub is nearly always a wallet with no route to it; one that does
+   * arrives within seconds.
+   */
+  noPaymentHintAfterMs: 45_000,
+  /**
+   * The hub's hold invoice expires with its quote, but in whole seconds, and the hub counts one ending up to
+   * HOLD_INVOICE_EXPIRY_TOLERANCE_SECONDS (5) early as the quote expiring. Its expiry is judged only until this long
+   * before the quote's; from there the quote's expiry says what happened.
+   */
+  holdExpiryGraceMs: 5_000,
 } as const;
 
 /** The two directions, each the other's flip. */

@@ -53,7 +53,14 @@ export class MarketPriceService {
   private async fetchMarketPrice(): Promise<MarketPrice> {
     const samples = await this.fetchAll();
     const now = this.clock.now();
-    const price = aggregateMarketPrice(samples, { now, maxAgeMs: this.config.pricing.maxPriceAgeMs });
+    const { maxPriceAgeMs, minSources, maxSpreadBps } = this.config.pricing;
+    const price = aggregateMarketPrice(samples, { now, maxAgeMs: maxPriceAgeMs }, { minSources, maxSpreadBps });
+    const unpriced = PRICED_COINS.filter((coin) => price[coin] === null);
+    if (unpriced.length > 0) {
+      this.logger.warn(
+        `No agreed ${unpriced.join(", ")} price: fewer than ${minSources} fresh sources, or they differ by more than ${maxSpreadBps} bps`,
+      );
+    }
     if (!hasAnyCoinPrice(price)) throw PRICING_ERROR.noFreshPrice();
     this.cached = { price, fetchedAt: now };
     return price;

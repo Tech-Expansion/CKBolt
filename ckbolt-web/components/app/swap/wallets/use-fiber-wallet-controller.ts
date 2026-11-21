@@ -71,9 +71,11 @@ export function useFiberWalletController(hubNetwork: string | null, watching: bo
     [wallet],
   );
 
+  const payoutHashOf = useCallback((invoice: string) => wallet.payoutHashOf(invoice), [wallet]);
+
   const api = useMemo<FiberWalletApi>(
-    () => ({ ...state, choose, disconnect, makeInvoice, payInvoice }),
-    [state, choose, disconnect, makeInvoice, payInvoice],
+    () => ({ ...state, choose, disconnect, makeInvoice, payInvoice, payoutHashOf }),
+    [state, choose, disconnect, makeInvoice, payInvoice, payoutHashOf],
   );
   const node = useMemo(() => ({ view, check: bridge.check }), [view, bridge.check]);
   return { api, node, client: bridge.client };

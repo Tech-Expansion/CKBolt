@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import { parseEnv } from "node:util";
-import { KIT_SECRET_BYTES, LND_WALLET_PASSWORD_BYTES } from "../scripts/lib/constants";
+import { KIT_FILE, KIT_SECRET_BYTES, LND_WALLET_PASSWORD_BYTES, SECRET_FILE_MODE } from "../scripts/lib/constants";
 import {
   envCompletionScript,
   envEntries,
@@ -248,13 +248,32 @@ describe("writing the .env on the server (real sh)", () => {
     }
   });
 
-  it("lists the hub.env.example keys a server's hub.env lacks, never touching set values", () => {
-    const current = "HUB_HOST=0.0.0.0\nSWAP_MAX_SATS=15000\n";
-    const missing = missingEnvLines(hubExampleText, current);
+  it("lists the hub.env.example keys a server's hub.env lacks, from the key names a probe found, never touching set values", () => {
+    const missing = missingEnvLines(hubExampleText, ["HUB_HOST", "SWAP_MAX_SATS"]);
     assert.ok(missing.includes("FIBER_INBOUND_ENABLED=true"));
     assert.ok(!missing.some((line) => line.startsWith("SWAP_MAX_SATS=")));
     assert.ok(!missing.some((line) => line.startsWith("HUB_HOST=")));
-    assert.deepEqual(missingEnvLines(hubExampleText, hubExampleText), []);
+    assert.deepEqual(missingEnvLines(hubExampleText, envEntries(hubExampleText).keys()), []);
+    assert.deepEqual(missingEnvLines(hubExampleText, []), [...envEntries(hubExampleText)].map(([key, value]) => `${key}=${value}`));
+  });
+
+  it("counts a key the server's hub.env has with an empty value as present: it is not appended a second time", () => {
+    assert.ok(!missingEnvLines(hubExampleText, ["HUB_PROXY_SECRET"]).some((line) => line.startsWith("HUB_PROXY_SECRET=")));
+  });
+
+  it("takes the key names from a real probe of hub.env, which prints no value", { skip: SHELL }, () => {
+    const dir = tempDir();
+    try {
+      writeFileSync(join(dir, KIT_FILE.HUB_ENV), "HUB_HOST=0.0.0.0\nHUB_PROXY_SECRET=probe-secret-value\nSWAP_MAX_SATS=\n# FIBER_INBOUND_ENABLED=true\n");
+      const run = runLocalSh(envProbeScript(KIT_FILE.HUB_ENV, []), dir);
+      assert.equal(run.status, 0, run.stderr);
+      assert.doesNotMatch(run.stdout, /probe-secret-value|0\.0\.0\.0/);
+      const missing = missingEnvLines(hubExampleText, parseEnvProbe(run.stdout, []).keys());
+      for (const key of ["HUB_HOST", "HUB_PROXY_SECRET", "SWAP_MAX_SATS"]) assert.ok(!missing.some((line) => line.startsWith(`${key}=`)), key);
+      assert.ok(missing.includes("FIBER_INBOUND_ENABLED=true"), "a commented-out key is missing");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -277,20 +296,46 @@ describe("PUBLIC_IP from the SSH host", () => {
   });
 });
 
+/** hub.env holds HUB_PROXY_SECRET and alert webhook tokens: `testnet env` creates it owner-only and keeps it so. */
+const CREATE_HUB_ENV = `(umask 077 && cp ${KIT_FILE.HUB_ENV_EXAMPLE} ${KIT_FILE.HUB_ENV})`;
+const CHMOD_HUB_ENV = `chmod ${SECRET_FILE_MODE} ${KIT_FILE.HUB_ENV}`;
+const APPEND_HUB_ENV = `cat >> ${KIT_FILE.HUB_ENV}`;
+const KIT_ON_SERVER = "/opt/ckbolt/testnet";
+
+/** The scripts `testnet env` ran in the kit folder, without the `cd <kit> && ` prefix, in order. */
+const kitScripts = (runner: FakeRunner): string[] =>
+  runner.scripts().flatMap((script) => {
+    const bare = withoutKitDir(script, KIT_ON_SERVER);
+    return bare === null ? [] : [bare];
+  });
+
+/** Asserts `later` ran, and ran after `earlier`. */
+function assertRanAfter(scripts: readonly string[], earlier: string, later: string): void {
+  const first = scripts.indexOf(earlier);
+  assert.ok(first >= 0, `${earlier} ran`);
+  assert.ok(scripts.indexOf(later, first + 1) > first, `${later} ran after ${earlier}`);
+}
+
 /** A fake server for `testnet env`: the kit folder holds `files` (name -> text); probes run against them. */
 function envServer(files: Record<string, string>) {
   const runner = new FakeRunner();
   runner.on((call) => {
     if (call.command === "ssh" && call.args[0] === "-G") return result("hostname 203.0.113.77\n");
-    const script = call.script === null ? null : withoutKitDir(call.script, "/opt/ckbolt/testnet");
+    const script = call.script === null ? null : withoutKitDir(call.script, KIT_ON_SERVER);
     if (script === null) return undefined;
     const test = /^test -e (\S+)$/.exec(script);
     if (test?.[1]) return result("", test[1] in files ? 0 : 1);
-    if (script.startsWith("if [ -f .env ]; then awk")) {
-      const lines = Object.entries(parseEnv(files[".env"] ?? "")).map(([key, value]) => `${key}\t${value ? "set" : "empty"}\t${readable.includes(key) ? value : ""}`);
+    // envProbeScript on any file: key, set or empty, and the value of the keys the probe may read (none for hub.env).
+    const probe = /^if \[ -f (\S+) \]; then awk -v readable=(\S*) /.exec(script);
+    if (probe?.[1] !== undefined) {
+      const readableKeys = (probe[2] ?? "").replace(/^'|'$/g, "").split(",").filter(Boolean);
+      const lines = Object.entries(parseEnv(files[probe[1]] ?? "")).map(([key, value]) => `${key}\t${value ? "set" : "empty"}\t${readableKeys.includes(key) ? value : ""}`);
       return result(lines.join("\n"));
     }
-    if (script === "cat hub.env") return result(files["hub.env"] ?? "");
+    // hub.env holds HUB_PROXY_SECRET: nothing may print it back.
+    if (/\b(cat|head|tail|less|more|grep|sed|awk)\b[^|>]*\bhub\.env\b/.test(script) && !script.startsWith("cat >> ")) {
+      return result("", 1, "the test server refuses to print hub.env");
+    }
     return undefined;
   });
   return runner;
@@ -312,7 +357,7 @@ describe("testnet env", () => {
     assert.doesNotMatch(completion, /BITCOIND_RPC_PASSWORD|BITCOIND_RPC_USER/, "the sync's credentials are not touched");
     assert.match(completion, /QUOTE_SIGNING_KEY .*\/dev\/urandom/);
     assert.match(completion, /PUBLIC_IP 203\.0\.113\.7/);
-    assert.ok(scripts.some((script) => script.endsWith("cp hub.env.example hub.env")), "hub.env created from the example");
+    assert.ok(kitScripts(runner).includes(CREATE_HUB_ENV), "hub.env created from the example with umask 077");
     for (const node of ["lnd-hub", "lnd-demo"]) {
       assert.ok(scripts.some((script) => script.includes(`secrets/wallet/${node}.password`) && script.includes("/dev/urandom")), `${node} password`);
     }
@@ -321,6 +366,45 @@ describe("testnet env", () => {
     assert.match(log, /QUOTE_SIGNING_KEY generated on the server/);
     assert.doesNotMatch(log, /syncpasswordsecret/);
     assert.ok(runner.calls.every((call) => !call.input.includes("syncpasswordsecret") && !(call.script ?? "").includes("syncpasswordsecret")));
+  });
+
+  it("makes a hub.env it creates owner-only: umask 077 for the copy, then chmod 600", async () => {
+    const runner = envServer({ ".env.example": exampleText, ".env": SYNC_ENV });
+    const { ctx } = testContext({ runner, settings: testSettings({ DEPLOY_PUBLIC_IP: "203.0.113.7" }) });
+    await completeKitEnv(ctx);
+    assertRanAfter(kitScripts(runner), CREATE_HUB_ENV, CHMOD_HUB_ENV);
+  });
+
+  it("makes a hub.env it completes owner-only too: chmod 600 after the append, for one an older kit left world-readable", async () => {
+    const runner = envServer({ ".env.example": exampleText, ".env": SYNC_ENV, "hub.env": "SWAP_MAX_SATS=15000\n" });
+    const { ctx } = testContext({ runner, settings: testSettings({ DEPLOY_PUBLIC_IP: "203.0.113.7" }) });
+    await completeKitEnv(ctx);
+    const scripts = kitScripts(runner);
+    assert.ok(!scripts.includes(CREATE_HUB_ENV), "an existing hub.env is not copied over");
+    assertRanAfter(scripts, APPEND_HUB_ENV, CHMOD_HUB_ENV);
+  });
+
+  it("makes hub.env owner-only even when it already has every key", async () => {
+    const complete = [...envEntries(exampleText)].map(([key, value]) => `${key}=${value || "x"}`).join("\n");
+    const runner = envServer({ ".env.example": exampleText, ".env": complete.replace("PUBLIC_IP=x", "PUBLIC_IP=203.0.113.7"), "hub.env": hubExampleText });
+    const { ctx } = testContext({ runner });
+    await completeKitEnv(ctx);
+    assert.equal(kitScripts(runner).filter((script) => script === CHMOD_HUB_ENV).length, 1);
+  });
+
+  it("leaves a created hub.env with mode 600 when its commands run in a real shell", { skip: SHELL || (process.platform === "win32" && "no POSIX modes") }, () => {
+    const dir = tempDir();
+    try {
+      writeFileSync(join(dir, KIT_FILE.HUB_ENV_EXAMPLE), hubExampleText);
+      for (const script of [CREATE_HUB_ENV, CHMOD_HUB_ENV]) {
+        const run = runLocalSh(script, dir);
+        assert.equal(run.status, 0, run.stderr);
+      }
+      assert.equal(statSync(join(dir, KIT_FILE.HUB_ENV)).mode & 0o777, 0o600);
+      assert.equal(readFileSync(join(dir, KIT_FILE.HUB_ENV), "utf8"), hubExampleText);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("takes PUBLIC_IP from the SSH host when DEPLOY_PUBLIC_IP is not set", async () => {
@@ -355,11 +439,37 @@ describe("testnet env", () => {
     assert.ok(!runner.scripts().some((script) => script.includes("sed -i") || script.startsWith("cat >>")));
   });
 
+  it("completes hub.env from its key names only: it never prints or reads hub.env's content back", async () => {
+    const secret = "proxy-secret-that-stays-on-the-server";
+    const runner = envServer({ ".env.example": exampleText, ".env": SYNC_ENV, "hub.env": `SWAP_MAX_SATS=15000\nHUB_PROXY_SECRET=${secret}\n` });
+    const { ctx, logger } = testContext({ runner, settings: testSettings({ DEPLOY_PUBLIC_IP: "203.0.113.7" }) });
+    const readTexts: string[] = [];
+    const readText = ctx.kit.readText.bind(ctx.kit);
+    ctx.kit.readText = (path: string) => {
+      readTexts.push(path);
+      return readText(path);
+    };
+    await completeKitEnv(ctx);
+    assert.ok(!readTexts.includes(KIT_FILE.HUB_ENV), "no readText of hub.env");
+    const hubEnvScripts = kitScripts(runner).filter((script) => script.includes(KIT_FILE.HUB_ENV));
+    const probe = envProbeScript(KIT_FILE.HUB_ENV, []);
+    for (const script of hubEnvScripts) {
+      assert.ok([probe, `test -e ${KIT_FILE.HUB_ENV}`, APPEND_HUB_ENV, CHMOD_HUB_ENV].includes(script), `a script that may print hub.env: ${script}`);
+    }
+    assert.ok(hubEnvScripts.includes(probe), "hub.env's keys were probed, with no readable key");
+    const append = runner.calls.find((call) => call.script?.endsWith(APPEND_HUB_ENV));
+    assert.ok(append, "the missing keys were still appended");
+    assert.match(append.input, /FIBER_INBOUND_ENABLED=true/);
+    assert.doesNotMatch(append.input, /^(SWAP_MAX_SATS|HUB_PROXY_SECRET)=/m, "keys hub.env has are not appended again");
+    assert.ok(!logger.text().includes(secret));
+    assert.ok(runner.calls.every((call) => !call.input.includes(secret) && !(call.script ?? "").includes(secret)));
+  });
+
   it("appends only the keys a newer hub.env.example added", async () => {
     const runner = envServer({ ".env.example": exampleText, ".env": SYNC_ENV, "hub.env": "SWAP_MAX_SATS=15000\n" });
     const { ctx } = testContext({ runner, settings: testSettings({ DEPLOY_PUBLIC_IP: "203.0.113.7" }) });
     await completeKitEnv(ctx);
-    const append = runner.calls.find((call) => call.script?.endsWith("cat >> hub.env"));
+    const append = runner.calls.find((call) => call.script?.endsWith(APPEND_HUB_ENV));
     assert.ok(append, "hub.env was appended to");
     assert.match(append.input, /FIBER_INBOUND_ENABLED=true/);
     assert.doesNotMatch(append.input, /SWAP_MAX_SATS=/);

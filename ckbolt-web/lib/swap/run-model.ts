@@ -143,7 +143,7 @@ function payPart({ direction, swap, progress, pay, expired }: RunInput): Part {
     case "idle":
       return expired ? part("failed", STEP_LINE.EXPIRED) : part("active", STEP_LINE.PAYING);
     case "paying":
-      return part("active", STEP_LINE.PAYING);
+      return part("active", direction === "fiber_to_ln" ? STEP_LINE.CONFIRM_IN_NODE : STEP_LINE.PAYING);
     case "sent":
     case "uncertain":
       return part("active", STEP_LINE.SENT);

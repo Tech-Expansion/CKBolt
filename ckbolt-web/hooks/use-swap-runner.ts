@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { SWAP_CARD } from "@/lib/swap/constants";
 import { ManualFiberStep, type FiberWalletApi } from "@/components/app/swap/contracts";
 import type { HealthDto, QuoteDto, SwapDto } from "@/lib/hub/contract";
 import { RUN_ERROR } from "@/lib/swap/copy";
@@ -25,7 +26,8 @@ import {
   type StepView,
 } from "@/lib/swap/run-model";
 import { webStore } from "@/lib/wallets/fiber-browser/storage";
-import { checkHoldInvoice } from "@/lib/wallets/lightning/invoice-check";
+import { checkSwapHoldInvoice } from "@/lib/wallets/lightning/invoice-check";
+import { LN_WALLET_MESSAGE } from "@/lib/wallets/lightning/messages";
 import { weblnPayStore, type WeblnPayStore } from "@/lib/wallets/lightning/pay-store";
 import { useHubSwap, type CancelTokenSink } from "./use-hub-swap";
 import { useWebln } from "./use-webln";
@@ -66,6 +68,13 @@ export interface SwapRun {
   browserWallet: { error: ShortError | null } | null;
   /** The last read of the swap failed; reading goes on. */
   pollError: boolean;
+  /**
+   * CKB or a token to BTC, paid by the browser node: the node checked the hub's invoice and waits for the visitor's Confirm
+   * on its own page (the header's popup, the node's window or the node page).
+   */
+  confirmInNode: boolean;
+  /** BTC to CKB or a token: the hold invoice has waited SWAP_CARD.noPaymentHintAfterMs with nothing paid. */
+  noPaymentYet: boolean;
 }
 
 export interface SwapRunner {
@@ -132,16 +141,33 @@ export function useSwapRunner({ fiber, health, nowMs, webln: weblnStore = weblnP
   const lightningNetwork = health?.lightning.network ?? null;
   const fiberNetwork = health?.fiber.network ?? null;
 
-  // The hub's Lightning hold invoice (ln_to_fiber), checked against the swap before the page shows it or a wallet pays it.
+  // The hub's Lightning hold invoice (ln_to_fiber), checked against what the visitor accepted (the quote, the payout
+  // invoice the page sent and its hash) before the page shows it or a wallet pays it.
   const holdInvoice = swap?.pay.network === "lightning" ? swap.pay.invoice : null;
   const holdSats = swap?.pay.network === "lightning" ? swap.pay.amount : null;
   const paymentHash = swap?.paymentHash ?? null;
+  const swapPayout = swap?.receive.invoice ?? null;
+  const acceptedSats = plan?.quote.direction === "ln_to_fiber" ? plan.quote.pay.amount : null;
+  const sentPayout = invoice.status === "made" ? invoice.invoice : null;
+  const payoutHash = sentPayout ? (fiber.payoutHashOf?.(sentPayout) ?? null) : null;
+  // Until shortly before the quote's own expiry: there the quote expiring explains it, not the hub's invoice.
+  const quoteExpiresAtMs = Date.parse(swap?.quoteExpiresAt ?? plan?.quote.expiresAt ?? "");
+  const holdCheckNowMs = Number.isNaN(quoteExpiresAtMs) ? nowMs : Math.min(nowMs, quoteExpiresAtMs - SWAP_CARD.holdExpiryGraceMs);
   const holdCheck = useMemo(
     () =>
       holdInvoice && holdSats && paymentHash
-        ? checkHoldInvoice(holdInvoice, { amountSats: holdSats, paymentHash, hubNetwork: lightningNetwork })
+        ? acceptedSats && sentPayout && swapPayout
+          ? checkSwapHoldInvoice(holdInvoice, {
+              acceptedSats,
+              payoutInvoice: sentPayout,
+              payoutHash,
+              swap: { amountSats: holdSats, paymentHash, payoutInvoice: swapPayout },
+              hubNetwork: lightningNetwork,
+              nowMs: holdCheckNowMs,
+            })
+          : { ok: false as const, error: LN_WALLET_MESSAGE.HOLD_INVOICE_MISMATCH }
         : null,
-    [holdInvoice, holdSats, paymentHash, lightningNetwork],
+    [holdInvoice, holdSats, paymentHash, swapPayout, acceptedSats, sentPayout, payoutHash, lightningNetwork, holdCheckNowMs],
   );
 
   const attempt = paymentHash ? webln.attempts[paymentHash.toLowerCase()] : undefined;
@@ -187,10 +213,17 @@ export function useSwapRunner({ fiber, health, nowMs, webln: weblnStore = weblnP
 
   /** CKB or a token to BTC: the Fiber node pays the hub's Fiber hold invoice (the browser node; the own node by hand). */
   async function payHoldInvoice(current: () => boolean) {
-    if (swap?.pay.network !== "fiber") return;
+    if (swap?.pay.network !== "fiber" || !plan || invoice.status !== "made") return;
     setFiberPay(PAYING);
     try {
-      await fiber.payInvoice({ swapId: swap.id, invoice: swap.pay.invoice });
+      // What the visitor accepted goes with it: the node checks the hub's invoice against it, then asks for Confirm.
+      await fiber.payInvoice({
+        swapId: swap.id,
+        invoice: swap.pay.invoice,
+        payoutInvoice: invoice.invoice,
+        asset: plan.quote.asset,
+        amount: plan.quote.pay.amount,
+      });
       if (current()) setFiberPay(SENT);
     } catch (e) {
       if (current()) setFiberPay(e instanceof ManualFiberStep ? MANUAL : fiberPayFailure(e));
@@ -279,6 +312,9 @@ export function useSwapRunner({ fiber, health, nowMs, webln: weblnStore = weblnP
     manualInvoice,
     browserWallet: direction === "ln_to_fiber" && manualInvoice && webln.available ? { error: browserPayError(attempt) } : null,
     pollError: hubSwap.pollError !== null,
+    confirmInNode: direction === "fiber_to_ln" && fiberPay.status === "paying",
+    noPaymentYet:
+      direction === "ln_to_fiber" && manualInvoice !== null && swap !== null && nowMs - Date.parse(swap.createdAt) >= SWAP_CARD.noPaymentHintAfterMs,
   };
   return { run, start, retry, payInBrowser, reset };
 }

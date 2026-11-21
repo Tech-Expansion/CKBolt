@@ -127,9 +127,12 @@ export class BridgeClient {
     return result;
   }
 
-  /** fiber_to_ln: asks the node to pay the hub's hold invoice; throws BridgeError. */
+  /**
+   * fiber_to_ln: asks the node to pay the hub's hold invoice, which it does only once the visitor confirmed it in the
+   * node; throws BridgeError.
+   */
   async payInvoice(params: PayInvoiceParams): Promise<PayInvoiceResult> {
-    const result = await this.first({ method: BRIDGE_METHOD.PAY_INVOICE, params }, this.timing.paymentTimeoutMs);
+    const result = await this.first({ method: BRIDGE_METHOD.PAY_INVOICE, params }, this.timing.confirmTimeoutMs + this.timing.paymentTimeoutMs);
     if (!isPayInvoiceResult(result)) throw new BridgeError(BRIDGE_ERROR.NODE_ERROR, UNREADABLE_MESSAGE);
     return result;
   }

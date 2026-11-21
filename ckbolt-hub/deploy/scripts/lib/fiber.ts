@@ -7,7 +7,7 @@ import type { Script } from "../../../src/domain/types";
 import { FNN_ADMIN_METHOD, FNN_RPC_CURL_TIMEOUT_SECONDS, MULTIADDR_PEER_ID_PROTOCOL, type FnnService } from "./constants";
 import type { RemoteKit } from "./kit";
 
-/* fnn v0.9.1 JSON-RPC shapes (snake_case, u64/u128 as 0x hex), only the fields the scripts read. */
+/* fnn v0.10.1 JSON-RPC shapes (snake_case, u64/u128 as 0x hex), only the fields the scripts read. */
 
 export interface FnnScript {
   code_hash: string;

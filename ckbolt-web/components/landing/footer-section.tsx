@@ -3,6 +3,8 @@
 import { ArrowUpRight } from "lucide-react";
 import { SiteLink } from "@/components/site-link";
 import { GUIDE_PAGE_PATH } from "@/components/app/guide/constants";
+import { BrandMark } from "@/components/brand/brand-mark";
+import { BRAND_KIT_PAGE_PATH, BRAND_PAGE_PATH } from "@/lib/brand/kit";
 import { AnimatedWave } from "./animated-wave";
 
 const footerLinks = {
@@ -16,6 +18,12 @@ const footerLinks = {
     { name: "Architecture", href: "/#architecture" },
     { name: "Roadmap", href: "/#roadmap" },
     { name: "FAQ", href: "/#faq" },
+  ],
+  Brand: [
+    { name: "Brand guidelines", href: BRAND_PAGE_PATH },
+    { name: "Brand kit", href: BRAND_KIT_PAGE_PATH },
+    { name: "Logo files", href: `${BRAND_KIT_PAGE_PATH}#logos` },
+    { name: "Color tokens", href: `${BRAND_KIT_PAGE_PATH}#tokens` },
   ],
   Developers: [
     { name: "Nervos docs", href: "https://docs.nervos.org" },
@@ -36,6 +44,7 @@ const footerLinks = {
 };
 
 const socialLinks = [
+  { name: "X (CKBolt)", href: "https://x.com/CKBoltNetwork" },
   { name: "X (TEX Labs)", href: "https://x.com/texlabsorg/" },
   { name: "TEX Labs", href: "https://texlabs.org" },
 ];
@@ -51,20 +60,20 @@ export function FooterSection() {
       <div className="relative z-10 max-w-[1400px] mx-auto px-6 lg:px-12">
         {/* Main Footer */}
         <div className="py-16 lg:py-24">
-          <div className="grid grid-cols-2 md:grid-cols-6 gap-12 lg:gap-8">
+          <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-12 lg:gap-8">
             {/* Brand Column */}
-            <div className="col-span-2">
-              <SiteLink href="/" className="inline-flex items-center gap-2 mb-6">
-                <span className="text-2xl font-display">CKBolt</span>
-                <span className="text-xs text-muted-foreground font-mono">Prototype</span>
+            <div className="col-span-2 md:col-span-4 lg:col-span-2">
+              <SiteLink href="/" className="inline-flex items-center gap-2.5 mb-6">
+                <BrandMark className="w-[22px] h-auto shrink-0" />
+                <span className="text-2xl font-display tracking-tight">CKBolt</span>
               </SiteLink>
 
               <p className="text-muted-foreground leading-relaxed mb-8 max-w-xs">
-                Pay, get paid and swap between Bitcoin Lightning and CKB. A prototype by TEX Labs.
+                Pay, get paid and swap between Bitcoin Lightning and CKB.
               </p>
 
               {/* Social Links */}
-              <div className="flex gap-6">
+              <div className="flex flex-wrap gap-x-6 gap-y-3">
                 {socialLinks.map((link) => (
                   <a
                     key={link.name}

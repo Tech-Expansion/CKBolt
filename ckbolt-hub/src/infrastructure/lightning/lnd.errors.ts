@@ -77,12 +77,19 @@ export const isPaymentNotFound = (info: LndErrorInfo): boolean =>
 
 const describeLndError = (info: LndErrorInfo): string => info.details || info.name;
 
+/** What a user reads of a BOLT11 invoice the hub cannot use, after the reason when there is one the hub wrote. */
+const LN_INVOICE_UNREADABLE = "This Lightning invoice cannot be read";
+const LN_INVOICE_HINT = "Check that it is a complete BOLT11 invoice.";
+
+/** The user reads a fixed sentence; the call and LND's own text are the error's log-only detail. */
 export class LndUnavailableError extends HubError {
   constructor(
     readonly rpc: string,
     readonly info: LndErrorInfo,
   ) {
-    super(`The Lightning node is unavailable (${rpc}). Try again in a moment.`, HttpStatus.SERVICE_UNAVAILABLE, API_ERROR_CODE.UPSTREAM_UNAVAILABLE);
+    super("The Lightning node is unavailable. Try again in a moment.", HttpStatus.SERVICE_UNAVAILABLE, API_ERROR_CODE.UPSTREAM_UNAVAILABLE, {
+      detail: `${rpc}: ${describeLndError(info)}`,
+    });
     this.name = "LndUnavailableError";
   }
 }
@@ -97,15 +104,21 @@ export class LndRpcError extends Error {
   }
 }
 
+/**
+ * `detail` says why the invoice cannot be read, for logs only: it is often LND's own text. `reason` is a clause the hub
+ * wrote itself, which the user may read; without it the user reads a fixed sentence.
+ */
 export class LnInvoiceInvalidError extends HubError {
-  constructor(readonly detail: string) {
-    super(`This Lightning invoice cannot be read (${detail}). Check that it is a complete BOLT11 invoice.`, HttpStatus.BAD_REQUEST, API_ERROR_CODE.INVOICE_INVALID);
+  constructor(detail: string, reason?: string) {
+    const unreadable = reason === undefined ? LN_INVOICE_UNREADABLE : `${LN_INVOICE_UNREADABLE} (${reason})`;
+    super(`${unreadable}. ${LN_INVOICE_HINT}`, HttpStatus.BAD_REQUEST, API_ERROR_CODE.INVOICE_INVALID, { detail });
     this.name = "LnInvoiceInvalidError";
   }
 
   static unknownPrefix(): LnInvoiceInvalidError {
     const prefixes = BOLT11_PREFIXES.map(({ prefix }) => prefix).join(", ");
-    return new LnInvoiceInvalidError(`it does not start with one of ${prefixes}`);
+    const reason = `it does not start with one of ${prefixes}`;
+    return new LnInvoiceInvalidError(reason, reason);
   }
 }
 

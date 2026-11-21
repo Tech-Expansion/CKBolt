@@ -1,3 +1,4 @@
+import { OperatorEvents, type OperatorEvent } from "../../../src/application/monitoring/operator-events";
 import type { FiberPort } from "../../../src/application/ports/fiber.port";
 import type { LightningPort } from "../../../src/application/ports/lightning.port";
 import type { CreatedSwap, CreateSwapInput, SwapEngine } from "../../../src/application/swaps/swap-engine.contract";
@@ -48,14 +49,14 @@ interface SchedulerHarness {
   scheduler: SwapSchedulerService;
 }
 
-function makeScheduler(ports: { lightning?: LightningPort; fiber?: FiberPort } = {}): SchedulerHarness {
+function makeScheduler(ports: { lightning?: LightningPort; fiber?: FiberPort; events?: OperatorEvents } = {}): SchedulerHarness {
   const clock = new FakeClock();
   const store = new FakeSwapStore(clock);
   const engine = new StubEngine(store);
   const lightning = new FakeLightningNetwork("regtest", clock).node("hub");
   const fiber = new FakeFiberNetwork("devnet", clock).node("hub");
   const config = swapConfig({ swaps: { pollIntervalMs: POLL_MS } });
-  const scheduler = new SwapSchedulerService(engine, store, ports.lightning ?? lightning, ports.fiber ?? fiber, config);
+  const scheduler = new SwapSchedulerService(engine, store, ports.lightning ?? lightning, ports.fiber ?? fiber, config, ports.events);
   return { clock, store, engine, lightning, fiber, scheduler };
 }
 
@@ -112,6 +113,56 @@ describe("SwapSchedulerService", () => {
     await s.scheduler.onModuleDestroy();
     jest.useRealTimers();
     jest.restoreAllMocks();
+  });
+
+  describe("pass events for the hub's monitor (OperatorEvents)", () => {
+    let heard: OperatorEvent[];
+
+    beforeEach(async () => {
+      await s.scheduler.onModuleDestroy();
+      const events = new OperatorEvents();
+      heard = [];
+      events.on((event) => heard.push(event));
+      s = makeScheduler({ events });
+    });
+
+    it("emits swap-pass-ok after each pass that succeeds, the recovery pass included", async () => {
+      await s.scheduler.onModuleInit();
+      expect(heard).toEqual([{ kind: "swap-pass-ok" }]);
+
+      await jest.advanceTimersByTimeAsync(POLL_MS);
+      expect(heard).toEqual([{ kind: "swap-pass-ok" }, { kind: "swap-pass-ok" }]);
+    });
+
+    it("emits swap-pass-failed with the error after a pass that fails, and swap-pass-ok after the next that succeeds", async () => {
+      s.engine.processOpenSwaps.mockRejectedValueOnce(new Error("store locked"));
+
+      await s.scheduler.onModuleInit();
+      expect(heard).toEqual([{ kind: "swap-pass-failed", detail: "store locked" }]);
+
+      await jest.advanceTimersByTimeAsync(POLL_MS);
+      expect(heard.at(-1)).toEqual({ kind: "swap-pass-ok" });
+    });
+
+    it("emits nothing for the work a node update starts: only passes over every open swap count", async () => {
+      const swap = seedSwap(s.store, "incoming_accepted");
+      await s.scheduler.onModuleInit();
+      heard.length = 0;
+
+      s.lightning.emit(swap.paymentHash);
+      await jest.advanceTimersByTimeAsync(POLL_MS - 1);
+
+      expect(s.engine.processSwap).toHaveBeenCalledWith(swap.id);
+      expect(heard).toEqual([]);
+    });
+
+    it("runs without events when built bare (no MonitoringModule)", async () => {
+      await s.scheduler.onModuleDestroy();
+      s = makeScheduler();
+
+      await expect(s.scheduler.onModuleInit()).resolves.toBeUndefined();
+      expect(s.engine.processOpenSwaps).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe("polling", () => {

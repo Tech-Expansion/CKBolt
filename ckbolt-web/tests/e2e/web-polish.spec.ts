@@ -313,3 +313,77 @@ test.describe("hub error codes are shown as plain sentences", () => {
     }
   });
 });
+
+/* -------------------------------------------------------------------- the proxy's answers are inert JSON (W8) */
+
+test.describe("the real proxy answers JSON that cannot run as a page (security review W8)", () => {
+  /** The proxy's own answers on a server without HUB_URL: no hub, a method a path does not take, a path that is none. */
+  const CASES = [
+    { method: "GET", path: "v1/health", status: 503 },
+    { method: "POST", path: "v1/health", status: 405 },
+    { method: "GET", path: "v1/admin", status: 404 },
+    { method: "GET", path: "v1/swaps/not-a-swap-id", status: 404 },
+  ] as const;
+
+  test("every answer is application/json, never sniffed and never cached", async ({ request }) => {
+    for (const c of CASES) {
+      const res = await request.fetch(`/api/hub/${c.path}`, { method: c.method, maxRedirects: 0 });
+      const what = `${c.method} ${c.path}`;
+      expect(res.status(), what).toBe(c.status);
+      const headers = res.headers();
+      expect(headers["content-type"], what).toBe("application/json");
+      expect(headers["x-content-type-options"], what).toBe("nosniff");
+      expect(headers["cache-control"], what).toBe("no-store");
+      expect(headers.location, what).toBeUndefined();
+      expect(typeof (await res.json()).error.code, what).toBe("string");
+    }
+  });
+
+  test("every answer carries the proxy's sandbox CSP, so a browser that opens one as a page runs nothing in it", async ({ request }) => {
+    for (const c of CASES) {
+      const res = await request.fetch(`/api/hub/${c.path}`, { method: c.method, maxRedirects: 0 });
+      const what = `${c.method} ${c.path}`;
+      const headers = res.headersArray();
+      // One policy, the proxy's own: no page rule adds another.
+      expect(headers.filter((h) => h.name.toLowerCase() === "content-security-policy").map((h) => h.value), what).toEqual(["default-src 'none'; sandbox"]);
+      expect(headers.filter((h) => h.name.toLowerCase() === "x-frame-options"), what).toEqual([]);
+      // The site-wide headers still apply.
+      expect(res.headers()["referrer-policy"], what).toBe("strict-origin-when-cross-origin");
+      expect(res.headers()["permissions-policy"], what).toBe("camera=(self), microphone=(), geolocation=()");
+    }
+  });
+
+  test("in a real browser, a proxy answer opened as a page is inert: an opaque origin, no script runs, nothing can be fetched", async ({ page }) => {
+    await page.goto("/api/hub/v1/admin");
+    expect(await page.evaluate(() => window.origin)).toBe("null");
+    const ran = await page.evaluate(() => {
+      const script = document.createElement("script");
+      script.textContent = "window.__ckboltRan = true";
+      document.documentElement.appendChild(script);
+      return (window as unknown as { __ckboltRan?: boolean }).__ckboltRan === true;
+    });
+    expect(ran).toBe(false);
+    expect(await page.evaluate(() => fetch("/api/hub/v1/health").then(() => "fetched", () => "refused"))).toBe("refused");
+  });
+
+  test("pages keep their framing headers: DENY and frame-ancestors 'none' everywhere, SAMEORIGIN and 'self' for /app/wallet", async ({ request }) => {
+    for (const path of ["/", "/app", "/app/guide", "/app/fiber/fund"]) {
+      const res = await request.get(path);
+      expect(res.status(), path).toBe(200);
+      expect(res.headers()["x-frame-options"], path).toBe("DENY");
+      expect(res.headers()["content-security-policy"], path).toBe("frame-ancestors 'none'; object-src 'none'; base-uri 'self'; form-action 'self'");
+      expect(res.headers()["x-content-type-options"], path).toBe("nosniff");
+    }
+    // The two node pages get proxy.ts's strict policy (W4, tests/e2e/node-csp.spec.ts), which keeps their framing rule
+    // and the same object, base and form rules.
+    const node = await request.get("/app/fiber");
+    expect(node.status()).toBe(200);
+    expect(node.headers()["x-frame-options"]).toBe("DENY");
+    expect(node.headers()["content-security-policy"]).toMatch(/^default-src 'self'; .*; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'$/);
+    expect(node.headers()["x-content-type-options"]).toBe("nosniff");
+    const wallet = await request.get("/app/wallet");
+    expect(wallet.status()).toBe(200);
+    expect(wallet.headers()["x-frame-options"]).toBe("SAMEORIGIN");
+    expect(wallet.headers()["content-security-policy"]).toMatch(/^default-src 'self'; .*; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'$/);
+  });
+});

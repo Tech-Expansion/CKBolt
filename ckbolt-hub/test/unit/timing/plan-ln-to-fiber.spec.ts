@@ -31,27 +31,30 @@ import {
  */
 describe("timing: planLnToFiber", () => {
   describe("worked examples", () => {
-    it("mutinynet: a 160-minute payout delta plus one 4 h hop fits an LDK payer with a channel to the hub (C = 861)", () => {
-      // F_max = 160 + 240 + 10 = 410 min; 410 min / 30 s = 820 blocks; 820 + 18 + 20 + 3 = 861; 861 + 80 = 941 <= 1008.
+    it("mutinynet: a 160-minute payout delta plus one 4 h hop fits an LDK payer with a channel to the hub (C = 901)", () => {
+      // F_max = 160 + 240 + 10 = 410 min; 410 min / 30 s = 820 blocks; 820 + 18 + 60 + 3 = 901; 901 + 80 = 981 <= 1008.
       const plan = expectPlan(planLnToFiber(profile("mutinynet"), { payoutFinalExpiryDeltaMs: minutes(160) }));
 
-      expect(plan).toEqual({ ok: true, holdCltvExpiry: 861, payoutTlcExpiryLimitMs: minutes(410) });
+      expect(plan).toEqual({ ok: true, holdCltvExpiry: 901, payoutTlcExpiryLimitMs: minutes(410) });
       expect(plan.holdCltvExpiry + LDK_SHADOW_ROUTE_RESERVE_BLOCKS).toBeLessThanOrEqual(PAYER_MAX_CLTV_LDK);
     });
 
     it("mutinynet: an LDK payer one LSP hop away cannot fit, so only LDK's reserve is budgeted", () => {
-      // What Alby Hub met with a channel from Megalith: 861 + 80 + 144 = 1085 > 1008 (RouteNotFound).
+      // What Alby Hub met with a channel from Megalith (then 861 + 80 + 144 = 1085): now 901 + 80 + 144 = 1125 > 1008.
+      // 1008 - 901 - 80 = 27 blocks are left for forwarding hops: not even the faucet's 80 fits.
+      const { holdCltvExpiry } = expectPlan(planLnToFiber(profile("mutinynet"), { payoutFinalExpiryDeltaMs: minutes(160) }));
       expect(profile("mutinynet").payerRouteBudgetBlocks).toBe(LDK_SHADOW_ROUTE_RESERVE_BLOCKS);
-      expect(861 + LDK_SHADOW_ROUTE_RESERVE_BLOCKS + LSP_TIME_LOCK_DELTA_BLOCKS).toBeGreaterThan(PAYER_MAX_CLTV_LDK);
+      expect(holdCltvExpiry + LDK_SHADOW_ROUTE_RESERVE_BLOCKS + LSP_TIME_LOCK_DELTA_BLOCKS).toBe(1125);
+      expect(PAYER_MAX_CLTV_LDK - holdCltvExpiry - LDK_SHADOW_ROUTE_RESERVE_BLOCKS).toBe(27);
     });
 
-    it("mutinynet: two 4 h hops need 1341 blocks and are refused with a reason naming the numbers", () => {
-      // F_max = 160 + 480 + 10 = 650 min = 1300 blocks; 1300 + 41 = 1341; with LDK's 80-block reserve 1421 > 1008.
+    it("mutinynet: two 4 h hops need 1381 blocks and are refused with a reason naming the numbers", () => {
+      // F_max = 160 + 480 + 10 = 650 min = 1300 blocks; 1300 + 18 + 60 + 3 = 1381; with LDK's 80-block reserve 1461 > 1008.
       const twoHops = profileWith("mutinynet", { maxFiberHops: 2 });
       const reason = expectRefusal(planLnToFiber(twoHops, { payoutFinalExpiryDeltaMs: minutes(160) }));
 
-      expect(reason).toContain("1341");
-      expect(reason).toContain("1421");
+      expect(reason).toContain("1381");
+      expect(reason).toContain("1461");
       expect(reason).toContain(String(PAYER_MAX_CLTV_LDK));
     });
 
@@ -72,10 +75,11 @@ describe("timing: planLnToFiber", () => {
       expect(plan).toEqual({ ok: true, holdCltvExpiry: 869, payoutTlcExpiryLimitMs: minutes(410) });
     });
 
-    it("mutinynet with LND's holdexpirydelta set to 85: C = 928 still fits LDK's reserve under 1008 blocks, 86 would not", () => {
-      // 820 + 85 + 20 + 3 = 928, + 80 = 1008; with 86: 929 + 80 = 1009 > 1008.
-      expect(expectPlan(planLnToFiber(profileWith("mutinynet", { lndHoldExpiryDeltaBlocks: 85 }), { payoutFinalExpiryDeltaMs: minutes(160) })).holdCltvExpiry).toBe(928);
-      expect(expectRefusal(planLnToFiber(profileWith("mutinynet", { lndHoldExpiryDeltaBlocks: 86 }), { payoutFinalExpiryDeltaMs: minutes(160) }))).toContain("1009");
+    it("mutinynet with LND's holdexpirydelta set to 45: C = 928 still fits LDK's reserve under 1008 blocks, 46 would not", () => {
+      // 820 + 45 + 60 + 3 = 928, + 80 = 1008; with 46: 929 + 80 = 1009 > 1008. (85 and 86 with the 20-block margin used
+      // before 2026-11-13: the 40 extra margin blocks come out of LND's holdexpirydelta headroom.)
+      expect(expectPlan(planLnToFiber(profileWith("mutinynet", { lndHoldExpiryDeltaBlocks: 45 }), { payoutFinalExpiryDeltaMs: minutes(160) })).holdCltvExpiry).toBe(928);
+      expect(expectRefusal(planLnToFiber(profileWith("mutinynet", { lndHoldExpiryDeltaBlocks: 46 }), { payoutFinalExpiryDeltaMs: minutes(160) }))).toContain("1009");
     });
 
     it.each(["mainnet", "testnet"] as const)("%s: 160 min + two hops + 15 min margin gives C = 115", (name) => {
@@ -93,12 +97,12 @@ describe("timing: planLnToFiber", () => {
     });
 
     it("a direct channel (maxFiberHops 0) budgets no hop delta", () => {
-      // F_max = 160 + 10 = 170 min = 340 blocks; 340 + 41 = 381.
+      // F_max = 160 + 10 = 170 min = 340 blocks; 340 + 18 + 60 + 3 = 421.
       const direct = profileWith("mutinynet", { maxFiberHops: 0 });
 
       expect(planLnToFiber(direct, { payoutFinalExpiryDeltaMs: minutes(160) })).toEqual({
         ok: true,
-        holdCltvExpiry: 381,
+        holdCltvExpiry: 421,
         payoutTlcExpiryLimitMs: minutes(170),
       });
     });
@@ -123,11 +127,14 @@ describe("timing: planLnToFiber", () => {
   });
 
   describe("payer CLTV cap", () => {
-    // mutinynet: C = ceil(F / 30 s) + 41, and C + 80 <= 1008 -> F <= 887 blocks x 30 s = 26,610 s; F = delta + 250 min.
-    const largestDeltaMs = 887 * fastBlockMs(profile("mutinynet")) - minutes(250);
+    // mutinynet: C = ceil(F / 30 s) + 18 + 60 + 3, and C + 80 <= 1008 -> F <= 847 blocks x 30 s = 25,410 s = 423.5 min;
+    // F = delta + 250 min, so the largest payout delta is 173.5 min (193.5 with the 20-block margin before 2026-11-13).
+    const largestDeltaMs = 847 * fastBlockMs(profile("mutinynet")) - minutes(250);
 
     it("accepts the largest payout delta whose C plus the payer's route budget equals payerMaxCltv exactly", () => {
       const plan = expectPlan(planLnToFiber(profile("mutinynet"), { payoutFinalExpiryDeltaMs: largestDeltaMs }));
+
+      expect(largestDeltaMs).toBe(minutes(173.5));
 
       expect(plan.holdCltvExpiry).toBe(928);
       expect(plan.holdCltvExpiry + profile("mutinynet").payerRouteBudgetBlocks).toBe(PAYER_MAX_CLTV_LDK);
@@ -141,17 +148,20 @@ describe("timing: planLnToFiber", () => {
 
     it("follows the profile's payerMaxCltv (a config tunable), not a fixed number", () => {
       const lndPayers = profileWith("mutinynet", { maxFiberHops: 2, payerMaxCltv: PAYER_MAX_CLTV_LND });
-      const strictPayers = profileWith("mutinynet", { payerMaxCltv: 940 });
+      // Two hops: 1381 blocks (see above) fit LND's 2016. One hop: C = 901, + 80 = 981, so a cap of 981 is the edge.
+      const edgePayers = profileWith("mutinynet", { payerMaxCltv: 981 });
+      const strictPayers = profileWith("mutinynet", { payerMaxCltv: 980 });
 
-      expect(expectPlan(planLnToFiber(lndPayers, { payoutFinalExpiryDeltaMs: minutes(160) })).holdCltvExpiry).toBe(1341);
-      expect(expectRefusal(planLnToFiber(strictPayers, { payoutFinalExpiryDeltaMs: minutes(160) }))).toContain("941");
+      expect(expectPlan(planLnToFiber(lndPayers, { payoutFinalExpiryDeltaMs: minutes(160) })).holdCltvExpiry).toBe(1381);
+      expect(expectPlan(planLnToFiber(edgePayers, { payoutFinalExpiryDeltaMs: minutes(160) })).holdCltvExpiry).toBe(901);
+      expect(expectRefusal(planLnToFiber(strictPayers, { payoutFinalExpiryDeltaMs: minutes(160) }))).toContain("981");
     });
 
     it("follows the profile's payerRouteBudgetBlocks (PAYER_ROUTE_BUDGET_BLOCKS), not a fixed number", () => {
-      // C = 861 on mutinynet: a 147-block budget makes exactly 1008, 148 makes 1009.
-      expectPlan(planLnToFiber(profileWith("mutinynet", { payerRouteBudgetBlocks: 147 }), { payoutFinalExpiryDeltaMs: minutes(160) }));
-      const reason = expectRefusal(planLnToFiber(profileWith("mutinynet", { payerRouteBudgetBlocks: 148 }), { payoutFinalExpiryDeltaMs: minutes(160) }));
-      expect(reason).toContain("148 blocks for the payer's route");
+      // C = 901 on mutinynet: a 107-block budget makes exactly 1008, 108 makes 1009.
+      expectPlan(planLnToFiber(profileWith("mutinynet", { payerRouteBudgetBlocks: 107 }), { payoutFinalExpiryDeltaMs: minutes(160) }));
+      const reason = expectRefusal(planLnToFiber(profileWith("mutinynet", { payerRouteBudgetBlocks: 108 }), { payoutFinalExpiryDeltaMs: minutes(160) }));
+      expect(reason).toContain("108 blocks for the payer's route");
       expect(reason).toContain("1009");
     });
   });
@@ -206,15 +216,17 @@ describe("timing: planLnToFiber", () => {
 
   describe("rounding and integer results", () => {
     it("rounds blocks up, so the hold never runs out before the Fiber lock (7 s fast blocks)", () => {
-      // 410 min = 24,600 s / 7 s = 3514.29 -> 3515 blocks; 3515 + 18 + 20 + 3 = 3556.
-      const odd = profileWith("mutinynet", { btcFastBlockSeconds: 7, payerMaxCltv: 10_000 });
+      // 410 min = 24,600 s / 7 s = 3514.29 -> 3515 blocks; 3515 + 18 + 20 + 3 = 3556. lnMarginBlocks is pinned at 20:
+      // this checks the rounding, not Mutinynet's margin (the worked examples above do that).
+      const odd = profileWith("mutinynet", { btcFastBlockSeconds: 7, payerMaxCltv: 10_000, lnMarginBlocks: 20 });
 
       expect(expectPlan(planLnToFiber(odd, { payoutFinalExpiryDeltaMs: minutes(160) })).holdCltvExpiry).toBe(3556);
     });
 
     it("rounds the payout limit down to whole ms and sizes C from that limit", () => {
-      // F = 400 min + 10.7 ms -> 24,000,010 ms; ceil(24,000,010 / 30,000) = 801; 801 + 41 = 842.
-      const fractional = profileWith("mutinynet", { fiberMarginMs: 10.7 });
+      // F = 400 min + 10.7 ms -> 24,000,010 ms; ceil(24,000,010 / 30,000) = 801; 801 + 18 + 20 + 3 = 842 (lnMarginBlocks
+      // pinned at 20: this checks the rounding, not Mutinynet's margin).
+      const fractional = profileWith("mutinynet", { fiberMarginMs: 10.7, lnMarginBlocks: 20 });
 
       expect(planLnToFiber(fractional, { payoutFinalExpiryDeltaMs: minutes(160) })).toEqual({
         ok: true,

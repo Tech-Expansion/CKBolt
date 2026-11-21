@@ -1,4 +1,5 @@
-import { Inject, Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
+import { Inject, Injectable, Logger, Optional, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
+import { OPERATOR_EVENTS, type OperatorEvents } from "../monitoring/operator-events";
 import { describeError } from "../../common/utils/error.util";
 import type { HubConfig } from "../../config/hub.config";
 import { hasSwapProgressed, isSwapOpen, MAX_SWAP_PROGRESS_STEPS } from "../../domain/swap";
@@ -28,6 +29,8 @@ export class SwapSchedulerService implements OnModuleInit, OnModuleDestroy {
     @Inject(LIGHTNING) private readonly lightning: LightningPort,
     @Inject(FIBER) private readonly fiber: FiberPort,
     @Inject(HUB_CONFIG) private readonly config: HubConfig,
+    /** The hub's monitor counts failed passes through it (MonitoringModule); absent in tests that build it bare. */
+    @Optional() @Inject(OPERATOR_EVENTS) private readonly events?: OperatorEvents,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -68,8 +71,10 @@ export class SwapSchedulerService implements OnModuleInit, OnModuleDestroy {
   private async runPass(): Promise<void> {
     try {
       await this.engine.processOpenSwaps();
+      this.events?.emit({ kind: "swap-pass-ok" });
     } catch (error) {
       this.logger.error(`Swap pass failed: ${describeError(error)}`);
+      this.events?.emit({ kind: "swap-pass-failed", detail: describeError(error) });
     }
   }
 

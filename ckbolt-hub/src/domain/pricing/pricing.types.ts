@@ -21,6 +21,15 @@ export interface FreshnessWindow {
   maxAgeMs: number;
 }
 
+/**
+ * When fresh samples make a price: at least `minSources` of them, no further apart than `maxSpreadBps` (highest less
+ * lowest, in basis points of their median), so one wrong or pushed feed cannot set or move the price on its own.
+ */
+export interface PriceAgreement {
+  minSources: number;
+  maxSpreadBps: number;
+}
+
 /** One coin's market price: the median of its fresh samples, timestamped with the oldest one used, and their sources. */
 export interface CoinPrice {
   usd: number;

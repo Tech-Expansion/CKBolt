@@ -19,16 +19,18 @@ src/
                                   from its chain: LND chain ids, fnn chain_hash); node-id.util, multiaddr.util;
                                   sliding-window-limiter.util (the rate limits and the inbound channel caps);
                                   serial-queue.util (check-then-act sequences that must not interleave)
-    errors/                       HubError (with an optional cause), NotFoundError, DuplicateHashError, QuoteAlreadyUsedError,
+    errors/                       HubError (with an optional cause and log-only detail), NotFoundError, DuplicateHashError, QuoteAlreadyUsedError,
                                   RateLimitedError (429 rate_limited; its retryAfterSeconds goes out as Retry-After)
   domain/                         pure: types, asset registry (built from config), timing policy, pricing maths (per-coin
                                   market price, asset prices by USD rule, per-asset terms), swap state machine
   application/
-    ports/                        LightningPort, FiberPort, PriceSource, Clock, SwapStore, InboundOpenStore + injection
-                                  tokens
+    ports/                        LightningPort, FiberPort, PriceSource, Clock, SwapStore, InboundOpenStore, QuoteRetention +
+                                  injection tokens
     pricing/                      PricingService (contract + implementation)
     swaps/                        SwapEngine (contract + implementation), scheduler, the caps on unpaid swaps
-                                  (unpaid-swap-limits.ts)
+                                  (unpaid-swap-limits.ts), the start-up check on open swaps' assets
+                                  (open-swap-assets.check.ts)
+    quote-retention/              QuoteRetentionService: deletes quotes no swap uses, QUOTE_RETENTION_DAYS after expiry
     demo/                         DemoWallet (contract + implementation)
     health/                       HealthService (contract + implementation, the plain reasons of a degraded report)
     fiber-node/                   the hub's Fiber node for other Fiber nodes: FiberNodeService (GET /v1/fiber/node) and
@@ -37,8 +39,9 @@ src/
   infrastructure/
     lightning/                    LND adapter (LightningPort) + LightningModule (LIGHTNING, DEMO_LIGHTNING)
     fiber/                        fnn JSON-RPC client and adapter (FiberPort) + FiberModule (FIBER, DEMO_FIBER)
-    persistence/                  SQLite SwapStore, ChannelOpenLog and InboundOpenStore + PersistenceModule
-                                  (SWAP_STORE, CHANNEL_OPEN_LOG, INBOUND_OPEN_STORE): one database, one migration list
+    persistence/                  SQLite SwapStore, ChannelOpenLog, InboundOpenStore and QuoteRetention + PersistenceModule
+                                  (SWAP_STORE, CHANNEL_OPEN_LOG, INBOUND_OPEN_STORE, QUOTE_RETENTION): one database, one
+                                  migration list
     prices/                       CoinGecko, Binance, KuCoin price sources + PricesModule (PRICE_SOURCES)
   interfaces/http/
     contract/                     request schemas and response DTOs + mappers: the public API contract
@@ -70,6 +73,7 @@ How to run and test all of it: [testing.md](testing.md). The public demo's deplo
 | `PriceSource` | `application/ports/prices.port.ts` | `infrastructure/prices` | pricing |
 | `SwapStore` | `application/ports/swap-store.port.ts` | `infrastructure/persistence` | pricing (quotes, payouts open swaps still need), swaps |
 | `InboundOpenStore` | `application/ports/inbound-open-store.port.ts` | `infrastructure/persistence` (table `inbound_opens`) | fiber-node (the inbound opens it may abandon) |
+| `QuoteRetention` | `application/ports/quote-retention.port.ts` | `infrastructure/persistence` (table `quotes`) | quote-retention (deletes quotes that expired `QUOTE_RETENTION_DAYS` ago and that no swap references; one statement, so a quote a swap uses is never deleted) |
 | Timing policy | `domain/timing/timing.policy.ts` | domain timing | swaps |
 | `PricingService` | `application/pricing/pricing.contract.ts` | application pricing | http, swaps |
 | `SwapEngine` | `application/swaps/swap-engine.contract.ts` | application swaps | http, demo |
@@ -87,6 +91,12 @@ The port files state the error behaviour every implementation keeps: lookups res
 the node cannot use throws a HubError with `invoice_invalid`; an unreachable node or an unknown outcome throws a 503
 `upstream_unavailable` HubError; payInvoice resolves FAILED (Lightning) or Failed (Fiber) for a payment the node refuses
 for good, because nothing was sent. In a SwapStore patch, an absent or `undefined` field means "leave unchanged".
+
+A HubError's message is what the client reads, so it is always a fixed sentence the hub wrote; a node's own error text
+(LND's, fnn's) never goes into it. A reason the hub wrote about the user's own invoice may (a repeated attribute,
+`FiberInvoiceContentError`; an unknown BOLT11 prefix). The adapters put the node's text in the error's log-only `detail`
+(`HubErrorOptions`), or keep the node's error as the `cause`; `describeError` prints both, and the HTTP filter logs them (a 5xx as a warning, a
+4xx that carries a detail or cause at debug level). Swap events and failure reasons are the `SWAP_REASON` sentences only.
 
 Signatures the security review changed:
 
@@ -259,7 +269,9 @@ CKB is built in. The UDTs the hub serves on `CKB_NETWORK` come from config, so a
 | `iconUrl` | no | The icon the web app shows, either an https URL (at most 2,048 characters, no user name or password) or an inline SVG `data:image/svg+xml;base64,...` of at most 8,192 characters. The SVG may hold no script, event handler, link, animation, character reference, DTD or outside reference (`ICON_URL_RULE`). `GET /v1/assets` `iconUrl`, null when unset |
 
 Unknown keys, duplicate ids or type scripts, and a non-empty list on mainnet (the hub serves no UDT there in stage 3) are
-refused. `FIBER_ASSETS=[]` serves CKB only. Every listed UDT must also be in the hub fnn's `udt_whitelist`
+refused. Removing an asset while a swap in it is still open (not final, or failed and not refunded) is refused at
+start-up too (`assertOpenSwapAssetsServed`, resolved when Nest builds SwapsModule, before the recovery pass): such a
+swap could neither finish nor be refunded. Put the asset back until those swaps have ended. `FIBER_ASSETS=[]` serves CKB only. Every listed UDT must also be in the hub fnn's `udt_whitelist`
 (`deploy/testnet/fnn/hub.yml`), with its `args` anchored as `^…$` because fnn reads them as a regex. fnn reads the
 whitelist only at start. That whitelist, and fnn-demo's, is generated from `FIBER_ASSETS` by
 `src/interfaces/cli/fnn-whitelist` (`npm run fnn-whitelist`, or in the hub image on the server through

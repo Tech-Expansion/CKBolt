@@ -152,9 +152,10 @@ describe("PricingServiceImpl", () => {
       const h = makeHarness();
       const [a, b, c] = h.sources;
       if (!a || !b || !c) throw new Error("three sources expected");
-      a.prices = { btc: 78_000, ckb: 0.0019, ageMs: 1_000 };
+      // Within PRICE_MAX_SPREAD_BPS (300) of each other: BTC 175 bps, CKB 200 bps of the median.
+      a.prices = { btc: 79_000, ckb: 0.00198, ageMs: 1_000 };
       b.prices = { btc: 80_000, ckb: 0.002, ageMs: 90_000 };
-      c.prices = { btc: 95_000, ckb: 0.003, ageMs: 5_000 };
+      c.prices = { btc: 80_400, ckb: 0.00202, ageMs: 5_000 };
 
       const quote = await h.service.createQuote(req("ln_to_fiber", "CKB", "pay", 10_000n));
 
@@ -164,17 +165,16 @@ describe("PricingServiceImpl", () => {
     });
 
     it("leaves a stale or failing source out of the price and its label", async () => {
-      const h = makeHarness();
-      const [coingecko, binance, kucoin] = h.sources;
-      if (!coingecko || !binance || !kucoin) throw new Error("three sources expected");
+      // Four sources, so two fresh ones remain for PRICE_MIN_SOURCES (2).
+      const h = makeHarness({ sourceNames: ["coingecko", "binance", "kucoin", "bitstamp"] });
+      const [coingecko, binance] = h.sources;
+      if (!coingecko || !binance) throw new Error("four sources expected");
       coingecko.prices = { btc: 1, ckb: 1, ageMs: MAX_PRICE_AGE_MS + 1 };
       binance.failing = true;
 
       const quote = await h.service.createQuote(req("ln_to_fiber", "CKB", "pay", 10_000n));
 
-      expect(quote.priceSource).toContain("kucoin");
-      expect(quote.priceSource).not.toContain("coingecko");
-      expect(quote.priceSource).not.toContain("binance");
+      expect(quote.priceSource).toBe("median:kucoin,bitstamp");
       expect(quote.fiberAmount).toBe(396_000_000_000n);
     });
 
@@ -351,14 +351,45 @@ describe("PricingServiceImpl", () => {
       await expectHubError(() => h.service.createQuote(req("fiber_to_ln", "CKB", "receive", 10_000n)), 503, API_ERROR_CODE.QUOTE_UNAVAILABLE);
     });
 
-    it("quotes with a single fresh source", async () => {
+    it("refuses a single fresh source: a price needs PRICE_MIN_SOURCES (2) of them", async () => {
       const h = makeHarness({ sourceNames: ["kucoin"] });
+
+      await expectHubError(() => h.service.createQuote(req("ln_to_fiber", "CKB", "pay", 10_000n)), 503, API_ERROR_CODE.QUOTE_UNAVAILABLE);
+    });
+
+    it("quotes with a single fresh source when config.pricing.minSources is 1", async () => {
+      const h = makeHarness({ sourceNames: ["kucoin"], pricing: { minSources: 1 } });
 
       await expect(h.service.createQuote(req("ln_to_fiber", "CKB", "pay", 10_000n))).resolves.toMatchObject({ fiberAmount: 396_000_000_000n });
     });
 
+    it("refuses two sources that differ by more than config.pricing.maxSpreadBps: no two agree", async () => {
+      const h = makeHarness({ sourceNames: ["coingecko", "binance"] });
+      const [a] = h.sources;
+      if (!a) throw new Error("a source expected");
+      a.prices = { btc: BTC_USD * 2, ckb: CKB_USD };
+
+      await expectHubError(() => h.service.createQuote(req("ln_to_fiber", "CKB", "pay", 10_000n)), 503, API_ERROR_CODE.QUOTE_UNAVAILABLE);
+    });
+
+    it("quotes from the two sources that agree when the third is far off, and names only them", async () => {
+      const h = makeHarness();
+      const [coingecko] = h.sources;
+      if (!coingecko) throw new Error("a source expected");
+      coingecko.prices = { btc: BTC_USD * 2, ckb: CKB_USD * 2 };
+
+      const quote = await h.service.createQuote(req("ln_to_fiber", "CKB", "pay", 10_000n));
+
+      expect({ btcUsd: quote.btcUsd, assetUsd: quote.assetUsd, priceSource: quote.priceSource }).toEqual({
+        btcUsd: BTC_USD,
+        assetUsd: CKB_USD,
+        priceSource: "median:binance,kucoin",
+      });
+      expect(quote.fiberAmount).toBe(396_000_000_000n);
+    });
+
     it("refuses a price exactly one millisecond past the limit and accepts one at it", async () => {
-      const h = makeHarness({ sourceNames: ["coingecko"] });
+      const h = makeHarness({ sourceNames: ["coingecko", "binance"] });
       setPrices(h.sources, { btc: BTC_USD, ckb: CKB_USD, ageMs: MAX_PRICE_AGE_MS });
 
       await expect(h.service.createQuote(req("ln_to_fiber", "CKB", "pay", 10_000n))).resolves.toBeDefined();

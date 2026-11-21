@@ -70,7 +70,7 @@ export class LndLightningAdapter implements LightningPort {
   private readonly logger: Logger;
   private readonly updates: LndUpdateFeed;
   private readonly payments: LndPaymentFollower;
-  /** A macaroon without onchain:read cannot read the wallet balance; after the first denial on-chain funds count as zero. */
+  /** A macaroon without WalletBalance (uri:/lnrpc.Lightning/WalletBalance) cannot read it; after the first denial on-chain funds count as zero. */
   private chainBalanceReadable = true;
 
   constructor(
@@ -255,7 +255,7 @@ export class LndLightningAdapter implements LightningPort {
     } catch (error) {
       if (!isAccessDenied(readLndError(error))) throw toLndError(LND_RPC.WALLET_BALANCE, error);
       this.chainBalanceReadable = false;
-      this.logger.warn("The LND macaroon cannot read the on-chain balance (onchain:read); on-chain funds are reported as 0.");
+      this.logger.warn("The LND macaroon cannot read the on-chain balance (uri:/lnrpc.Lightning/WalletBalance); on-chain funds are reported as 0.");
       return 0n;
     }
   }

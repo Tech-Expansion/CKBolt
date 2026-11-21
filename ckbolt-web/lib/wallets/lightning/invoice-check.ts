@@ -90,6 +90,8 @@ export interface HoldInvoiceExpectation {
   amountSats: string;
   paymentHash: string;
   hubNetwork: string | null;
+  /** The page's clock: an expired invoice is never shown to pay. */
+  nowMs: number;
 }
 
 /**
@@ -109,5 +111,42 @@ export function checkHoldInvoice(text: string, expected: HoldInvoiceExpectation)
     networkError(decoded, expected.hubNetwork) === null &&
     decoded.amountMsat === satsToMsat(expected.amountSats) &&
     decoded.paymentHash?.toLowerCase() === expected.paymentHash.toLowerCase();
-  return matches ? { ok: true, invoice } : { ok: false, error: LN_WALLET_MESSAGE.HOLD_INVOICE_MISMATCH };
+  if (!matches) return { ok: false, error: LN_WALLET_MESSAGE.HOLD_INVOICE_MISMATCH };
+  const expiresAtMs = (decoded.timestamp + decoded.expirySeconds) * MS_PER_SECOND;
+  return expiresAtMs > expected.nowMs ? { ok: true, invoice } : { ok: false, error: LN_WALLET_MESSAGE.HOLD_INVOICE_EXPIRED };
+}
+
+/** What the visitor accepted for a BTC to CKB or token swap, and what the hub's swap says, for checkSwapHoldInvoice. */
+export interface SwapHoldExpectation {
+  /** The quote's pay amount the visitor accepted, whole sats. */
+  acceptedSats: string;
+  /** The payout invoice the page gave the hub (made by the browser node or pasted). */
+  payoutInvoice: string;
+  /** Its payment hash, when the browser node made it and reported it; null for a pasted one (the browser cannot read it). */
+  payoutHash: string | null;
+  /** What the hub's swap reports: its pay amount, payment hash and payout invoice. */
+  swap: { amountSats: string; paymentHash: string; payoutInvoice: string };
+  hubNetwork: string | null;
+  nowMs: number;
+}
+
+const sameHash = (a: string, b: string): boolean => a.toLowerCase().replace(/^0x/, "") === b.toLowerCase().replace(/^0x/, "");
+
+/**
+ * The hub's hold invoice must be the swap the visitor accepted, not only the swap the hub reports: the quoted amount, the
+ * payout invoice the page sent, and (when the node reported it) that invoice's payment hash. A hub whose hold invoice
+ * had another hash could settle the visitor's payment without paying out; this refuses it before any wallet pays.
+ */
+export function checkSwapHoldInvoice(text: string, expected: SwapHoldExpectation): InvoiceCheck {
+  const accepted =
+    expected.swap.amountSats === expected.acceptedSats &&
+    expected.swap.payoutInvoice.trim() === expected.payoutInvoice.trim() &&
+    (expected.payoutHash === null || sameHash(expected.payoutHash, expected.swap.paymentHash));
+  if (!accepted) return { ok: false, error: LN_WALLET_MESSAGE.HOLD_INVOICE_MISMATCH };
+  return checkHoldInvoice(text, {
+    amountSats: expected.acceptedSats,
+    paymentHash: expected.swap.paymentHash,
+    hubNetwork: expected.hubNetwork,
+    nowMs: expected.nowMs,
+  });
 }

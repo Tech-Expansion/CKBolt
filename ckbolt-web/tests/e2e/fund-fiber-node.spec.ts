@@ -1,4 +1,5 @@
 import { expect, test, type Locator, type Page, type Request } from "@playwright/test";
+import { encodeBech32, toWords } from "../../lib/bech32";
 import { TESTNET_RUSD, TYPE_ID_CODE_HASH } from "../../lib/wallets/fiber-byo/constants";
 import { lockScriptToAddress } from "../../lib/wallets/fiber-byo/funding";
 import { FakeHub, RATE } from "./fakes/hub";
@@ -16,13 +17,16 @@ import {
 } from "./fiber-byo-fakes";
 import { expectNoHorizontalOverflow, expectNoSeriousAxe } from "./page-checks";
 import { chooseUtxoGlobal, installCkbWallet, type FakeCkbWallet } from "./support/ckb-wallet";
+import { keystoreWithAddress, openFakeNodeTab, recordStates, runningPresence, seedKeystore, statesSeen } from "./support/node-keystore";
 
 /*
  * "Fund my Fiber node" (components/app/fund-fiber-node.tsx) on the funding page, /app/fiber/fund?address=…: the only
  * place an L1 wallet appears for live swaps (docs/live-swap-ui.md), linked from the node page and the Fiber wallet
  * dialog. The CKB testnet RPC is a fake chain (tests/e2e/fiber-byo-fakes.ts), the CKB wallet a stand-in for the UTXO
  * Global extension whose signing the test decides, and /api/hub/** a fake hub that records what it is asked. No request
- * leaves the machine.
+ * leaves the machine. The page funds only the node's own address (security review W7): in most tests below
+ * this browser keeps the node's key with its address, as the node writes it once it ran; the last describe checks
+ * the address itself.
  */
 
 const FUND_PAGE = "/app/fiber/fund";
@@ -75,8 +79,25 @@ interface FundPage {
   sent: Request[];
 }
 
-/** The funding page for a node address (a fresh testnet node unless given), with a fake chain, wallet and hub. */
-async function openFundPage(page: Page, opts: { wallet?: { lock?: Script; address?: string }; nodeAddress?: (wallet: FakeCkbWallet) => string } = {}): Promise<FundPage> {
+interface FundPageOptions {
+  wallet?: { lock?: Script; address?: string };
+  /** The node's own address (default: a fresh testnet node's). */
+  nodeAddress?: (wallet: FakeCkbWallet) => string;
+  /** The address the link carries (default: the node's own, as written). */
+  link?: (nodeAddress: string, nodeLock: Script) => string;
+  /** The address this browser keeps next to the node's key (default: the node's own); null keeps no key at all. */
+  stored?: (nodeAddress: string) => string | null;
+  /** Wait until the funding form shows (default); false returns as soon as the page started loading. */
+  form?: boolean;
+  /** Runs before the page loads (init scripts, a node tab). */
+  before?: () => Promise<void>;
+}
+
+/**
+ * The funding page for a node address (a fresh testnet node unless given), with a fake chain, wallet and hub. By default
+ * this browser keeps the node's key with that address, so the page knows the link is the node's own and offers the form.
+ */
+async function openFundPage(page: Page, opts: FundPageOptions = {}): Promise<FundPage> {
   const hub = new FakeHub();
   const chain = new FakeCkbChain();
   const sent: Request[] = [];
@@ -87,10 +108,13 @@ async function openFundPage(page: Page, opts: { wallet?: { lock?: Script; addres
   await installChain(page, chain);
   const nodeLock = secpLock();
   const nodeAddress = opts.nodeAddress?.(wallet) ?? lockScriptToAddress(nodeLock);
-  await page.goto(`${FUND_PAGE}?address=${nodeAddress}`);
+  const stored = opts.stored ? opts.stored(nodeAddress) : nodeAddress;
+  if (stored !== null) await seedKeystore(page, await keystoreWithAddress(stored));
+  await opts.before?.();
+  await page.goto(`${FUND_PAGE}?address=${opts.link?.(nodeAddress, nodeLock) ?? nodeAddress}`);
   const fund = page.getByTestId("fund-fiber-node");
   // The wallet connector bundle loads client-side; allow for a cold server.
-  await expect(fund).toBeVisible({ timeout: 20_000 });
+  if (opts.form !== false) await expect(fund).toBeVisible({ timeout: 20_000 });
   return { hub, chain, wallet, fund, nodeLock, nodeAddress, sent };
 }
 
@@ -152,6 +176,7 @@ test.describe("fund my Fiber node: the funding page", () => {
   });
 
   test("a link to the wallet's own address funds nothing and says why", async ({ page }) => {
+    // The node's own address is the wallet's here (the same key in both), so the page offers the form; the form refuses.
     const { fund, wallet } = await openFundPage(page, { nodeAddress: (w) => w.address });
     await connectWallet(page, fund);
     await expect(fund.getByText("This is your wallet's own address. Paste the address of your Fiber node.")).toBeVisible({ timeout: 15_000 });
@@ -314,5 +339,136 @@ test.describe("fund my Fiber node: the funding page", () => {
     await fund.getByLabel("Amount in CKB").fill("60");
     await expectNoHorizontalOverflow(page);
     await expectNoSeriousAxe(page, "[data-testid=fund-node-page]");
+  });
+});
+
+/* ------------------------------------------------------------------------------ the funding page's address */
+
+/** The same lock in the short address format (RFC 0021, code hash index 0: secp256k1-blake160), as old wallets write it. */
+const shortAddress = (lock: Script) => encodeBech32("ckt", toWords([0x01, 0x00, ...Buffer.from(lock.args.slice(2), "hex")]), "bech32");
+
+/** The page's states (fund-node-page.tsx), recorded in the order they first showed. */
+const FUND_STATES = ["fund-node-checking", "fund-node-unconfirmed", "fund-node-mismatch", "fund-node-missing", "fund-fiber-node"] as const;
+
+/** The status window (800 ms) plus the page's next ask (every 5 s), with room for a loaded machine. */
+const NEXT_ASK_MS = 15_000;
+
+test.describe("the funding page's address (security review W7): only the node's own", () => {
+  test.slow();
+
+  test("the link is the node's own, written another way: the form, which sends to the node's own spelling of it", async ({ page }) => {
+    let link = "";
+    const { fund, chain, wallet, nodeLock, nodeAddress } = await openFundPage(page, {
+      // The node kept its full address; the link carries the short spelling of the same lock.
+      link: (_address, lock) => (link = shortAddress(lock)),
+      before: () => recordStates(page, FUND_STATES),
+    });
+    expect(link).not.toBe(nodeAddress);
+    expect(link).toMatch(/^ckt1q/);
+    expect(await statesSeen(page)).toEqual(["fund-node-checking", "fund-fiber-node"]);
+    // The page names and funds the node's own spelling, never the link's.
+    await expect(page.getByTestId("fund-node-address")).toContainText(nodeAddress);
+    await expect(page.locator("main")).not.toContainText(link);
+    chain.addCell({ lock: wallet.lock, capacity: units(10_000) });
+    await connectWallet(page, fund);
+    await expect(rowValue(fund, "To your node")).toHaveText(`${nodeAddress.slice(0, 12)}…${nodeAddress.slice(-12)}`, { timeout: 15_000 });
+    await fund.getByRole("radio", { name: "600 CKB: Open a channel to a public node" }).click();
+    await review(fund).click();
+    await expect(rowValue(fund.getByTestId("fund-confirm"), "To")).toHaveText(nodeAddress);
+    await fund.getByRole("button", { name: "Send 600 CKB" }).click();
+    await expect(fund.getByTestId("fund-sent")).toBeVisible();
+    expect(chain.sent).toHaveLength(1);
+    expect(sameScript(chain.sent[0].outputs[0].lock, nodeLock)).toBe(true);
+    expect(BigInt(chain.sent[0].outputs[0].capacity)).toBe(units(600));
+  });
+
+  test("a link to someone else's address: no form, nothing to sign or send, the link's address not shown, a way to fund the node's own", async ({ page }) => {
+    const theirs = lockScriptToAddress(secpLock());
+    const { wallet, chain, nodeAddress, sent } = await openFundPage(page, {
+      link: () => theirs,
+      form: false,
+      before: () => recordStates(page, FUND_STATES),
+    });
+    const mismatch = page.getByTestId("fund-node-mismatch");
+    await expect(mismatch).toBeVisible({ timeout: 20_000 });
+    await expect(page.getByRole("heading", { name: /Not your node's address/ })).toBeVisible();
+    await expect(mismatch.getByRole("alert")).toHaveText("This link's address is not your Fiber node's. This page sends nothing to it.");
+    const own = mismatch.getByTestId("fund-node-own");
+    await expect(own).toHaveText("Fund your own node");
+    await expect(own).toHaveAttribute("href", `/app/fiber/fund?address=${nodeAddress}`);
+    await expect(mismatch.getByRole("link", { name: "Open your Fiber node" })).toHaveAttribute("href", "/app/fiber");
+    // Nothing to fund the link with: no form, no wallet connector, and the page never showed them on the way.
+    await expect(page.getByTestId("fund-fiber-node")).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Connect CKB wallet" })).toHaveCount(0);
+    expect(await statesSeen(page)).toEqual(["fund-node-checking", "fund-node-mismatch"]);
+    // The link's address is not repeated on the page, in its title or anywhere outside the address bar.
+    await expect(page.locator("body")).not.toContainText(theirs);
+    expect(await page.title()).not.toContain(theirs);
+    expect(wallet.signRequests).toEqual([]);
+    expect(chain.sent).toEqual([]);
+    expect(carrying(sent, theirs)).toEqual([]);
+    await expectNoHorizontalOverflow(page);
+    await expectNoSeriousAxe(page, "[data-testid=fund-node-page]");
+
+    // "Fund your own node" opens the form for the node's own address.
+    await own.click();
+    await expect(page).toHaveURL(new RegExp(`/app/fiber/fund\\?address=${nodeAddress}$`));
+    await expect(page.getByTestId("fund-fiber-node")).toBeVisible({ timeout: 20_000 });
+    await expect(page.getByTestId("fund-node-address")).toContainText(nodeAddress);
+  });
+
+  test("no node tab and no key in this browser: Open your Fiber node first; the page asks again and turns ready once a node tab answers", async ({ page, context }) => {
+    const { nodeAddress, nodeLock } = await openFundPage(page, { stored: () => null, form: false, before: () => recordStates(page, FUND_STATES) });
+    const unconfirmed = page.getByTestId("fund-node-unconfirmed");
+    await expect(unconfirmed).toBeVisible({ timeout: 20_000 });
+    await expect(page.getByRole("heading", { name: /Open your Fiber node first/ })).toBeVisible();
+    await expect(unconfirmed.getByRole("status")).toHaveText("This page sends only to your own Fiber node. Open and unlock it; this page then checks again.");
+    const open = unconfirmed.getByRole("link", { name: "Open your Fiber node" });
+    await expect(open).toHaveAttribute("href", "/app/fiber");
+    // A new tab, so this page stays open and keeps asking.
+    await expect(open).toHaveAttribute("target", "_blank");
+    await expect(page.getByTestId("fund-fiber-node")).toHaveCount(0);
+    expect(await statesSeen(page)).toEqual(["fund-node-checking", "fund-node-unconfirmed"]);
+    await expectNoSeriousAxe(page, "[data-testid=fund-node-page]");
+
+    // A node tab on another network, and then a locked one, confirm nothing: still unconfirmed after they were asked.
+    const tab = await openFakeNodeTab(context, runningPresence(lockScriptToAddress(nodeLock, "ckb"), { network: "mainnet" }));
+    await expect.poll(() => tab.asked(), { timeout: NEXT_ASK_MS }).toBeGreaterThanOrEqual(1);
+    await tab.setPresence(runningPresence(null, { phase: "locked", nodeId: null, hubConnected: false }));
+    const asked = await tab.asked();
+    await expect.poll(() => tab.asked(), { timeout: NEXT_ASK_MS }).toBeGreaterThan(asked);
+    await expect(unconfirmed).toBeVisible();
+    await expect(page.getByTestId("fund-fiber-node")).toHaveCount(0);
+
+    // The node runs and answers with its address, in the short spelling: the page turns ready and funds that spelling.
+    const spelling = shortAddress(nodeLock);
+    await tab.setPresence(runningPresence(spelling));
+    await expect(page.getByTestId("fund-fiber-node")).toBeVisible({ timeout: NEXT_ASK_MS });
+    await expect(page.getByTestId("fund-node-address")).toContainText(spelling);
+    await expect(unconfirmed).toHaveCount(0);
+    expect(await statesSeen(page)).toEqual(["fund-node-checking", "fund-node-unconfirmed", "fund-fiber-node"]);
+    // Once ready it stays ready: the page stops asking.
+    const settled = await tab.asked();
+    await page.waitForTimeout(6_000);
+    expect(await tab.asked()).toBe(settled);
+    expect(nodeAddress).not.toBe(spelling);
+  });
+
+  test("a running node tab wins over the address kept with the key: a link to the kept address is refused when the node says otherwise", async ({ page, context }) => {
+    const nodeLock = secpLock();
+    const runningAddress = lockScriptToAddress(nodeLock);
+    // This browser keeps an address that is not the running node's (say, a key since replaced in another tab).
+    const { nodeAddress } = await openFundPage(page, {
+      form: false,
+      before: async () => {
+        await openFakeNodeTab(context, runningPresence(runningAddress));
+        await recordStates(page, FUND_STATES);
+      },
+    });
+    const mismatch = page.getByTestId("fund-node-mismatch");
+    await expect(mismatch).toBeVisible({ timeout: 20_000 });
+    await expect(mismatch.getByTestId("fund-node-own")).toHaveAttribute("href", `/app/fiber/fund?address=${runningAddress}`);
+    await expect(page.locator("body")).not.toContainText(nodeAddress);
+    expect(await statesSeen(page)).toEqual(["fund-node-checking", "fund-node-mismatch"]);
   });
 });

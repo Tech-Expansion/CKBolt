@@ -1,4 +1,4 @@
-import type { FiberInvoiceRequest } from "@/components/app/swap/contracts";
+import type { FiberInvoiceRequest, FiberPayRequest } from "@/components/app/swap/contracts";
 import { BridgeError, type BridgeClient } from "@/lib/wallets/fiber-browser/bridge-client";
 import { BRIDGE_ERROR } from "@/lib/wallets/fiber-browser/bridge-protocol";
 import { checkNodeInvoice } from "./invoice-check";
@@ -6,10 +6,7 @@ import { checkNodeInvoice } from "./invoice-check";
 /** The part of the bridge client (lib/wallets/fiber-browser/bridge-client.ts) the wallet drives; tests pass a fake. */
 export type BrowserNodePort = Pick<BridgeClient, "makeInvoice" | "payInvoice">;
 
-export interface FiberPayRequest {
-  swapId: string;
-  invoice: string;
-}
+export type { FiberPayRequest };
 
 /** The node did not answer in time: the payment may be on its way, so it must not be sent again. */
 const mayHaveSent = (e: unknown): boolean => e instanceof BridgeError && e.code === BRIDGE_ERROR.TIMEOUT;
@@ -25,12 +22,14 @@ const sentNothing = (e: unknown): boolean => e instanceof BridgeError && e.code 
 export class BrowserNodeWallet {
   /** One payment per swap id, for the page's life. */
   private readonly payments = new Map<string, Promise<void>>();
+  /** The payment hash of each payout invoice the node made, for the page's life (the browser cannot read a Fiber invoice's). */
+  private readonly payoutHashes = new Map<string, string>();
 
   constructor(private readonly port: BrowserNodePort) {}
 
   /** ln_to_fiber: the payout invoice, made by the node and checked against the request. Throws with a sentence. */
   async makeInvoice(request: FiberInvoiceRequest): Promise<string> {
-    const { invoice } = await this.port.makeInvoice({
+    const { invoice, paymentHash } = await this.port.makeInvoice({
       asset: request.asset,
       amount: request.amount,
       quoteExpiresAt: request.quoteExpiresAt,
@@ -39,7 +38,13 @@ export class BrowserNodeWallet {
     });
     const check = checkNodeInvoice(invoice, request);
     if (!check.ok) throw new Error(check.error);
+    this.payoutHashes.set(invoice, paymentHash);
     return invoice;
+  }
+
+  /** The payment hash the node reported for a payout invoice it made here, or null. */
+  payoutHashOf(invoice: string): string | null {
+    return this.payoutHashes.get(invoice) ?? null;
   }
 
   /**
@@ -53,7 +58,7 @@ export class BrowserNodeWallet {
   payInvoice(request: FiberPayRequest): Promise<void> {
     const known = this.paymentFor(request.swapId);
     if (known) return known;
-    const attempt = this.port.payInvoice({ swapId: request.swapId, invoice: request.invoice }).then(
+    const attempt = this.port.payInvoice(request).then(
       () => undefined,
       (e: unknown) => {
         if (mayHaveSent(e)) return undefined;

@@ -189,6 +189,8 @@ export class FakeFiberNetwork {
 export class FakeFiberNode implements FiberPort {
   readonly nodeId: string;
   readonly calls: string[] = [];
+  /** Every createHoldInvoice request this node took, as the hub sent it, in order (e.g. to read its description). */
+  readonly holdInvoiceRequests: Array<Parameters<FiberPort["createHoldInvoice"]>[0]> = [];
   private readonly payments = new Map<Hex32, FiberPaymentStatus>();
   private readonly listeners = new Set<(paymentHash: Hex32) => void>();
   private channels: FiberChannel[] = [];
@@ -333,6 +335,7 @@ export class FakeFiberNode implements FiberPort {
 
   async createHoldInvoice(args: { paymentHash: Hex32; amount: bigint; udtTypeScript: Script | null; expirySeconds: number; finalExpiryDeltaMs: number; description: string }) {
     this.enter("createHoldInvoice");
+    this.holdInvoiceRequests.push({ ...args });
     const invoice = this.register(args.paymentHash, {
       amount: args.amount,
       udt: args.udtTypeScript,

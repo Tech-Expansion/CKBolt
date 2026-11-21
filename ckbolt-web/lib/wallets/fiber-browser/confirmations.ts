@@ -28,6 +28,18 @@ export type ConfirmView =
       route: FiberPaymentRoute;
     }
   | {
+      /** A swap from the app: the node pays the hub's hold invoice, and the visitor gets sats on Lightning. */
+      kind: "swap-payment";
+      asset: FiberAssetId;
+      amount: string;
+      /** The most the routing fee may be. */
+      maxFee: string;
+      /** What the visitor's Lightning invoice receives, in sats. */
+      receiveSats: string;
+      /** Epoch ms the hold invoice stops being payable, or null. */
+      expiresAt: number | null;
+    }
+  | {
       kind: "on-chain";
       address: string;
       /** Shannons the address receives. */

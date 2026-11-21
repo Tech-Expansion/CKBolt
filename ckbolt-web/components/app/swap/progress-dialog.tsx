@@ -7,6 +7,7 @@ import { pairLine } from "@/lib/swap/format";
 import { hashKey } from "@/lib/swap/history";
 import { isRunSettled } from "@/lib/swap/run-model";
 import { ViewInHistory } from "../fiber-wallet/host/view-in-history";
+import { popupRunsNode, useWalletHost } from "../fiber-wallet/host/wallet-host";
 import { primaryButton, secondaryButton } from "../ui";
 import { RunView } from "./run-view";
 
@@ -16,6 +17,8 @@ const keepOpen = (e: Event) => e.preventDefault();
  * The run of one swap, from "Swap" to complete, refunded or cancelled. While it runs it cannot be dismissed (no close
  * button, Escape and outside clicks are ignored) but offers "Hide"; the card then shows a banner to come back. Once
  * settled, closing it puts the run away, and "View in History" hides it and opens the header's Fiber node on the swap.
+ * While the header's node waits for Confirm on a swap payment, "Confirm in your Fiber node" hides it and opens the node
+ * there: the popup cannot be used under this modal dialog.
  */
 export function ProgressDialog({
   open,
@@ -36,6 +39,8 @@ export function ProgressDialog({
   onPayInBrowser: () => void;
 }) {
   const { plan, swap, outcome } = run;
+  const host = useWalletHost();
+  const confirmInPopup = run.confirmInNode && popupRunsNode(host);
   const ended = outcome !== "running";
   const settled = isRunSettled(run);
   // Before a swap exists, starting over means a new quote; after a cancelled one, it is simply trying again.
@@ -58,6 +63,19 @@ export function ProgressDialog({
           {!settled && (
             <button type="button" onClick={onHide} className={secondaryButton}>
               {PROGRESS_COPY.HIDE}
+            </button>
+          )}
+          {confirmInPopup && (
+            <button
+              type="button"
+              onClick={() => {
+                onHide();
+                host.show("confirm");
+              }}
+              className={primaryButton}
+              data-testid="swap-confirm-in-node"
+            >
+              {PROGRESS_COPY.CONFIRM_IN_NODE}
             </button>
           )}
           {run.retry ? (

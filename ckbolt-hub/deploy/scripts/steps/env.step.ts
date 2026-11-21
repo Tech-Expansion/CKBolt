@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { DeployContext } from "../lib/context";
 import { KIT_ENV_KEY, KIT_FILE, KIT_HAND_SECRETS,
-  KIT_SECRET_BYTES, LND_SERVICES, LND_WALLET_PASSWORD_BYTES } from "../lib/constants";
+  KIT_SECRET_BYTES, LND_SERVICES, LND_WALLET_PASSWORD_BYTES, SECRET_FILE_MODE } from "../lib/constants";
 import {
   envCompletionScript,
   envEntries,
@@ -12,6 +12,7 @@ import {
   planEnvCompletion,
   secretFileScript,
   validateKitEnv,
+  validateTunnelProxySecret,
 } from "../lib/env-file";
 import { walletPasswordPath } from "../lib/kit-paths";
 import { publicIpOfSshHost } from "../lib/public-ip";
@@ -27,7 +28,8 @@ export const readableEnvKeys = (exampleText: string): string[] =>
 /**
  * Creates or completes the server's .env and hub.env and the LND wallet passwords. Keeps every value already there
  * (the running sync's bitcoind RPC credentials included); each missing secret is generated on the server and never
- * leaves it. Stops with a sentence per contradiction (e.g. DEMO_ENABLED without the demo profile).
+ * leaves it. Stops with a sentence per contradiction (e.g. DEMO_ENABLED without the demo profile) before writing; a
+ * tunnel without HUB_PROXY_SECRET in hub.env, which the operator sets by hand, stops it once hub.env exists.
  */
 export async function completeKitEnv(ctx: DeployContext): Promise<void> {
   const { kit, logger } = ctx;
@@ -57,6 +59,14 @@ export async function completeKitEnv(ctx: DeployContext): Promise<void> {
     await kit.run(secretFileScript(walletPasswordPath(service), LND_WALLET_PASSWORD_BYTES), { description: `${service} wallet password` });
   }
   logger.info(`LND wallet passwords in ${KIT_FILE.WALLET_SECRETS_DIR}/ (mode 600; kept when present)`);
+  await assertTunnelProxySecret(ctx, plan.values);
+}
+
+/** The tunnel needs HUB_PROXY_SECRET in hub.env (validateTunnelProxySecret); the probe reads no value back. */
+async function assertTunnelProxySecret(ctx: DeployContext, kitValues: ReadonlyMap<string, string>): Promise<void> {
+  const output = await ctx.kit.run(envProbeScript(KIT_FILE.HUB_ENV, []), { description: "read the hub.env keys" });
+  const problems = validateTunnelProxySecret(kitValues, parseEnvProbe(output, []));
+  if (problems.length > 0) throw new Error(`hub.env needs a change: ${problems.join("; ")}`);
 }
 
 /** PUBLIC_IP for a new .env: DEPLOY_PUBLIC_IP, else the SSH host's address. */
@@ -67,16 +77,28 @@ async function findPublicIp(ctx: DeployContext): Promise<string | null> {
   return found;
 }
 
-/** Copies hub.env.example to hub.env when there is none, else appends the keys a newer example added. */
+/**
+ * Copies hub.env.example to hub.env when there is none, else appends the keys a newer example added. Either way hub.env
+ * ends owner-only (it holds HUB_PROXY_SECRET and alert webhook tokens), also when an older kit created it world-readable.
+ */
 async function completeHubEnv(ctx: DeployContext): Promise<void> {
+  await addMissingHubEnvLines(ctx);
+  await ctx.kit.run(`chmod ${SECRET_FILE_MODE} ${shellQuote(KIT_FILE.HUB_ENV)}`, { description: "make hub.env owner-only" });
+}
+
+async function addMissingHubEnvLines(ctx: DeployContext): Promise<void> {
   const { kit, logger } = ctx;
   if (!(await kit.fileExists(KIT_FILE.HUB_ENV))) {
-    await kit.run(`cp ${shellQuote(KIT_FILE.HUB_ENV_EXAMPLE)} ${shellQuote(KIT_FILE.HUB_ENV)}`, { description: "create hub.env" });
+    await kit.run(`(umask 077 && cp ${shellQuote(KIT_FILE.HUB_ENV_EXAMPLE)} ${shellQuote(KIT_FILE.HUB_ENV)})`, {
+      description: "create hub.env",
+    });
     logger.info("hub.env created from hub.env.example");
     return;
   }
   const exampleText = readFileSync(join(ctx.paths.kitDir, KIT_FILE.HUB_ENV_EXAMPLE), "utf8");
-  const missing = missingEnvLines(exampleText, await kit.readText(KIT_FILE.HUB_ENV));
+  // Key names only: hub.env holds HUB_PROXY_SECRET and webhook tokens, which never leave the server.
+  const probe = parseEnvProbe(await kit.run(envProbeScript(KIT_FILE.HUB_ENV, []), { description: "read the hub.env keys" }), []);
+  const missing = missingEnvLines(exampleText, probe.keys());
   if (missing.length === 0) {
     logger.info("hub.env already has every key of hub.env.example");
     return;

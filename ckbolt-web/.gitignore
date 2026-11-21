@@ -30,6 +30,8 @@ next-env.d.ts
 # local artifacts
 .server.log
 *.zip
+# the brand kit's downloads (/brand/kit) are served files, not local artifacts
+!/public/brand/*.zip
 
 # playwright
 /test-results/

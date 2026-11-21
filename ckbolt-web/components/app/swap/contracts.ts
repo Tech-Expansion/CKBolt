@@ -58,8 +58,28 @@ export interface FiberWalletApi extends FiberWalletState {
   disconnect(): void;
   /** ln_to_fiber payout invoice. Browser node: made and checked. Own node: rejects with ManualFiberStep. */
   makeInvoice(request: FiberInvoiceRequest): Promise<string>;
-  /** fiber_to_ln: pay the hub's hold invoice. Browser node: sent. Own node: rejects with ManualFiberStep. */
-  payInvoice(request: { swapId: string; invoice: string }): Promise<void>;
+  /**
+   * fiber_to_ln: pay the hub's hold invoice. Browser node: checked against what the visitor accepted, confirmed by the
+   * visitor in the node, then sent. Own node: rejects with ManualFiberStep.
+   */
+  payInvoice(request: FiberPayRequest): Promise<void>;
+  /**
+   * ln_to_fiber: the payment hash of a payout invoice this wallet made (the browser node reports it), or null when it
+   * did not make it. The hub's Lightning hold invoice must have that hash.
+   */
+  payoutHashOf?(invoice: string): string | null;
+}
+
+/** fiber_to_ln: what the browser node pays, and what the visitor accepted, so the node can check the hub's invoice. */
+export interface FiberPayRequest {
+  swapId: string;
+  /** The hub's Fiber hold invoice. */
+  invoice: string;
+  /** The visitor's own Lightning invoice the swap pays out to: the hold invoice must have its payment hash. */
+  payoutInvoice: string;
+  /** The quote's pay asset and amount (base units). */
+  asset: FiberAssetId;
+  amount: string;
 }
 
 /** Props of the Fiber node's chip on the Fiber side of the swap card (wallets part). */

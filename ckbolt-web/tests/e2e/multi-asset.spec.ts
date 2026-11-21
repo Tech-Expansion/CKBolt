@@ -15,7 +15,7 @@ import {
   RUSD_SCRIPT,
   units,
 } from "./support/fiber-node";
-import { WALLET_TIMEOUT_MS } from "./support/fiber-wallet";
+import { answerInNode, WALLET_TIMEOUT_MS } from "./support/fiber-wallet";
 import { isolate, LiveHub } from "./support/live-hub";
 import { STEP_TIMEOUT_MS, SwapCard } from "./support/swap-card";
 import { DISPLAY_NAME_MAX_LENGTH } from "../../lib/token-display";
@@ -227,6 +227,8 @@ test.describe("cWBTC on the swap card, from the hub's assets alone", () => {
     expect(hub.quoteBodies.at(-1)).toEqual({ direction: "fiber_to_ln", asset: "CWBTC", side: "receive", amount: String(CWBTC_TO_BTC.sats) });
     await card.swap();
     await card.expectStep(1, "done", "Your pasted invoice");
+    // The node checks the hub's cWBTC hold invoice, then pays it once the visitor confirmed it in the node.
+    await answerInNode({ ui: node, scope: node }, "accept");
     await card.expectStep(3, "active", "Sent; waiting for the hub");
     expect(await nodeCalls(node, "send_payment")).toEqual([expect.objectContaining({ invoice: hub.current.pay.invoice })]);
     expect(hub.current.pay).toMatchObject({ asset: "CWBTC", amount: "25000" });
@@ -272,6 +274,7 @@ test.describe("Pay and Get paid in cWBTC", () => {
     await expect(confirm).toHaveText(`Pay ${CWBTC_TO_BTC.cwbtc} cWBTC`, { timeout: NODE_STATUS_TIMEOUT_MS });
     await confirm.click();
     const result = tab.getByTestId("pay-result");
+    await answerInNode({ ui: node, scope: node }, "accept");
     await expect(result.getByTestId("swap-step-3")).toContainText("Sent; waiting for the hub", { timeout: STEP_TIMEOUT_MS });
     expect(await nodeCalls(node, "send_payment")).toEqual([expect.objectContaining({ invoice: hub.current.pay.invoice })]);
     hubCompletes(hub);

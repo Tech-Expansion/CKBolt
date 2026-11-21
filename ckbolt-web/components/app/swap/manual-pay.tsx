@@ -11,6 +11,7 @@ import type { ShortError } from "@/lib/swap/errors";
 import { lightningUri } from "@/lib/wallets/lightning/invoice-check";
 import { GUIDE_HUB_HREF } from "../guide/constants";
 import { QrCode } from "../qr-code";
+import { StatusNotice } from "../status";
 import { CopyButton } from "../ui";
 import { InfoTip } from "./info-tip";
 import { NodeCommand } from "./node-command";
@@ -133,5 +134,27 @@ export function HoldInvoicePay({
         )}
       </div>
     </InvoiceToPay>
+  );
+}
+
+/**
+ * BTC to CKB or a token: the hold invoice has waited a while with nothing paid. On testnet that is nearly always a wallet
+ * with no route to the hub, so the line says so and links the guide's hub card, where the hub opens a channel to it.
+ */
+export function NoPaymentHint() {
+  return (
+    <StatusNotice tone="pending" role="status" className="mt-3" data-testid="swap-no-payment-hint">
+      <p>{PROGRESS_COPY.NO_PAYMENT_YET}</p>
+      <a
+        href={GUIDE_HUB_HREF}
+        target="_blank"
+        rel="noopener"
+        className={`inline-flex min-h-10 items-center gap-1 text-sm font-medium ${inlineLink}`}
+      >
+        {PROGRESS_COPY.GET_HUB_CHANNEL}
+        <ArrowUpRight className="h-3.5 w-3.5" aria-hidden="true" />
+        <span className="sr-only"> {WALLET_ACTION.NEW_TAB}</span>
+      </a>
+    </StatusNotice>
   );
 }

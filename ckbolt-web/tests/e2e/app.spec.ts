@@ -126,6 +126,51 @@ test("the footer names the stage, and no longer says that nothing is paid", asyn
   await expect(footer.getByRole("link", { name: "Testnet guide" })).toHaveAttribute("href", "/app/guide");
 });
 
+test("the footer links CKBolt's own X account first, then TEX Labs', each in a new tab, and the row fits the screen", async ({ page, isMobile }) => {
+  await page.goto("/");
+  const footer = page.locator("footer");
+  const x = footer.getByRole("link", { name: "X (CKBolt)", exact: true });
+  await expect(x).toHaveCount(1);
+  await expect(x).toHaveAttribute("href", "https://x.com/CKBoltNetwork");
+  await expect(x).toHaveAttribute("target", "_blank");
+  // noreferrer also means noopener: the new tab cannot reach this page.
+  await expect(x).toHaveAttribute("rel", /\bnoreferrer\b/);
+  // The social row: CKBolt's account before TEX Labs', each opening in a new tab.
+  const row = x.locator("xpath=..").getByRole("link");
+  await expect(row).toHaveText(["X (CKBolt)", "X (TEX Labs)", "TEX Labs"]);
+  expect(await row.evaluateAll((links) => links.map((a) => [a.getAttribute("href"), a.getAttribute("target")]))).toEqual([
+    ["https://x.com/CKBoltNetwork", "_blank"],
+    ["https://x.com/texlabsorg/", "_blank"],
+    ["https://texlabs.org", "_blank"],
+  ]);
+
+  // On this screen and on a 320 px phone, the row wraps rather than run off the side, and the page never scrolls sideways.
+  const widths = isMobile ? [page.viewportSize()!.width, 320] : [page.viewportSize()!.width, 1024];
+  for (const width of widths) {
+    await page.setViewportSize({ width, height: page.viewportSize()!.height });
+    await x.scrollIntoViewIfNeeded();
+    await expect(x).toBeVisible();
+    const fit = await row.evaluateAll((links) => {
+      const vw = document.documentElement.clientWidth;
+      return {
+        outside: links.filter((a) => a.getBoundingClientRect().right > vw + 1 || a.getBoundingClientRect().left < 0).map((a) => a.textContent),
+        pageScrolls: document.documentElement.scrollWidth > vw + 1,
+      };
+    });
+    expect(fit, `${width} px`).toEqual({ outside: [], pageScrolls: false });
+  }
+});
+
+test("the share tags name CKBolt's X account as the site and TEX Labs' as the creator, on every page", async ({ page }) => {
+  for (const path of ["/", "/app", "/app/guide"]) {
+    await page.goto(path);
+    await expect(page.locator('meta[name="twitter:site"]'), path).toHaveAttribute("content", "@CKBoltNetwork");
+    await expect(page.locator('meta[name="twitter:creator"]'), path).toHaveAttribute("content", "@texlabsorg");
+    await expect(page.locator('meta[name="twitter:card"]'), path).toHaveAttribute("content", "summary_large_image");
+    await expect(page.locator('meta[name="twitter:site"]'), path).toHaveCount(1);
+  }
+});
+
 test("the site says Live testnet demo where it said stage 2: hero, Impact strip, roadmap and FAQ", async ({ page }) => {
   await page.goto("/");
   await expect(page.locator("main").getByText("Live testnet demo by TEX Labs, stage 3 of 6")).toBeVisible();

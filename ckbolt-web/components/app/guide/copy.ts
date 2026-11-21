@@ -169,7 +169,7 @@ export const FIBER_CHANNEL_COPY = {
     `Runs connect_peer on your fnn (RPC at ${rpc}). In Fiber Studio, add this address as a peer. The hub opens channels only to nodes connected to it.`,
   TITLE: "Get a Fiber channel from the hub",
   TIP_LABEL: "Why a Fiber channel from the hub",
-  TIP: "Your own Fiber node receives swaps over a channel the hub opens to it, with the hub's tokens on the hub's side. Connect your node first, then paste its node id and pick a token. Your node accepts the channel by itself: CKB as fnn does by default, a token once its config lists it.",
+  TIP: "Your own Fiber node receives swaps over a channel the hub opens to it, with the hub's tokens on the hub's side. Connect your node first, then paste its node id and pick a token. Your node accepts the channel by itself: CKB as fnn does by default, a token once its config lists it. It needs fnn 0.10 or later: the hub runs 0.10, and a 0.9 node cannot open a channel with it.",
   NODE_ID_LABEL: "Your Fiber node id",
   NODE_ID_PLACEHOLDER: "02… or 03…",
   TOKEN_LABEL: "Token",

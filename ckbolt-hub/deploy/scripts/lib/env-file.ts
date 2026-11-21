@@ -6,6 +6,7 @@ import {
   COMPOSE_PROFILE_SEPARATOR,
   DEMO_PROFILE,
   ENV_TRUE_VALUES,
+  HUB_ENV_KEY,
   KIT_ENV_KEY,
   PUBLIC_OVERLAY_FILE,
   SECRET_FILE_MODE,
@@ -38,14 +39,19 @@ export const envEntries = (text: string): Map<string, string> =>
 
 /**
  * A script that prints `<key>\t<set|empty>\t<value>` for each key of the env file at `path`, with the value only for the
- * `readableKeys` (the rest stay on the server). Prints nothing when the file does not exist.
+ * `readableKeys` (the rest stay on the server). A value that is blank once its spaces and one pair of quotes are removed
+ * (`""`, `''`, spaces, or nothing before a ` #` comment) is empty, as Compose reads it. Prints nothing when the file does not exist.
  */
 export function envProbeScript(path: string, readableKeys: readonly string[]): string {
   const awk = [
     `BEGIN { n = split(readable, keys, ","); for (i = 1; i <= n; i++) allowed[keys[i]] = 1 }`,
     `/^[A-Za-z_][A-Za-z0-9_]*=/ {`,
     `  key = substr($0, 1, index($0, "=") - 1); value = substr($0, index($0, "=") + 1)`,
-    `  printf "%s\\t%s\\t%s\\n", key, (value == "" ? "${PROBE_EMPTY}" : "${PROBE_SET}"), ((key in allowed) ? value : "")`,
+    `  bare = value; sub(/^[ \t]+/, "", bare); q = substr(bare, 1, 1)`,
+    `  if (q == "\\"" || q == "'") { rest = substr(bare, 2); end = index(rest, q); bare = (end > 0 ? substr(rest, 1, end - 1) : rest) }`,
+    `  else { sub(/[ \t]+#.*$/, "", bare); sub(/^#.*$/, "", bare) }`,
+    `  gsub(/^[ \t]+|[ \t]+$/, "", bare)`,
+    `  printf "%s\\t%s\\t%s\\n", key, (bare == "" ? "${PROBE_EMPTY}" : "${PROBE_SET}"), ((key in allowed) ? value : "")`,
     `}`,
   ].join("\n");
   const file = shellQuote(path);
@@ -107,6 +113,24 @@ const isTrue = (value: string | undefined): boolean => ENV_TRUE_VALUES.includes(
 const listOf = (value: string | undefined, separator: string): string[] =>
   (value ?? "").split(separator).map((item) => item.trim()).filter(Boolean);
 
+/** Whether a COMPOSE_PROFILES value (from the kit's .env) turns the Cloudflare Tunnel on. */
+export const listsTunnelProfile = (composeProfiles: string | undefined): boolean =>
+  listOf(composeProfiles, COMPOSE_PROFILE_SEPARATOR).includes(TUNNEL_PROFILE);
+
+/**
+ * The tunnel puts the hub on the internet, so the hub must ask for the web app's proxy secret: COMPOSE_PROFILES with the
+ * tunnel needs HUB_PROXY_SECRET set in hub.env (docs/security-review-2026-11.md, D4). `hubEnv` is a probe of hub.env
+ * (envProbeScript with no readable key): it says whether the secret is set, never what it is. An empty list when fine.
+ */
+export function validateTunnelProxySecret(kitValues: ReadonlyMap<string, string>, hubEnv: EnvProbe): string[] {
+  if (!listsTunnelProfile(kitValues.get(KIT_ENV_KEY.COMPOSE_PROFILES)) || hubEnv.get(HUB_ENV_KEY.PROXY_SECRET)?.set) return [];
+  return [
+    `COMPOSE_PROFILES lists ${TUNNEL_PROFILE}, so the server's hub.env must set ${HUB_ENV_KEY.PROXY_SECRET} (the web app's ` +
+      "proxy secret, at least 32 characters, the same value as on the web server; `openssl rand -hex 32` makes one): set it by " +
+      "hand, then run `testnet env` again",
+  ];
+}
+
 /** Settings that contradict each other, as sentences that say what to change. */
 export function validateKitEnv(values: ReadonlyMap<string, string>): string[] {
   const problems: string[] = [];
@@ -153,9 +177,10 @@ export function envCompletionScript(path: string, fills: readonly EnvFill[]): st
 }
 
 /** Lines of the example (`key=value`) whose keys the current file lacks, to append to it. */
-export function missingEnvLines(exampleText: string, currentText: string): string[] {
-  const current = envEntries(currentText);
-  return [...envEntries(exampleText)].filter(([key]) => !current.has(key)).map(([key, value]) => `${key}=${value}`);
+/** The example's lines whose key the server's file lacks; `presentKeys` comes from envProbeScript, so no value is read. */
+export function missingEnvLines(exampleText: string, presentKeys: Iterable<string>): string[] {
+  const present = new Set(presentKeys);
+  return [...envEntries(exampleText)].filter(([key]) => !present.has(key)).map(([key, value]) => `${key}=${value}`);
 }
 
 /** A script that creates `path` with a random hex secret (no newline, owner-only) unless it already holds one. */

@@ -5,13 +5,16 @@ import request from "supertest";
 import { AppModule } from "../../../src/app.module";
 import { DEMO_WALLET } from "../../../src/application/demo/demo-wallet.contract";
 import { HEALTH_SERVICE } from "../../../src/application/health/health.contract";
+import { HubMonitorService } from "../../../src/application/monitoring/hub-monitor.service";
+import { OPERATOR_EVENTS, OperatorEvents } from "../../../src/application/monitoring/operator-events";
 import type { SwapStore } from "../../../src/application/ports/swap-store.port";
-import { CLOCK, DEMO_FIBER, DEMO_LIGHTNING, FIBER, HUB_CONFIG, LIGHTNING, PRICE_SOURCES, SWAP_STORE } from "../../../src/application/ports/tokens";
+import { ALERT_SINK, CLOCK, DEMO_FIBER, DEMO_LIGHTNING, FIBER, HUB_CONFIG, LIGHTNING, PRICE_SOURCES, SWAP_STORE } from "../../../src/application/ports/tokens";
 import { PRICING_SERVICE } from "../../../src/application/pricing/pricing.contract";
 import { SWAP_ENGINE, type SwapEngine } from "../../../src/application/swaps/swap-engine.contract";
 import { SwapSchedulerService } from "../../../src/application/swaps/swap-scheduler.service";
 import { SQLITE_IN_MEMORY_PATH } from "../../../src/common/constants/persistence.constants";
 import { loadHubConfig, type HubConfig } from "../../../src/config/hub.config";
+import { LogAlertSink } from "../../../src/infrastructure/alerts/webhook-alert-sink";
 import { FakeClock, FakeFiberNetwork, FakeLightningNetwork, FakePriceSource, type FakeLightningNode } from "../../fakes";
 import { DEVNET_RUSD_SCRIPT, spyOnLogger } from "../api/api.fixtures";
 import { makeSwap } from "../persistence/persistence.fixtures";
@@ -85,6 +88,24 @@ describe("AppModule", () => {
     ({ app } = await createApp());
     for (const token of [PRICING_SERVICE, SWAP_ENGINE, DEMO_WALLET, HEALTH_SERVICE, SWAP_STORE]) expect(app.get(token)).toBeDefined();
     expect(app.get<{ enabled: boolean }>(DEMO_WALLET).enabled).toBe(true);
+  });
+
+  it("wires the monitor: alerts to the log without a webhook, and one OperatorEvents the scheduler reports on and the monitor hears", async () => {
+    const subscribe = jest.spyOn(OperatorEvents.prototype, "on");
+    const emit = jest.spyOn(OperatorEvents.prototype, "emit");
+
+    ({ app } = await createApp());
+    const events = app.get<OperatorEvents>(OPERATOR_EVENTS);
+
+    expect(app.get(ALERT_SINK)).toBeInstanceOf(LogAlertSink);
+    expect(app.get(HubMonitorService)).toBeInstanceOf(HubMonitorService);
+    expect(subscribe.mock.contexts).toEqual([events]);
+    // The scheduler's recovery pass during start-up.
+    expect(emit).toHaveBeenCalledWith({ kind: "swap-pass-ok" });
+    expect(new Set(emit.mock.contexts)).toEqual(new Set([events]));
+    // The payout guard reports only while a payout hangs, so the engine's wiring is read from its processor.
+    const engine = app.get<SwapEngine>(SWAP_ENGINE) as unknown as { processor: { events?: OperatorEvents } };
+    expect(engine.processor.events).toBe(events);
   });
 
   it("serves the API: health, assets, a quote in each direction and a demo invoice", async () => {

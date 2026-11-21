@@ -4,9 +4,12 @@
  * ./config.ts. Research: ../ckbolt-hub/docs/research/fiber-browser-wallet.md.
  */
 
-/** The fiber-js release this code is written for; package.json pins it. The hub's fnn must run the same minor (0.9). */
-export const FIBER_JS_VERSION = "0.9.1";
-/** Download size of fiber-js 0.9.1 (gzip), told to the visitor before the node starts. */
+/**
+ * The fiber-js release this code is written for; package.json pins it. The hub's fnn must run the same minor (0.10): a
+ * 0.10 node cannot open a channel with a 0.9 one. A browser node made by 0.9.1 migrates its store on its first start.
+ */
+export const FIBER_JS_VERSION = "0.10.1";
+/** Download size of fiber-js 0.10.1 (gzip), told to the visitor before the node starts. */
 export const FIBER_JS_DOWNLOAD_MB = 7;
 
 /**
@@ -68,13 +71,19 @@ export const SECP256K1_ORDER_HEX = "fffffffffffffffffffffffffffffffebaaedce6af48
 export const KEY_GENERATION_MAX_TRIES = 8;
 /** Bytes of sha256(P2P key) that name the node's database. */
 export const KEY_TAG_BYTES = 8;
-export const PASSWORD_MIN_LENGTH = 8;
+/**
+ * Shortest password for a new keystore (security review W6; it was 8). Only new passwords are held to it: a key stored
+ * or backed up under a shorter one still unlocks and restores, so nobody is locked out.
+ */
+export const PASSWORD_MIN_LENGTH = 12;
 
 /** Version of the stored keystore record. */
 export const KEYSTORE_VERSION = 1;
 /**
  * scrypt parameters for a new keystore (N = 2^logN). 2^16 x r 8 uses 64 MiB for about a second, next to fiber-js's own
- * 100 MiB of shared buffers; the record stores them, so a later change keeps old records readable.
+ * 100 MiB of shared buffers; the record stores them, so a later change keeps old records readable. A record opened with
+ * weaker ones (a key made by an older page, or a restored backup) is encrypted again with these, under the same password
+ * (keystore.ts, `strengthenKeystore`).
  */
 export const KDF_PARAMS = { logN: 16, r: 8, p: 1 } as const;
 /** Largest parameters accepted from a stored or imported record, so a crafted backup cannot freeze the tab. */

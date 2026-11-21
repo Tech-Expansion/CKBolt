@@ -4,6 +4,10 @@
 @custom-variant dark (&:is(.dark *));
 
 :root {
+  /*
+   * The brand kit's colors (public/brand/tokens/ckbolt-tokens.css, /brand): the neutrals resolve to Paper #FAFAF9,
+   * Ink #080503, Card #FFFFFF, Secondary #F3F2EE, Muted #ECEBE7, Accent #E7E4DD, Border #DAD7D0 and Text muted #5E534A.
+   */
   --background: oklch(0.985 0.002 90);
   --foreground: oklch(0.12 0.01 60);
   --card: oklch(1 0 0);
@@ -18,20 +22,20 @@
   --muted-foreground: oklch(0.45 0.02 60);
   --accent: oklch(0.92 0.01 90);
   --accent-foreground: oklch(0.12 0.01 60);
-  --destructive: oklch(0.577 0.245 27.325);
-  --destructive-foreground: oklch(0.577 0.245 27.325);
+  --destructive: #E40014; /* Error: 4.67:1 on the background */
+  --destructive-foreground: #E40014;
   /*
    * Status colours (docs/style-guide.md, Colour; decision of 2026-10-27). Colour carries state, never
    * decoration: Fiber/CKB green also means alive, ready, done; amber means in progress or waiting; red means failed.
    * The -bright tones are for dots, borders and indicators only, never text; the -soft ones are tints behind text.
    */
-  --fiber: oklch(0.50 0.11 165); /* #007653: 5.39:1 on the background, 5.07:1 on fiber-soft */
-  --fiber-bright: oklch(0.70 0.15 165); /* #00bb87 */
-  --fiber-soft: oklch(0.96 0.03 165); /* #e0f9ed */
-  --pending: oklch(0.53 0.12 65); /* #9a5a00: 5.22:1 on the background, 4.91:1 on pending-soft */
-  --pending-bright: oklch(0.78 0.15 75); /* #efa831 */
-  --pending-soft: oklch(0.965 0.04 85); /* #fff2d6 */
-  --destructive-soft: oklch(0.965 0.02 25); /* #ffefed: destructive text on it is only 4.26:1, so text stays foreground */
+  --fiber: #007654; /* 5.41:1 on the background, 5.09:1 on fiber-soft */
+  --fiber-bright: #00BA87;
+  --fiber-soft: #E0F9ED;
+  --pending: #9A5B00; /* 5.20:1 on the background, 4.89:1 on pending-soft */
+  --pending-bright: #EFA831;
+  --pending-soft: #FFF2D8;
+  --destructive-soft: #FFEFEE; /* destructive text on it is only 4.37:1, so text stays foreground */
   --border: oklch(0.88 0.01 90);
   --input: oklch(0.92 0.01 90);
   --ring: oklch(0.12 0.01 60);
@@ -54,7 +58,7 @@
 @theme inline {
   --font-sans: var(--font-instrument), 'Instrument Sans', system-ui, sans-serif;
   --font-mono: var(--font-jetbrains), 'JetBrains Mono', monospace;
-  --font-display: var(--font-instrument-serif), 'Instrument Serif', Georgia, serif;
+  --font-display: var(--font-instrument), 'Instrument Sans', system-ui, sans-serif;
   --color-background: var(--background);
   --color-foreground: var(--foreground);
   --color-card: var(--card);

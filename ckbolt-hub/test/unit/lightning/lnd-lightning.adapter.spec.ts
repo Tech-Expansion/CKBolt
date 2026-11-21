@@ -579,7 +579,7 @@ describe("LndLightningAdapter", () => {
       await expect(adapter.getBalances()).resolves.toMatchObject({ channelRemoteSats: 0n });
     });
 
-    it("counts on-chain funds as zero, warns once and stops asking when the macaroon lacks onchain:read", async () => {
+    it("counts on-chain funds as zero, warns once and stops asking when the macaroon lacks WalletBalance", async () => {
       const warn = jest.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
       sim.rpc.getChainBalance.mockRejectedValue(libError("UnexpectedGetChainBalanceError", GRPC_CODE.PERMISSION_DENIED, LND_DETAILS.PERMISSION));
 
@@ -588,6 +588,8 @@ describe("LndLightningAdapter", () => {
 
       expect(sim.rpc.getChainBalance).toHaveBeenCalledTimes(1);
       expect(warn).toHaveBeenCalledTimes(1);
+      // The macaroon's permissions are LND URI permissions (security review D9): the warning names the one missing.
+      expect(String(warn.mock.calls[0]?.[0])).toContain("uri:/lnrpc.Lightning/WalletBalance");
     });
 
     it("does not hide a transport failure of the on-chain balance as zero", async () => {

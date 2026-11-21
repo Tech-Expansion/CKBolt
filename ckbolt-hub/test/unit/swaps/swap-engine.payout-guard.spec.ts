@@ -181,19 +181,25 @@ describe("swap engine: the ln_to_fiber payout guard", () => {
     expect(h.hubFiber.forceClosedChannels).toEqual([PAYEE_PUBLIC_CHANNEL]);
   });
 
-  it("a failure to read the payout invoice is logged and retried; the swap stays as it is", async () => {
+  it("a failure to read the payout invoice closes no routing channel and is logged with its reason; the next pass reads it and closes", async () => {
+    // 2026-11-13: an unreadable payee waits for a pass that reads it (a router's channel is not closed over a passing RPC
+    // failure); the warning carries the node's error text (describeError over the pass's AggregateError).
     const { swap, hash, sentAt } = await holdingPayee();
     h.hubFiber.setOfferedTlcs(hash, [offered({ channelId: PUBLIC_CHANNEL, channelPublic: true, peer: h.userFiber.nodeId, expiresAt: sentAt + hours(7) })]);
     h.clock.set(sentAt + hours(2));
     h.hubFiber.failNext = "parseInvoice";
 
     const after = await processPasses(h, swap.id, 1);
-    expect(after.state).toBe("outgoing_in_flight");
+    expect(after).toMatchObject({ state: "outgoing_in_flight", refunded: false });
     expect(h.hubFiber.forceClosedChannels).toEqual([]);
-    expect(logs.warn).toHaveBeenCalledWith(expect.stringContaining("could not check the payout's channels"));
+    expect(logs.warn).toHaveBeenCalledWith(
+      expect.stringContaining("could not check the payout's channels: payout guard closed []; 1 step(s) failed (parseInvoice: simulated transport error)"),
+    );
+    expect(await holdState(hash)).toBe("ACCEPTED");
 
     await processPasses(h, swap.id, 1);
     expect(h.hubFiber.forceClosedChannels).toEqual([PUBLIC_CHANNEL]);
+    expect(await holdState(hash)).toBe("ACCEPTED");
   });
 
   it("counts a channel the peer opened with the delay assumed for peer channels: closes after the grace", async () => {

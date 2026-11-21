@@ -150,7 +150,11 @@ it back up (the files as fnn ran them, and `hub.env`), write, and restart fnn-hu
 nothing restarts nothing and makes no backup. It never touches `hub.env` and never recreates the hub. It refuses, and
 writes nothing, when the new whitelist would leave out a token fnn has now (a channel in a token fnn no longer
 whitelists cannot close after fnn restarts): put the token back in `FIBER_ASSETS`, or pass `--allow-drop` by hand once
-no channel in it is left.
+no channel in it is left. It reads the whitelists with a small reader of the block-style YAML the kit writes (standard
+library only); a `ckb:` block it cannot read (flow lists, anchors, tabs, odd indentation) counts as a drop, so it refuses
+then too rather than guess. It writes each file through a temporary file beside it and a rename (a crash leaves the
+old file or the new one, with the old one's mode and owner), and the hub image generates into a folder only the user
+running the script may open (`docker compose run --user`).
 
 The sync skips the step, and says what to run by hand, while the server cannot run it. The files fnn runs then stay as
 they were; only a file the server does not have yet (a new server) is copied from its template:

@@ -2,7 +2,8 @@ import { TESTNET_RUSD_TYPE_SCRIPT } from "../../../src/common/constants/assets.c
 import { describeError } from "../../../src/common/utils/error.util";
 import { activeServices, serviceStates, type DeployContext } from "../lib/context";
 import { RUNNING_STATE, type ComposeServiceState } from "../lib/compose-state";
-import { KIT_FILE, MUTINYNET_LSP, SERVICE, type FnnService, type ServiceName } from "../lib/constants";
+import { HUB_ENV_KEY, KIT_ENV_KEY, KIT_FILE, MUTINYNET_LSP, SERVICE, type FnnService, type ServiceName } from "../lib/constants";
+import { envProbeScript, listsTunnelProfile, parseEnvProbe } from "../lib/env-file";
 import { isSuccess } from "../lib/http";
 import { hubMacaroonPath } from "../lib/kit-paths";
 import {
@@ -23,6 +24,7 @@ import {
   evaluateLndSync,
   evaluateLnPeer,
   evaluateOnchain,
+  evaluateTunnelProxySecret,
   fail,
   ok,
   warn,
@@ -48,6 +50,7 @@ export async function runCheck(ctx: DeployContext): Promise<CheckResult[]> {
 
   const reachable = await checkServer(ctx, results);
   if (!reachable) return results;
+  await probe("tunnel", "check the kit's .env and hub.env on the server", () => checkTunnelSecret(ctx));
   const active = await activeServices(ctx);
   const states = await serviceStates(ctx);
   results.push(...evaluateContainers(active, states));
@@ -87,6 +90,15 @@ async function checkServer(ctx: DeployContext, results: CheckResult[]): Promise<
   }
   results.push(ok("server", `kit in ${ctx.settings.remoteDir}`));
   return true;
+}
+
+/** The tunnel profile (COMPOSE_PROFILES in .env) needs HUB_PROXY_SECRET in hub.env; neither probe reads a secret back. */
+async function checkTunnelSecret(ctx: DeployContext): Promise<CheckResult[]> {
+  const readable = [KIT_ENV_KEY.COMPOSE_PROFILES];
+  const kitEnv = parseEnvProbe(await ctx.kit.run(envProbeScript(KIT_FILE.ENV, readable), { description: "read COMPOSE_PROFILES" }), readable);
+  const hubEnv = parseEnvProbe(await ctx.kit.run(envProbeScript(KIT_FILE.HUB_ENV, []), { description: "read the hub.env keys" }), []);
+  const tunnelOn = listsTunnelProfile(kitEnv.get(KIT_ENV_KEY.COMPOSE_PROFILES)?.value ?? undefined);
+  return evaluateTunnelProxySecret(tunnelOn, hubEnv.get(HUB_ENV_KEY.PROXY_SECRET)?.set ?? false);
 }
 
 async function checkLndHub(ctx: DeployContext): Promise<CheckResult[]> {

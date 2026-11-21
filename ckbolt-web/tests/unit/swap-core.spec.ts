@@ -340,7 +340,7 @@ test.describe("swap card wallet answers", () => {
   test("the hub's hold invoice is checked against the swap before the wallet pays", () => {
     const hash = randomBytes(32);
     const hold = encodeUnsignedBolt11({ network: "signet", amountSats: 2000, paymentHash: hash, description: "hold", expirySeconds: 600 });
-    const expected = { amountSats: "2000", paymentHash: hash.toString("hex"), hubNetwork: "signet" };
+    const expected = { amountSats: "2000", paymentHash: hash.toString("hex"), hubNetwork: "signet", nowMs: Date.now() };
     expect(checkHoldInvoice(hold, expected).ok).toBe(true);
     expect(checkHoldInvoice(hold, { ...expected, paymentHash: hex32() }).ok).toBe(false);
     expect(checkHoldInvoice(hold, { ...expected, amountSats: "2001" }).ok).toBe(false);
@@ -587,6 +587,26 @@ test.describe("swap run", () => {
     expect(runOutcome(run.swap, run.progress)).toBe("cancelled");
     expect(retryAction(run.input)).toBe("new-quote");
     expect(runSteps(run.input)[4]).toMatchObject({ status: "failed", line: STEP_LINE.CANCELLED });
+  });
+
+  test("step 3 while the payment is on its way: CKB or a token to BTC says to confirm it in the node; BTC to CKB, the wallet pays", () => {
+    const fiberToLn = new FakeRun("fiber_to_ln", { invoice: madeInvoice, createSwap: () => swapOf("fiber_to_ln", "pending"), pay: () => ({ status: "paying" }) });
+    fiberToLn.settle();
+    expect(runSteps(fiberToLn.input)[2]).toMatchObject({ status: "active", line: STEP_LINE.CONFIRM_IN_NODE });
+    expect(STEP_LINE.CONFIRM_IN_NODE).toBe("Confirm it in your Fiber node");
+
+    // BTC to CKB: a browser wallet (WebLN) that is sending.
+    const sending = lightningPayStep(PAY_SENDING, { ok: true, invoice: "lntbs20u1hold" });
+    expect(sending).toEqual({ status: "paying" });
+    const lnToFiber = new FakeRun("ln_to_fiber", { invoice: madeInvoice, createSwap: () => swapOf("ln_to_fiber", "pending"), pay: () => sending });
+    lnToFiber.settle();
+    lnToFiber.pay = sending;
+    expect(runSteps(lnToFiber.input)[2]).toMatchObject({ status: "active", line: STEP_LINE.PAYING });
+    expect(STEP_LINE.PAYING).toBe("Paying from your wallet…");
+
+    // Once sent, both say so the same way.
+    fiberToLn.pay = { status: "sent" };
+    expect(runSteps(fiberToLn.input)[2]).toMatchObject({ status: "active", line: STEP_LINE.SENT });
   });
 
   test("a browser node's payment is not sent once the quote expired", () => {
